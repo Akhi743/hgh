@@ -18,13 +18,6 @@ CALIPER_SD = 0.25          # Caliper size in standard deviations of propensity s
 def get_dummy_col(df, features):
     """
     Automatically detect and convert categorical variables to dummy variables
-    
-    Parameters:
-    df (pandas.DataFrame): Input dataframe
-    features (list): List of features to process
-    
-    Returns:
-    tuple: (modified dataframe, list of categorical columns that were encoded)
     """
     df_copy = df.copy()
     categorical_cols = []
@@ -63,19 +56,41 @@ def get_propensity_score(data_frame, x, y, method="glm"):
         })
         coef_df['p_value'] = 'NA'  # Would need statsmodels for p-values
         print(coef_df.to_string(index=False))
-        
-    else:
-        tmp_model = LogisticRegression(
-            penalty='l2',
-            C=1e6, 
-            solver='lbfgs',
-            random_state=42,
-            max_iter=1000
-        )
-        tmp_model.fit(data_frame[x], data_frame[y])
-        tmp_dist = tmp_model.predict_proba(data_frame[x])[:, 1]
     
     return tmp_model, tmp_dist
+
+def perform_psm_matching(treated_df, control_df, x_var, caliper, matching_ratio, n_neighbors):
+    """
+    Perform regular propensity score matching
+    """
+    matched_pairs = []
+    used_control_indices = set()
+    
+    # Initialize KNN model for matching
+    knn = KNeighborsClassifier(n_neighbors=n_neighbors)
+    knn.fit(control_df[x_var], np.zeros(len(control_df)))
+    
+    # For each treated unit
+    for idx, treated_unit in treated_df.iterrows():
+        # Find nearest neighbors
+        distances, indices = knn.kneighbors([treated_unit[x_var]])
+        potential_matches = control_df.iloc[indices[0]]
+        
+        # Filter based on caliper and previous usage
+        eligible_matches = potential_matches[
+            (abs(potential_matches['pscore'] - treated_unit['pscore']) <= caliper) &
+            (~potential_matches.index.isin(used_control_indices))
+        ]
+        
+        if len(eligible_matches) >= matching_ratio:
+            # Select the specified number of matches
+            selected_matches = eligible_matches.iloc[:matching_ratio]
+            
+            # Add treated unit and its matches to the results
+            matched_pairs.extend([treated_unit] + [selected_matches.iloc[i] for i in range(matching_ratio)])
+            used_control_indices.update(selected_matches.index)
+    
+    return matched_pairs
 
 def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_method='glm', 
                 matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
@@ -97,7 +112,6 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
     print(f"Control group: {len(control_df)}")
     
     matched_pairs = []
-    used_control_indices = set()
     
     if match_combinations:
         total_matched = 0
@@ -122,62 +136,31 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
             print(f"Control units available: {len(control_group)}")
             
             if len(treated_group) > 0 and len(control_group) >= matching_ratio:
-                # Initialize KNN model for matching
-                knn = KNeighborsClassifier(n_neighbors=n_neighbors)
-                knn.fit(control_group[x_var], np.zeros(len(control_group)))
-                
-                # For each treated unit in this group
-                combination_matched = 0
-                for idx, treated_unit in treated_group.iterrows():
-                    # Find nearest neighbors
-                    distances, indices = knn.kneighbors([treated_unit[x_var]])
-                    potential_matches = control_group.iloc[indices[0]]
-                    
-                    # Filter based on caliper and previous usage
-                    eligible_matches = potential_matches[
-                        (abs(potential_matches['pscore'] - treated_unit['pscore']) <= caliper) &
-                        (~potential_matches.index.isin(used_control_indices))
-                    ]
-                    
-                    if len(eligible_matches) >= matching_ratio:
-                        # Select the specified number of matches
-                        selected_matches = eligible_matches.iloc[:matching_ratio]
-                        
-                        # Add treated unit and its matches to the results
-                        matched_pairs.extend([treated_unit] + [selected_matches.iloc[i] for i in range(matching_ratio)])
-                        used_control_indices.update(selected_matches.index)
-                        combination_matched += 1
-                        total_matched += 1
-                
-                print(f"Successfully matched {combination_matched} pairs in this combination")
+                curr_matched_pairs = perform_psm_matching(
+                    treated_group, control_group, x_var, caliper,
+                    matching_ratio, n_neighbors
+                )
+                matched_pairs.extend(curr_matched_pairs)
+                total_matched += len(curr_matched_pairs) // (matching_ratio + 1)
+                print(f"Successfully matched {len(curr_matched_pairs) // (matching_ratio + 1)} pairs in this combination")
             else:
                 print(f"Insufficient units for matching in this combination")
         
         print(f"\nTotal matched pairs across all combinations: {total_matched}")
-    else:
-        # Initialize KNN model for matching
-        knn = KNeighborsClassifier(n_neighbors=n_neighbors)
-        knn.fit(control_df[x_var], np.zeros(len(control_df)))
         
-        # For each treated unit
-        for idx, treated_unit in treatment_df.iterrows():
-            # Find nearest neighbors
-            distances, indices = knn.kneighbors([treated_unit[x_var]])
-            potential_matches = control_df.iloc[indices[0]]
-            
-            # Filter based on caliper and previous usage
-            eligible_matches = potential_matches[
-                (abs(potential_matches['pscore'] - treated_unit['pscore']) <= caliper) &
-                (~potential_matches.index.isin(used_control_indices))
-            ]
-            
-            if len(eligible_matches) >= matching_ratio:
-                # Select the specified number of matches
-                selected_matches = eligible_matches.iloc[:matching_ratio]
-                
-                # Add treated unit and its matches to the results
-                matched_pairs.extend([treated_unit] + [selected_matches.iloc[i] for i in range(matching_ratio)])
-                used_control_indices.update(selected_matches.index)
+        # If no matches found with exact matching, fall back to regular PSM
+        if len(matched_pairs) == 0:
+            print("\nNo matches found with exact matching. Falling back to regular PSM...")
+            matched_pairs = perform_psm_matching(
+                treatment_df, control_df, x_var, caliper,
+                matching_ratio, n_neighbors
+            )
+    else:
+        print("\nPerforming regular PSM without exact matching...")
+        matched_pairs = perform_psm_matching(
+            treatment_df, control_df, x_var, caliper,
+            matching_ratio, n_neighbors
+        )
     
     if not matched_pairs:
         print("Warning: No matches found with current settings")
@@ -211,23 +194,29 @@ def main():
         dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
         features_for_model.extend(dummy_cols)
     
-    # Example: Match only females to females
-    match_combinations = [
-        (
-            ['gender_cd_F'],  # treated females
-            ['gender_cd_F']   # control females
-        )
-    ]
+    
+    # 1. Regular PSM (no exact matching)
+    match_combinations = [(['medical_coverage_tier_employee only'], ['medical_coverage_tier_employee plus 1'])]
+    
+    # 2. Female to Female matching
+    # match_combinations = [(['gender_cd_F'], ['gender_cd_F'])]
+        
+    # 3. Male to Female matching
+    # match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
     
     print("\nFeatures used for matching:")
     print(f"Original features: {X_VARIABLES}")
     print(f"Categorical features detected: {categorical_cols}")
     print(f"Final features after encoding: {features_for_model}")
-    print("\nMatching combinations:")
-    for treated_cats, control_cats in match_combinations:
-        print(f"Treated {treated_cats} -> Control {control_cats}")
     
-    # Run PSM with category matching
+    if match_combinations:
+        print("\nMatching combinations:")
+        for treated_cats, control_cats in match_combinations:
+            print(f"Treated {treated_cats} -> Control {control_cats}")
+    else:
+        print("\nNo exact matching specified - performing regular PSM")
+    
+    # Run PSM
     print("\nRunning propensity score matching...")
     model, matched_data = psm_function(
         data_frame=df_encoded,
@@ -255,15 +244,10 @@ if __name__ == "__main__":
 
 
 
-
-
-
-
-
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from causalml.match import NearestNeighborMatch
+import faiss
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -272,7 +256,7 @@ DATA_PATH = "HCA_unmatched_data_setup.parquet"  # Path to your input data file
 X_VARIABLES = ["age", "gender_cd", "medical_coverage_tier"]  # Features to use
 TREATMENT_VAR = "grp_binary"  # Name of treatment/control indicator column
 OUTCOME_VAR = "social_risk_score"  # Name of outcome variable
-MATCHING_RATIO = 1          # Number of control units per treatment unit
+MATCHING_RATIO = 3          # Number of control units per treatment unit
 N_NEIGHBORS = 5             # Number of neighbors for KNN matching
 CALIPER_SD = 0.25          # Caliper size in standard deviations of propensity score
 # ==========================================
@@ -280,20 +264,12 @@ CALIPER_SD = 0.25          # Caliper size in standard deviations of propensity s
 def get_dummy_col(df, features):
     """
     Automatically detect and convert categorical variables to dummy variables
-    
-    Parameters:
-    df (pandas.DataFrame): Input dataframe
-    features (list): List of features to process
-    
-    Returns:
-    tuple: (modified dataframe, list of categorical columns that were encoded)
     """
     df_copy = df.copy()
     categorical_cols = []
     
     for col in features:
         if col in df_copy.columns:
-            # Check if column should be treated as categorical
             if df_copy[col].dtype == 'object' or df_copy[col].nunique() < 10:
                 categorical_cols.append(col)
                 dummies = pd.get_dummies(df_copy[col], prefix=col, drop_first=False)
@@ -326,8 +302,261 @@ def get_propensity_score(data_frame, x, y, method="glm"):
         })
         coef_df['p_value'] = 'NA'  # Would need statsmodels for p-values
         print(coef_df.to_string(index=False))
+    
+    return tmp_model, tmp_dist
+
+def perform_faiss_matching(treated_df, control_df, caliper, matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
+    """
+    Perform matching using FAISS based on propensity scores
+    """
+    # Create FAISS index for matching based on propensity scores
+    treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
+    control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+    
+    # Build FAISS index
+    dimension = 1  # propensity score dimension
+    index = faiss.IndexFlatL2(dimension)
+    index.add(control_pscores)
+    
+    # Find nearest neighbors for each treated unit
+    k = min(n_neighbors, len(control_df))
+    distances, indices = index.search(treated_pscores, k)
+    
+    # Perform matching with caliper
+    matched_pairs = []
+    used_control_indices = set()
+    unmatched_treated = 0
+    
+    for i, (dist, idx) in enumerate(zip(distances, indices)):
+        matched_controls = []
+        treated_pscore = treated_pscores[i][0]
         
+        # Check each potential match
+        for d, control_idx in zip(dist, idx):
+            if len(matched_controls) >= matching_ratio:
+                break
+                
+            control_pscore = control_pscores[control_idx][0]
+            ps_diff = abs(treated_pscore - control_pscore)
+            
+            if ps_diff <= caliper and control_idx not in used_control_indices:
+                matched_controls.append(control_idx)
+                used_control_indices.add(control_idx)
+        
+        if len(matched_controls) == matching_ratio:
+            matched_pairs.append(treated_df.iloc[i])
+            for control_idx in matched_controls:
+                matched_pairs.append(control_df.iloc[control_idx])
+        else:
+            unmatched_treated += 1
+    
+    print(f"\nMatching Statistics:")
+    print(f"Successfully matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
+    print(f"Unmatched treated units: {unmatched_treated}")
+    print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
+    
+    return matched_pairs
+
+def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_method='glm', 
+                matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
+    """
+    Perform propensity score matching using FAISS
+    """
+    # Get propensity scores
+    ft_model, ps = get_propensity_score(data_frame, x_var, y_var, method=distance_method)
+    data_frame['pscore'] = ps
+    
+    caliper = np.std(data_frame['pscore']) * CALIPER_SD
+    
+    # Split into treatment and control groups
+    treatment_df = data_frame[data_frame[y_var] == 1].copy()
+    control_df = data_frame[data_frame[y_var] == 0].copy()
+    
+    print(f"\nInitial sample sizes:")
+    print(f"Treatment group: {len(treatment_df)}")
+    print(f"Control group: {len(control_df)}")
+    
+    matched_pairs = []
+    
+    if match_combinations:
+        total_matched = 0
+        
+        for treated_cats, control_cats in match_combinations:
+            # Create masks for this combination
+            treated_mask = pd.Series(True, index=treatment_df.index)
+            control_mask = pd.Series(True, index=control_df.index)
+            
+            for cat in treated_cats:
+                treated_mask &= (treatment_df[cat] == 1)
+            for cat in control_cats:
+                control_mask &= (control_df[cat] == 1)
+            
+            treated_group = treatment_df[treated_mask]
+            control_group = control_df[control_mask]
+            
+            print(f"\nMatching combination:")
+            print(f"Treated categories: {treated_cats}")
+            print(f"Control categories: {control_cats}")
+            print(f"Treated units available: {len(treated_group)}")
+            print(f"Control units available: {len(control_group)}")
+            
+            if len(treated_group) > 0 and len(control_group) >= matching_ratio:
+                curr_matched_pairs = perform_faiss_matching(
+                    treated_group, control_group, caliper,
+                    matching_ratio, n_neighbors
+                )
+                matched_pairs.extend(curr_matched_pairs)
+                total_matched += len(curr_matched_pairs) // (matching_ratio + 1)
+                print(f"Successfully matched {len(curr_matched_pairs) // (matching_ratio + 1)} pairs in this combination")
+            else:
+                print(f"Insufficient units for matching in this combination")
+        
+        print(f"\nTotal matched pairs across all combinations: {total_matched}")
+        
+        # If no matches found with exact matching, fall back to regular PSM
+        if len(matched_pairs) == 0:
+            print("\nNo matches found with exact matching. Falling back to regular PSM...")
+            matched_pairs = perform_faiss_matching(
+                treatment_df, control_df, caliper,
+                matching_ratio, n_neighbors
+            )
     else:
+        print("\nPerforming regular PSM without exact matching...")
+        matched_pairs = perform_faiss_matching(
+            treatment_df, control_df, caliper,
+            matching_ratio, n_neighbors
+        )
+    
+    if not matched_pairs:
+        print("Warning: No matches found with current settings")
+        return ft_model, None
+    
+    matched_df = pd.DataFrame(matched_pairs)
+    
+    print(f"\nFinal Matching Results:")
+    print(f"Matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
+    print(f"Matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
+    
+    return ft_model, matched_df
+
+def main():
+    """Main execution function"""
+    # Load data
+    print(f"\nLoading data from {DATA_PATH}...")
+    try:
+        df = pd.read_parquet(DATA_PATH)
+    except Exception as e:
+        print(f"Error loading data: {str(e)}")
+        exit(1)
+    
+    # Create dummy variables using automatic detection
+    print("\nProcessing features and creating dummy variables...")
+    df_encoded, categorical_cols = get_dummy_col(df, X_VARIABLES)
+    
+    # Update features list with dummy variable columns
+    features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
+    for col in categorical_cols:
+        dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
+        features_for_model.extend(dummy_cols)
+    
+    # Print available columns for reference
+    print("\nAvailable categorical columns:")
+    for col in categorical_cols:
+        print(f"\n{col} columns:")
+        print([c for c in df_encoded.columns if c.startswith(col + '_')])
+    
+    # Example matching configurations - choose one:
+    
+    # 1. Regular PSM (no exact matching)
+    match_combinations =[(['medical_coverage_tier_employee only'], ['medical_coverage_tier_employee plus 1'])]
+    
+    # 2. Medical coverage tier matching
+   #match_combinations = [(['medical_coverage_tier_employee only'], ['medical_coverage_tier_employee plus 1'])]
+    
+    # 3. Female to Female matching
+    # match_combinations = [(['gender_cd_F'], ['gender_cd_F'])]
+    
+    # 4. Male to Female matching
+    # match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
+    
+    print("\nFeatures used for matching:")
+    print(f"Original features: {X_VARIABLES}")
+    print(f"Categorical features detected: {categorical_cols}")
+    print(f"Final features after encoding: {features_for_model}")
+    
+    if match_combinations:
+        print("\nMatching combinations:")
+        for treated_cats, control_cats in match_combinations:
+            print(f"Treated {treated_cats} -> Control {control_cats}")
+    else:
+        print("\nNo exact matching specified - performing regular PSM")
+    
+    # Run PSM
+    print("\nRunning propensity score matching...")
+    model, matched_data = psm_function(
+        data_frame=df_encoded,
+        x_var=features_for_model,
+        y_var=TREATMENT_VAR,
+        match_combinations=match_combinations
+    )
+    
+    if matched_data is not None:
+        # Calculate treatment effect
+        ate = matched_data[matched_data[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
+              matched_data[matched_data[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
+        
+        print(f"\nResults:")
+        print(f"Average Treatment Effect: {ate:.4f}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from causalml.match import NearestNeighborMatch
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============= INPUT PARAMETERS =============
+DATA_PATH = "HCA_unmatched_data_setup.parquet"  # Path to your input data file
+X_VARIABLES = ["age", "gender_cd", "medical_coverage_tier"]  # Features to use
+TREATMENT_VAR = "grp_binary"  # Name of treatment/control indicator column
+OUTCOME_VAR = "social_risk_score"  # Name of outcome variable
+MATCHING_RATIO = 1          # Number of control units per treatment unit
+N_NEIGHBORS = 5             # Number of neighbors for KNN matching
+CALIPER_SD = 0.25          # Caliper size in standard deviations of propensity score
+# ==========================================
+
+def get_dummy_col(df, features):
+    """
+    Automatically detect and convert categorical variables to dummy variables
+    """
+    df_copy = df.copy()
+    categorical_cols = []
+    
+    for col in features:
+        if col in df_copy.columns:
+            if df_copy[col].dtype == 'object' or df_copy[col].nunique() < 10:
+                categorical_cols.append(col)
+                dummies = pd.get_dummies(df_copy[col], prefix=col, drop_first=False)
+                df_copy = pd.concat([df_copy, dummies], axis=1)
+                df_copy = df_copy.drop(columns=[col])
+    
+    return df_copy, categorical_cols
+
+def get_propensity_score(data_frame, x, y, method="glm"):
+    """
+    Calculate propensity scores using logistic regression
+    """
+    if method == 'glm':
         tmp_model = LogisticRegression(
             penalty='l2',
             C=1e6, 
@@ -337,13 +566,52 @@ def get_propensity_score(data_frame, x, y, method="glm"):
         )
         tmp_model.fit(data_frame[x], data_frame[y])
         tmp_dist = tmp_model.predict_proba(data_frame[x])[:, 1]
+        
+        # Print model coefficients
+        print("\nPropensity Score Model Coefficients:")
+        coef_df = pd.DataFrame({
+            'Feature': x,
+            'Coefficient': tmp_model.coef_[0],
+            'Odds_Ratio': np.exp(tmp_model.coef_[0])
+        })
+        coef_df['p_value'] = 'NA'  # Would need statsmodels for p-values
+        print(coef_df.to_string(index=False))
     
     return tmp_model, tmp_dist
+
+def perform_causalml_matching(treated_df, control_df, caliper, matching_ratio=MATCHING_RATIO):
+    """
+    Perform matching using CausalML
+    """
+    # Combine treated and control groups for matching
+    combined_df = pd.concat([treated_df, control_df])
+    
+    # Initialize CausalML matcher
+    nnm = NearestNeighborMatch(
+        replace=False,
+        ratio=matching_ratio,
+        caliper=caliper,
+        random_state=42
+    )
+    
+    # Perform matching
+    matched_df = nnm.match(
+        data=combined_df,
+        treatment_col=TREATMENT_VAR,
+        score_cols=['pscore']
+    )
+    
+    print(f"\nMatching Statistics:")
+    print(f"Successfully matched treated units: {sum(matched_df[TREATMENT_VAR] == 1)}")
+    print(f"Successfully matched control units: {sum(matched_df[TREATMENT_VAR] == 0)}")
+    print(f"Total matched pairs: {len(matched_df) // (matching_ratio + 1)}")
+    
+    return matched_df
 
 def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_method='glm', 
                 matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
     """
-    Perform propensity score matching using CausalML with exact matching support
+    Perform propensity score matching using CausalML
     """
     # Get propensity scores
     ft_model, ps = get_propensity_score(data_frame, x_var, y_var, method=distance_method)
@@ -352,80 +620,66 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
     caliper = np.std(data_frame['pscore']) * CALIPER_SD
     
     # Split into treatment and control groups
-    print(f"\nInitial sample sizes:")
-    print(f"Treatment group: {sum(data_frame[y_var] == 1)}")
-    print(f"Control group: {sum(data_frame[y_var] == 0)}")
+    treatment_df = data_frame[data_frame[y_var] == 1].copy()
+    control_df = data_frame[data_frame[y_var] == 0].copy()
     
-    matched_data = pd.DataFrame()
+    print(f"\nInitial sample sizes:")
+    print(f"Treatment group: {len(treatment_df)}")
+    print(f"Control group: {len(control_df)}")
+    
+    matched_data = None
     
     if match_combinations:
+        all_matched_dfs = []
         total_matched = 0
         
         for treated_cats, control_cats in match_combinations:
             # Create masks for this combination
-            treated_mask = pd.Series(True, index=data_frame.index)
-            control_mask = pd.Series(True, index=data_frame.index)
+            treated_mask = pd.Series(True, index=treatment_df.index)
+            control_mask = pd.Series(True, index=control_df.index)
             
             for cat in treated_cats:
-                treated_mask &= (data_frame[cat] == 1)
+                treated_mask &= (treatment_df[cat] == 1)
             for cat in control_cats:
-                control_mask &= (data_frame[cat] == 1)
+                control_mask &= (control_df[cat] == 1)
             
-            # Get subset of data for this combination
-            subset_df = data_frame[treated_mask | control_mask].copy()
-            
-            # Get counts for reporting
-            n_treated = sum((subset_df[y_var] == 1) & treated_mask)
-            n_control = sum((subset_df[y_var] == 0) & control_mask)
+            treated_group = treatment_df[treated_mask]
+            control_group = control_df[control_mask]
             
             print(f"\nMatching combination:")
             print(f"Treated categories: {treated_cats}")
             print(f"Control categories: {control_cats}")
-            print(f"Treated units available: {n_treated}")
-            print(f"Control units available: {n_control}")
+            print(f"Treated units available: {len(treated_group)}")
+            print(f"Control units available: {len(control_group)}")
             
-            if n_treated > 0 and n_control >= matching_ratio:
-                # Initialize CausalML matcher for this combination
-                nnm = NearestNeighborMatch(
-                    replace=False,
-                    ratio=matching_ratio,
-                    caliper=caliper,
-                    random_state=42
+            if len(treated_group) > 0 and len(control_group) >= matching_ratio:
+                curr_matched_df = perform_causalml_matching(
+                    treated_group, control_group, caliper, matching_ratio
                 )
                 
-                # Perform matching on this subset
-                matched_subset = nnm.match(
-                    data=subset_df,
-                    treatment_col=y_var,
-                    score_cols=['pscore']
-                )
-                
-                if len(matched_subset) > 0:
-                    matched_data = pd.concat([matched_data, matched_subset])
-                    total_matched += sum(matched_subset[y_var] == 1)
-                    print(f"Successfully matched {sum(matched_subset[y_var] == 1)} pairs in this combination")
-                else:
-                    print("No matches found in this combination")
+                if curr_matched_df is not None and len(curr_matched_df) > 0:
+                    all_matched_dfs.append(curr_matched_df)
+                    total_matched += len(curr_matched_df) // (matching_ratio + 1)
+                    print(f"Successfully matched {len(curr_matched_df) // (matching_ratio + 1)} pairs in this combination")
             else:
                 print(f"Insufficient units for matching in this combination")
         
         print(f"\nTotal matched pairs across all combinations: {total_matched}")
-    else:
-        # Perform matching without exact matching constraints
-        nnm = NearestNeighborMatch(
-            replace=False,
-            ratio=matching_ratio,
-            caliper=caliper,
-            random_state=42
-        )
         
-        matched_data = nnm.match(
-            data=data_frame,
-            treatment_col=y_var,
-            score_cols=['pscore']
+        if all_matched_dfs:
+            matched_data = pd.concat(all_matched_dfs, ignore_index=True)
+        else:
+            print("\nNo matches found with exact matching. Falling back to regular PSM...")
+            matched_data = perform_causalml_matching(
+                treatment_df, control_df, caliper, matching_ratio
+            )
+    else:
+        print("\nPerforming regular PSM without exact matching...")
+        matched_data = perform_causalml_matching(
+            treatment_df, control_df, caliper, matching_ratio
         )
     
-    if len(matched_data) == 0:
+    if matched_data is None or len(matched_data) == 0:
         print("Warning: No matches found with current settings")
         return ft_model, None
     
@@ -455,23 +709,39 @@ def main():
         dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
         features_for_model.extend(dummy_cols)
     
-    # Example: Match only females to females
-    match_combinations = [
-        (
-            ['gender_cd_F'],  # treated females
-            ['gender_cd_F']   # control females
-        )
-    ]
+    # Print available columns for reference
+    print("\nAvailable categorical columns:")
+    for col in categorical_cols:
+        print(f"\n{col} columns:")
+        print([c for c in df_encoded.columns if c.startswith(col + '_')])
+    
+    # Example matching configurations - choose one:
+    
+    # 1. Regular PSM (no exact matching) # 2. Medical coverage tier matching
+    match_combinations = [(['medical_coverage_tier_employee only'], ['medical_coverage_tier_employee plus 1'])]
+    
+    # 1. Regular PSM (no exact matching)
+    # match_combinations = None
+    
+    # 3. Female to Female matching
+    # match_combinations = [(['gender_cd_F'], ['gender_cd_F'])]
+    
+    # 4. Male to Female matching
+    # match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
     
     print("\nFeatures used for matching:")
     print(f"Original features: {X_VARIABLES}")
     print(f"Categorical features detected: {categorical_cols}")
     print(f"Final features after encoding: {features_for_model}")
-    print("\nMatching combinations:")
-    for treated_cats, control_cats in match_combinations:
-        print(f"Treated {treated_cats} -> Control {control_cats}")
     
-    # Run PSM with category matching
+    if match_combinations:
+        print("\nMatching combinations:")
+        for treated_cats, control_cats in match_combinations:
+            print(f"Treated {treated_cats} -> Control {control_cats}")
+    else:
+        print("\nNo exact matching specified - performing regular PSM")
+    
+    # Run PSM
     print("\nRunning propensity score matching...")
     model, matched_data = psm_function(
         data_frame=df_encoded,
