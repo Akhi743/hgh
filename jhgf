@@ -1022,23 +1022,14 @@ if __name__ == "__main__":
 
 
 
-print("\n=== Gender Distribution Analysis ===")
+# For Treatment group (1)
+print("\nTreatment Group Gender Counts:")
+treatment_counts = matched_data[matched_data['grp_binary'] == 1]['gender_cd_F'].value_counts()
+print("Female:", treatment_counts.get(1, 0))
+print("Male:", treatment_counts.get(0, 0))
 
-# Before matching
-print("\nBefore Matching:")
-gender_cols = [col for col in treatment_df.columns if col.startswith('gender_cd_')]
-
-# Treatment group proportions
-print("\nTreatment Group Gender Distribution (%):")
-print(treatment_df[gender_cols].mean() * 100)
-
-# Control group proportions
-print("\nControl Group Gender Distribution (%):")
-print(control_df[gender_cols].mean() * 100)
-
-# After matching
-print("\nAfter Matching:")
-print("\nTreatment Group Gender Distribution (%):")
-print(matched_df[matched_df[TREATMENT_VAR] == 1][gender_cols].mean() * 100)
-print("\nControl Group Gender Distribution (%):")
-print(matched_df[matched_df[TREATMENT_VAR] == 0][gender_cols].mean() * 100)
+# For Control group (0)
+print("\nControl Group Gender Counts:")
+control_counts = matched_data[matched_data['grp_binary'] == 0]['gender_cd_F'].value_counts()
+print("Female:", control_counts.get(1, 0))
+print("Male:", control_counts.get(0, 0))
