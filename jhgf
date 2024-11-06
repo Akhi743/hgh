@@ -1027,23 +1027,18 @@ print("\n=== Gender Distribution Analysis ===")
 # Before matching
 print("\nBefore Matching:")
 gender_cols = [col for col in treatment_df.columns if col.startswith('gender_cd_')]
-before_matching = pd.concat([
-    treatment_df.assign(Group='Treatment'),
-    control_df.assign(Group='Control')
-])
-print("\nCounts:")
-print(before_matching.groupby(['Group'] + gender_cols).size().unstack(fill_value=0))
-print("\nProportions:")
-print(before_matching.groupby(['Group'] + gender_cols).size().unstack(fill_value=0).div(
-    before_matching.groupby('Group').size(), axis=0
-))
+
+# Treatment group proportions
+print("\nTreatment Group Gender Distribution (%):")
+print(treatment_df[gender_cols].mean() * 100)
+
+# Control group proportions
+print("\nControl Group Gender Distribution (%):")
+print(control_df[gender_cols].mean() * 100)
 
 # After matching
 print("\nAfter Matching:")
-matched_df['Group'] = matched_df[TREATMENT_VAR].map({1: 'Treatment', 0: 'Control'})
-print("\nCounts:")
-print(matched_df.groupby(['Group'] + gender_cols).size().unstack(fill_value=0))
-print("\nProportions:")
-print(matched_df.groupby(['Group'] + gender_cols).size().unstack(fill_value=0).div(
-    matched_df.groupby('Group').size(), axis=0
-))
+print("\nTreatment Group Gender Distribution (%):")
+print(matched_df[matched_df[TREATMENT_VAR] == 1][gender_cols].mean() * 100)
+print("\nControl Group Gender Distribution (%):")
+print(matched_df[matched_df[TREATMENT_VAR] == 0][gender_cols].mean() * 100)
