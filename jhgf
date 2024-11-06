@@ -1022,59 +1022,28 @@ if __name__ == "__main__":
 
 
 
-print("\n=== Distribution Analysis ===")
+print("\n=== Gender Distribution Analysis ===")
 
-# Gender Analysis
-print("\nGender Distribution:")
+# Before matching
 print("\nBefore Matching:")
-gender_cols = [col for col in matched_df.columns if col.startswith('gender_cd_')]
-
-# Combine treatment and control data for before matching comparison
-before_match_data = pd.concat([
+gender_cols = [col for col in treatment_df.columns if col.startswith('gender_cd_')]
+before_matching = pd.concat([
     treatment_df.assign(Group='Treatment'),
     control_df.assign(Group='Control')
 ])
-
-print(pd.crosstab(
-    before_match_data['Group'],
-    before_match_data[gender_cols].idxmax(axis=1),
-    normalize='index'
+print("\nCounts:")
+print(before_matching.groupby(['Group'] + gender_cols).size().unstack(fill_value=0))
+print("\nProportions:")
+print(before_matching.groupby(['Group'] + gender_cols).size().unstack(fill_value=0).div(
+    before_matching.groupby('Group').size(), axis=0
 ))
 
+# After matching
 print("\nAfter Matching:")
 matched_df['Group'] = matched_df[TREATMENT_VAR].map({1: 'Treatment', 0: 'Control'})
-print(pd.crosstab(
-    matched_df['Group'],
-    matched_df[gender_cols].idxmax(axis=1),
-    normalize='index'
+print("\nCounts:")
+print(matched_df.groupby(['Group'] + gender_cols).size().unstack(fill_value=0))
+print("\nProportions:")
+print(matched_df.groupby(['Group'] + gender_cols).size().unstack(fill_value=0).div(
+    matched_df.groupby('Group').size(), axis=0
 ))
-
-# Medical Coverage Analysis
-print("\nMedical Coverage Distribution:")
-print("\nBefore Matching:")
-med_cols = [col for col in matched_df.columns if col.startswith('medical_coverage_tier_')]
-
-print(pd.crosstab(
-    before_match_data['Group'],
-    before_match_data[med_cols].idxmax(axis=1),
-    normalize='index'
-))
-
-print("\nAfter Matching:")
-print(pd.crosstab(
-    matched_df['Group'],
-    matched_df[med_cols].idxmax(axis=1),
-    normalize='index'
-))
-
-# Age Distribution
-print("\nAge Distribution:")
-print("\nBefore Matching:")
-age_stats = pd.concat([
-    treatment_df['age'].describe().rename('Treatment'),
-    control_df['age'].describe().rename('Control')
-], axis=1)
-print(age_stats)
-
-print("\nAfter Matching:")
-print(matched_df.groupby(TREATMENT_VAR)['age'].describe())
