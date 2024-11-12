@@ -71,36 +71,58 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
         
-        # Configure and build ScaNN searcher - Fixed initialization
-        searcher = scann.scann_ops.build(
-            control_pscores,
-            n_neighbors,
-            "squared_l2",
-            n_leaves=min(64, len(control_pscores)),
-            n_leaves_to_search=min(20, len(control_pscores)),
-            dimensions_per_block=2,
-            anisotropic_quantization_threshold=0.2,
-            reorder_k=100
-        )
+        # First normalize the data - this is important for ScaNN
+        control_pscores = control_pscores / np.linalg.norm(control_pscores, axis=1)[:, np.newaxis]
+        treated_pscores = treated_pscores / np.linalg.norm(treated_pscores, axis=1)[:, np.newaxis]
         
+        try:
+            # Import ScaNN correctly
+            import scann
+            
+            # Create searcher configuration
+            searcher = scann.scann_ops.builder(
+                control_pscores, 
+                n_neighbors,
+                "dot_product"
+            ).tree(
+                num_leaves=min(64, len(control_pscores)),
+                num_leaves_to_search=min(20, len(control_pscores))
+            ).score_brute_force(
+                quantize=False
+            ).build()
+            
+        except AttributeError:
+            # Alternative initialization if the above fails
+            searcher = scann.scann_ops_pybind.builder(
+                control_pscores, 
+                n_neighbors,
+                "dot_product"
+            ).tree(
+                num_leaves=min(64, len(control_pscores)),
+                num_leaves_to_search=min(20, len(control_pscores))
+            ).score_brute_force(
+                quantize=False
+            ).build()
+    
     with Timer(f"Matching process for {len(treated_df)} treated units"):
         matched_pairs = []
         used_control_indices = set()
         unmatched_treated = 0
         
-        # Search for each treated unit
+        # Perform batch search
         neighbors, distances = searcher.search_batched(treated_pscores)
         
+        # Process matches
         for i, (neighbor_indices, dist) in enumerate(zip(neighbors, distances)):
             matched_controls = []
-            treated_pscore = treated_pscores[i][0]
+            treated_pscore = treated_df['pscore'].iloc[i]
             
             # Check each potential match
             for control_idx, distance in zip(neighbor_indices, dist):
                 if len(matched_controls) >= matching_ratio:
                     break
-                
-                control_pscore = control_pscores[control_idx][0]
+                    
+                control_pscore = control_df['pscore'].iloc[control_idx]
                 ps_diff = abs(treated_pscore - control_pscore)
                 
                 if ps_diff <= caliper and control_idx not in used_control_indices:
