@@ -36,7 +36,7 @@ def clean_data(data_frame, x_var):
         
         # Check for non-finite values in features
         mask = np.all(np.isfinite(data_frame[x_var]), axis=1)
-        data_frame = data_frame[mask]
+        data_frame = data_frame[mask].copy()
         
         removed_rows = initial_rows - len(data_frame)
         if removed_rows > 0:
@@ -82,6 +82,10 @@ def get_propensity_score(data_frame, x, y, method="glm"):
 
 def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
     with Timer("ScaNN initialization"):
+        # Reset indices to ensure proper alignment
+        treated_df = treated_df.reset_index(drop=True)
+        control_df = control_df.reset_index(drop=True)
+        
         # Prepare data for ScaNN
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
@@ -93,32 +97,31 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
         if not np.all(treated_mask):
             print(f"Warning: Found {np.sum(~treated_mask)} non-finite values in treated group. Removing these cases.")
             treated_pscores = treated_pscores[treated_mask]
-            treated_df = treated_df[treated_mask].copy()
+            treated_df = treated_df[treated_mask].copy().reset_index(drop=True)
         
         if not np.all(control_mask):
             print(f"Warning: Found {np.sum(~control_mask)} non-finite values in control group. Removing these cases.")
             control_pscores = control_pscores[control_mask]
-            control_df = control_df[control_mask].copy()
+            control_df = control_df[control_mask].copy().reset_index(drop=True)
         
         # Check if we have enough data after removing non-finite values
         if len(treated_pscores) == 0 or len(control_pscores) == 0:
             print("Error: No valid data remaining after removing non-finite values")
-            return []
+            return pd.DataFrame()
         
         # Add small epsilon to avoid zero division in normalization
         epsilon = 1e-8
         
         # Normalize the data safely
         control_norms = np.linalg.norm(control_pscores, axis=1)[:, np.newaxis]
-        control_norms = np.maximum(control_norms, epsilon)  # Avoid division by zero
+        control_norms = np.maximum(control_norms, epsilon)
         control_pscores = control_pscores / control_norms
         
         treated_norms = np.linalg.norm(treated_pscores, axis=1)[:, np.newaxis]
-        treated_norms = np.maximum(treated_norms, epsilon)  # Avoid division by zero
+        treated_norms = np.maximum(treated_norms, epsilon)
         treated_pscores = treated_pscores / treated_norms
         
         try:
-            # Create searcher configuration
             searcher = scann.scann_ops.builder(
                 control_pscores, 
                 n_neighbors,
@@ -131,7 +134,6 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
             ).build()
             
         except AttributeError:
-            # Alternative initialization if the above fails
             searcher = scann.scann_ops_pybind.builder(
                 control_pscores, 
                 n_neighbors,
@@ -152,16 +154,16 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
         neighbors, distances = searcher.search_batched(treated_pscores)
         
         # Process matches
-        for i, (neighbor_indices, dist) in enumerate(zip(neighbors, distances)):
+        for i in range(len(treated_df)):
             matched_controls = []
-            treated_pscore = treated_df['pscore'].iloc[i]
+            treated_pscore = treated_df.loc[i, 'pscore']
             
             # Check each potential match
-            for control_idx, distance in zip(neighbor_indices, dist):
+            for control_idx, distance in zip(neighbors[i], distances[i]):
                 if len(matched_controls) >= matching_ratio:
                     break
                     
-                control_pscore = control_df['pscore'].iloc[control_idx]
+                control_pscore = control_df.loc[control_idx, 'pscore']
                 ps_diff = abs(treated_pscore - control_pscore)
                 
                 if ps_diff <= caliper and control_idx not in used_control_indices:
@@ -169,9 +171,9 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
                     used_control_indices.add(control_idx)
             
             if len(matched_controls) == matching_ratio:
-                matched_pairs.append(treated_df.iloc[i])
+                matched_pairs.append(treated_df.loc[i])
                 for control_idx in matched_controls:
-                    matched_pairs.append(control_df.iloc[control_idx])
+                    matched_pairs.append(control_df.loc[control_idx])
             else:
                 unmatched_treated += 1
         
@@ -180,7 +182,10 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
         print(f"Unmatched treated units: {unmatched_treated}")
         print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
         
-        return matched_pairs
+        # Convert matched pairs to DataFrame
+        if matched_pairs:
+            return pd.DataFrame(matched_pairs)
+        return pd.DataFrame()
 
 def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_method='glm',
                 matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
@@ -195,11 +200,10 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
         treatment_df = data_frame[data_frame[y_var] == 1].copy()
         control_df = data_frame[data_frame[y_var] == 0].copy()
         
-        matched_pairs = []
-        
         if match_combinations:
             with Timer("Exact matching process"):
                 total_matched = 0
+                matched_dfs = []
                 
                 for treated_cats, control_cats in match_combinations:
                     treated_mask = pd.Series(True, index=treatment_df.index)
@@ -210,48 +214,47 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
                     for cat in control_cats:
                         control_mask &= (control_df[cat] == 1)
                     
-                    treated_group = treatment_df[treated_mask]
-                    control_group = control_df[control_mask]
+                    treated_group = treatment_df[treated_mask].copy()
+                    control_group = control_df[control_mask].copy()
                     
                     if len(treated_group) > 0 and len(control_group) >= matching_ratio:
-                        curr_matched_pairs = perform_scann_matching(
+                        curr_matched_df = perform_scann_matching(
                             treated_group, control_group, caliper,
                             matching_ratio, n_neighbors
                         )
-                        matched_pairs.extend(curr_matched_pairs)
-                        total_matched += len(curr_matched_pairs) // (matching_ratio + 1)
-                        print(f"Successfully matched {len(curr_matched_pairs) // (matching_ratio + 1)} pairs in this combination")
+                        if not curr_matched_df.empty:
+                            matched_dfs.append(curr_matched_df)
+                            total_matched += len(curr_matched_df) // (matching_ratio + 1)
+                            print(f"Successfully matched {len(curr_matched_df) // (matching_ratio + 1)} pairs in this combination")
                     else:
                         print(f"Insufficient units for matching in this combination")
                 
                 print(f"\nTotal matched pairs across all combinations: {total_matched}")
                 
-                if len(matched_pairs) == 0:
+                if matched_dfs:
+                    matched_df = pd.concat(matched_dfs, ignore_index=True)
+                else:
                     print("\nNo matches found with exact matching. Falling back to regular PSM...")
-                    matched_pairs = perform_scann_matching(
+                    matched_df = perform_scann_matching(
                         treatment_df, control_df, caliper,
                         matching_ratio, n_neighbors
                     )
         else:
             with Timer("Regular PSM matching"):
                 print("\nPerforming regular PSM without exact matching...")
-                matched_pairs = perform_scann_matching(
+                matched_df = perform_scann_matching(
                     treatment_df, control_df, caliper,
                     matching_ratio, n_neighbors
                 )
             
-            if not matched_pairs:
-                print("Warning: No matches found with current settings")
-                return ft_model, None
+        if matched_df.empty:
+            print("Warning: No matches found with current settings")
+            return ft_model, None
                 
-        with Timer("Creating final matched DataFrame"):
-            matched_df = pd.DataFrame(matched_pairs)
-            
-            print(f"\nFinal Matching Results:")
-            print(f"Matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
-            print(f"Matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
-            
-            return ft_model, matched_df
+        print(f"\nFinal Matching Results:")
+        print(f"Total matched pairs: {len(matched_df) // (matching_ratio + 1)}")
+        
+        return ft_model, matched_df
 
 def main():
     with Timer("\nTotal execution time"):
@@ -296,7 +299,9 @@ def main():
             
             print(f"\nResults:")
             print(f"Average Treatment Effect: {ate:.4f}")
+            print("\nMatched pairs by gender:")
             print(matched_data.groupby(['grp_binary', 'gender_cd_M']).size())
+            print("\nMatched pairs by coverage tier:")
             print(matched_data.groupby(['grp_binary', 'medical_coverage_tier_employee only']).size())
             
             # Save matched data to file
