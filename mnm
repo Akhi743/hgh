@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-import faiss
+import scann
 import time
 import warnings
 warnings.filterwarnings('ignore')
@@ -57,54 +57,56 @@ def get_propensity_score(data_frame, x, y, method="glm"):
             tmp_model.fit(data_frame[x], data_frame[y])
             tmp_dist = tmp_model.predict_proba(data_frame[x])[:, 1]
             
-            # Print model coefficients
             print("\nPropensity Score Model Coefficients:")
             coef_df = pd.DataFrame({
                 'Feature': x,
                 'Coefficient': tmp_model.coef_[0]})
-            
             print(coef_df.to_string(index=False))
         
         return tmp_model, tmp_dist
 
-def perform_hnsw_matching(treated_df, control_df, caliper, matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
-    with Timer("HNSW initialization"):
-        # Create FAISS index for matching based on propensity scores
+def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
+    with Timer("ScaNN initialization"):
+        # Prepare data for ScaNN
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
         
-        # Build HNSW index
-        dimension = 1  # propensity score dimension
-        index = faiss.IndexHNSWFlat(dimension, 32)  # 32 is the number of connections per layer
+        # Configure and build ScaNN searcher
+        builder = scann.scann_ops_pybind.Builder(
+            db=control_pscores,
+            num_neighbors=n_neighbors,
+            distance_measure='squared_l2'
+        )
         
-        # Set HNSW parameters
-        index.hnsw.efConstruction = 40  # Controls index building quality
-        index.hnsw.efSearch = 16  # Controls search quality
+        # Configure search parameters
+        builder = (builder.tree(
+            num_leaves=min(64, len(control_pscores)),
+            num_leaves_to_search=min(20, len(control_pscores))
+        ).score_ah(
+            2,
+            anisotropic_quantization_threshold=0.2
+        ).reorder(100))
         
-        # Add control points to index
-        index.add(control_pscores)
+        # Build the searcher
+        searcher = builder.build()
         
-        # Find nearest neighbors for each treated unit
-        k = min(N_NEIGHBORS, len(control_df))
-        distances, indices = index.search(treated_pscores, k)
-    
     with Timer(f"Matching process for {len(treated_df)} treated units"):
         # Perform matching with caliper
         matched_pairs = []
         used_control_indices = set()
         unmatched_treated = 0
         
-        for i, (dist, idx) in enumerate(zip(distances, indices)):
+        # Search for each treated unit
+        neighbors, distances = searcher.search_batched(treated_pscores)
+        
+        for i, (neighbor_indices, dist) in enumerate(zip(neighbors, distances)):
             matched_controls = []
             treated_pscore = treated_pscores[i][0]
             
             # Check each potential match
-            for d, control_idx in zip(dist, idx):
+            for control_idx, distance in zip(neighbor_indices, dist):
                 if len(matched_controls) >= matching_ratio:
                     break
-                
-                if control_idx == -1:  # HNSW might return -1 if not enough neighbors found
-                    continue
                 
                 control_pscore = control_pscores[control_idx][0]
                 ps_diff = abs(treated_pscore - control_pscore)
@@ -137,7 +139,6 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
         caliper = np.std(data_frame['pscore']) * CALIPER_SD
     
     with Timer("Splitting data into treatment and control groups"):
-        # Split into treatment and control groups
         treatment_df = data_frame[data_frame[y_var] == 1].copy()
         control_df = data_frame[data_frame[y_var] == 0].copy()
         
@@ -148,7 +149,6 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
                 total_matched = 0
                 
                 for treated_cats, control_cats in match_combinations:
-                    # Create masks for this combination
                     treated_mask = pd.Series(True, index=treatment_df.index)
                     control_mask = pd.Series(True, index=control_df.index)
                     
@@ -161,7 +161,7 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
                     control_group = control_df[control_mask]
                     
                     if len(treated_group) > 0 and len(control_group) >= matching_ratio:
-                        curr_matched_pairs = perform_hnsw_matching(
+                        curr_matched_pairs = perform_scann_matching(
                             treated_group, control_group, caliper,
                             matching_ratio, n_neighbors
                         )
@@ -173,17 +173,16 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
                 
                 print(f"\nTotal matched pairs across all combinations: {total_matched}")
                 
-                # If no matches found with exact matching, fall back to regular PSM
                 if len(matched_pairs) == 0:
                     print("\nNo matches found with exact matching. Falling back to regular PSM...")
-                    matched_pairs = perform_hnsw_matching(
+                    matched_pairs = perform_scann_matching(
                         treatment_df, control_df, caliper,
                         matching_ratio, n_neighbors
                     )
         else:
             with Timer("Regular PSM matching"):
                 print("\nPerforming regular PSM without exact matching...")
-                matched_pairs = perform_hnsw_matching(
+                matched_pairs = perform_scann_matching(
                     treatment_df, control_df, caliper,
                     matching_ratio, n_neighbors
                 )
@@ -203,7 +202,6 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
 
 def main():
     with Timer("\nTotal execution time"):
-        # Load data
         print(f"\nLoading data from {DATA_PATH}...")
         with Timer("Loading data"):
             try:
@@ -212,17 +210,14 @@ def main():
                 print(f"Error loading data: {str(e)}")
                 exit(1)
         
-        # Create dummy variables using automatic detection
         print("\nProcessing features and creating dummy variables...")
         df_encoded, categorical_cols = get_dummy_col(df, X_VARIABLES)
         
-        # Update features list with dummy variable columns
         features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
         for col in categorical_cols:
             dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
             features_for_model.extend(dummy_cols)
         
-        # Example matching configuration
         match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
         
         if match_combinations:
@@ -231,7 +226,6 @@ def main():
         else:
             print("\nNo exact matching specified - performing regular PSM")
         
-        # Run PSM
         print("\nRunning propensity score matching...")
         model, matched_data = psm_function(
             data_frame=df_encoded,
@@ -241,7 +235,6 @@ def main():
         )
         
         if matched_data is not None:
-            # Calculate treatment effect
             ate = matched_data[matched_data[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
                   matched_data[matched_data[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
             
