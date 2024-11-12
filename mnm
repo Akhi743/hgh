@@ -29,6 +29,21 @@ class Timer:
         self.duration = self.end - self.start
         print(f"{self.description}: {self.duration:.4f} seconds")
 
+def clean_data(data_frame, x_var):
+    """Clean the dataset by removing rows with non-finite values"""
+    with Timer("Cleaning data"):
+        initial_rows = len(data_frame)
+        
+        # Check for non-finite values in features
+        mask = np.all(np.isfinite(data_frame[x_var]), axis=1)
+        data_frame = data_frame[mask]
+        
+        removed_rows = initial_rows - len(data_frame)
+        if removed_rows > 0:
+            print(f"Removed {removed_rows} rows with non-finite values")
+            
+        return data_frame
+
 def get_dummy_col(df, features):
     with Timer("Creating dummy variables"):
         df_copy = df.copy()
@@ -71,14 +86,38 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
         
-        # First normalize the data - this is important for ScaNN
-        control_pscores = control_pscores / np.linalg.norm(control_pscores, axis=1)[:, np.newaxis]
-        treated_pscores = treated_pscores / np.linalg.norm(treated_pscores, axis=1)[:, np.newaxis]
+        # Handle any non-finite values
+        treated_mask = np.isfinite(treated_pscores).ravel()
+        control_mask = np.isfinite(control_pscores).ravel()
+        
+        if not np.all(treated_mask):
+            print(f"Warning: Found {np.sum(~treated_mask)} non-finite values in treated group. Removing these cases.")
+            treated_pscores = treated_pscores[treated_mask]
+            treated_df = treated_df[treated_mask].copy()
+        
+        if not np.all(control_mask):
+            print(f"Warning: Found {np.sum(~control_mask)} non-finite values in control group. Removing these cases.")
+            control_pscores = control_pscores[control_mask]
+            control_df = control_df[control_mask].copy()
+        
+        # Check if we have enough data after removing non-finite values
+        if len(treated_pscores) == 0 or len(control_pscores) == 0:
+            print("Error: No valid data remaining after removing non-finite values")
+            return []
+        
+        # Add small epsilon to avoid zero division in normalization
+        epsilon = 1e-8
+        
+        # Normalize the data safely
+        control_norms = np.linalg.norm(control_pscores, axis=1)[:, np.newaxis]
+        control_norms = np.maximum(control_norms, epsilon)  # Avoid division by zero
+        control_pscores = control_pscores / control_norms
+        
+        treated_norms = np.linalg.norm(treated_pscores, axis=1)[:, np.newaxis]
+        treated_norms = np.maximum(treated_norms, epsilon)  # Avoid division by zero
+        treated_pscores = treated_pscores / treated_norms
         
         try:
-            # Import ScaNN correctly
-            import scann
-            
             # Create searcher configuration
             searcher = scann.scann_ops.builder(
                 control_pscores, 
@@ -231,6 +270,9 @@ def main():
         for col in categorical_cols:
             dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
             features_for_model.extend(dummy_cols)
+            
+        # Clean data before processing
+        df_encoded = clean_data(df_encoded, features_for_model)
         
         match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
         
@@ -256,6 +298,11 @@ def main():
             print(f"Average Treatment Effect: {ate:.4f}")
             print(matched_data.groupby(['grp_binary', 'gender_cd_M']).size())
             print(matched_data.groupby(['grp_binary', 'medical_coverage_tier_employee only']).size())
+            
+            # Save matched data to file
+            output_file = "matched_data.parquet"
+            matched_data.to_parquet(output_file)
+            print(f"\nMatched data saved to {output_file}")
 
 if __name__ == "__main__":
     main()
