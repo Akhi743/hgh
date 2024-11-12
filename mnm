@@ -71,27 +71,19 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
         
-        # Configure and build ScaNN searcher
-        builder = scann.scann_ops_pybind.Builder(
-            db=control_pscores,
-            num_neighbors=n_neighbors,
-            distance_measure='squared_l2'
+        # Configure and build ScaNN searcher - Fixed initialization
+        searcher = scann.scann_ops.build(
+            control_pscores,
+            n_neighbors,
+            "squared_l2",
+            n_leaves=min(64, len(control_pscores)),
+            n_leaves_to_search=min(20, len(control_pscores)),
+            dimensions_per_block=2,
+            anisotropic_quantization_threshold=0.2,
+            reorder_k=100
         )
         
-        # Configure search parameters
-        builder = (builder.tree(
-            num_leaves=min(64, len(control_pscores)),
-            num_leaves_to_search=min(20, len(control_pscores))
-        ).score_ah(
-            2,
-            anisotropic_quantization_threshold=0.2
-        ).reorder(100))
-        
-        # Build the searcher
-        searcher = builder.build()
-        
     with Timer(f"Matching process for {len(treated_df)} treated units"):
-        # Perform matching with caliper
         matched_pairs = []
         used_control_indices = set()
         unmatched_treated = 0
