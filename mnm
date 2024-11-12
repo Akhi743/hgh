@@ -4,32 +4,26 @@ from sklearn.linear_model import LogisticRegression
 import faiss
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
-import threading
-
 warnings.filterwarnings('ignore')
 
-# Original parameters
-DATA_PATH = "HCA_unmatched_data_setup.parquet"
-X_VARIABLES = ["age", "gender_cd", "medical_coverage_tier"]
-TREATMENT_VAR = "grp_binary"
-OUTCOME_VAR = "social_risk_score"
-MATCHING_RATIO = 1
-N_NEIGHBORS = 5
-CALIPER_SD = 0.25
-
-# Optimization parameters
-BATCH_SIZE = 10000
-NUM_THREADS = 4
+# ============= INPUT PARAMETERS =============
+DATA_PATH = "HCA_unmatched_data_setup.parquet"  # Path to your input data file
+X_VARIABLES = ["age", "gender_cd", "medical_coverage_tier"]  # Features to use
+TREATMENT_VAR = "grp_binary"  # Name of treatment/control indicator column
+OUTCOME_VAR = "social_risk_score"  # Name of outcome variable
+MATCHING_RATIO = 1          # Number of control units per treatment unit
+N_NEIGHBORS = 5             # Number of neighbors for KNN matching
+CALIPER_SD = 0.25          # Caliper size in standard deviations of propensity score
+# ==========================================
 
 class Timer:
     def __init__(self, description):
         self.description = description
-    
+        
     def __enter__(self):
         self.start = time.time()
         return self
-    
+        
     def __exit__(self, *args):
         self.end = time.time()
         self.duration = self.end - self.start
@@ -37,256 +31,232 @@ class Timer:
 
 def get_dummy_col(df, features):
     with Timer("Creating dummy variables"):
-        categorical_cols = [col for col in features 
-                          if col in df.columns and 
-                          (df[col].dtype == 'object' or df[col].nunique() < 10)]
-        
-        if categorical_cols:
-            dummies = pd.get_dummies(df[categorical_cols], prefix=categorical_cols, drop_first=False)
-            df_copy = pd.concat([df.drop(columns=categorical_cols), dummies], axis=1)
-        else:
-            df_copy = df.copy()
-    
-    return df_copy, categorical_cols
+        df_copy = df.copy()
+        categorical_cols = []
+   
+        for col in features:
+            if col in df_copy.columns:
+                if df_copy[col].dtype == 'object' or df_copy[col].nunique() < 10:
+                    categorical_cols.append(col)
+                    dummies = pd.get_dummies(df_copy[col], prefix=col, drop_first=False)
+                    df_copy = pd.concat([df_copy, dummies], axis=1)
+                    df_copy = df_copy.drop(columns=[col])
+   
+        return df_copy, categorical_cols
 
 def get_propensity_score(data_frame, x, y, method="glm"):
     with Timer("Calculating propensity scores"):
         if method == 'glm':
-            X = data_frame[x].values
-            Y = data_frame[y].values
-            
             tmp_model = LogisticRegression(
                 penalty='l2',
                 C=1e6,
-                solver='saga',
+                solver='lbfgs',
                 random_state=42,
-                max_iter=1000,
-                n_jobs=-1
+                max_iter=1000
             )
+            tmp_model.fit(data_frame[x], data_frame[y])
+            tmp_dist = tmp_model.predict_proba(data_frame[x])[:, 1]
             
-            tmp_model.fit(X, Y)
-            tmp_dist = tmp_model.predict_proba(X)[:, 1]
-            
+            # Print model coefficients
             print("\nPropensity Score Model Coefficients:")
             coef_df = pd.DataFrame({
                 'Feature': x,
                 'Coefficient': tmp_model.coef_[0]})
+            
             print(coef_df.to_string(index=False))
-    
-    return tmp_model, tmp_dist
+   
+        return tmp_model, tmp_dist
 
 def perform_faiss_matching(treated_df, control_df, caliper, matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
-    with Timer("FAISS matching initialization"):
-        # Convert to float32 for FAISS
+    with Timer("KNN initialization"):
+        # Create FAISS index for matching based on propensity scores
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
-        
-        # Configure IVF index
-        nlist = min(int(np.sqrt(len(control_pscores))), 100)
-        quantizer = faiss.IndexFlatL2(1)
-        index = faiss.IndexIVFFlat(quantizer, 1, nlist)
-        
-        # Train and add vectors
+   
+        # Build FAISS index
+        dimension = 1  # propensity score dimension
+        nlist = min(64, len(control_pscores))  # number of clusters
+        quantizer = faiss.IndexFlatL2(dimension)
+        index = faiss.IndexIVFPQ(quantizer, dimension, nlist)
+   
+        # Train and optimize index
         index.train(control_pscores)
         index.add(control_pscores)
-        index.nprobe = min(nlist, 10)
-        
-        # Search with increased neighbors
-        k = min(n_neighbors * 2, len(control_df))
+        index.nprobe = min(20, nlist)  # Optimize search parameters
+   
+        # Find nearest neighbors for each treated unit
+        k = min(N_NEIGHBORS, len(control_df))
         distances, indices = index.search(treated_pscores, k)
-        
+   
+    with Timer(f"Matching process for {len(treated_df)} treated units"):
+        # Perform matching with caliper
         matched_pairs = []
         used_control_indices = set()
         unmatched_treated = 0
-        
-        # Process matches in parallel batches
-        with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-            futures = []
-            batch_results = []
+   
+        for i, (dist, idx) in enumerate(zip(distances, indices)):
+            matched_controls = []
+            treated_pscore = treated_pscores[i][0]
             
-            for i in range(0, len(treated_df), BATCH_SIZE):
-                end_idx = min(i + BATCH_SIZE, len(treated_df))
-                batch_indices = indices[i:end_idx]
-                batch_treated = treated_pscores[i:end_idx]
+            # Check each potential match
+            for d, control_idx in zip(dist, idx):
+                if len(matched_controls) >= matching_ratio:
+                    break
                 
-                future = executor.submit(
-                    process_batch_matches,
-                    batch_treated,
-                    control_pscores,
-                    batch_indices,
-                    caliper,
-                    matching_ratio,
-                    used_control_indices
-                )
-                futures.append(future)
+                control_pscore = control_pscores[control_idx][0]
+                ps_diff = abs(treated_pscore - control_pscore)
+                
+                if ps_diff <= caliper and control_idx not in used_control_indices:
+                    matched_controls.append(control_idx)
+                    used_control_indices.add(control_idx)
             
-            # Collect results
-            for future in futures:
-                batch_pairs, batch_used = future.result()
-                batch_results.extend(batch_pairs)
-                used_control_indices.update(batch_used)
-        
-        # Convert results to final pairs
-        for treated_idx, control_indices in batch_results:
-            matched_pairs.append(treated_df.iloc[treated_idx])
-            for control_idx in control_indices:
-                matched_pairs.append(control_df.iloc[control_idx])
-    
-    print(f"\nMatching Statistics:")
-    print(f"Successfully matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
-    print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
-    
-    return matched_pairs
+            if len(matched_controls) == matching_ratio:
+                matched_pairs.append(treated_df.iloc[i])
+                for control_idx in matched_controls:
+                    matched_pairs.append(control_df.iloc[control_idx])
+            else:
+                unmatched_treated += 1
+   
+        print(f"\nMatching Statistics:")
+        print(f"Successfully matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
+        print(f"Unmatched treated units: {unmatched_treated}")
+        print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
+   
+        return matched_pairs
 
-def process_batch_matches(batch_treated, control_pscores, batch_indices, caliper, matching_ratio, used_indices):
-    batch_pairs = []
-    batch_used_indices = set()
-    
-    for i, (treated_score, potential_indices) in enumerate(zip(batch_treated, batch_indices)):
-        matched_controls = []
-        
-        for control_idx in potential_indices:
-            if len(matched_controls) >= matching_ratio:
-                break
-                
-            if control_idx in used_indices or control_idx in batch_used_indices:
-                continue
-                
-            control_score = control_pscores[control_idx][0]
-            ps_diff = abs(treated_score[0] - control_score)
-            
-            if ps_diff <= caliper:
-                matched_controls.append(control_idx)
-                batch_used_indices.add(control_idx)
-        
-        if len(matched_controls) == matching_ratio:
-            batch_pairs.append((i, matched_controls))
-    
-    return batch_pairs, batch_used_indices
-
-def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_method='glm'):
+def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_method='glm',
+                matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
     with Timer("Total PSM process"):
-        # Calculate propensity scores
+        # Get propensity scores
         ft_model, ps = get_propensity_score(data_frame, x_var, y_var, method=distance_method)
         data_frame['pscore'] = ps
-        
+   
         caliper = np.std(data_frame['pscore']) * CALIPER_SD
-        
-        # Split data efficiently
-        treatment_mask = data_frame[y_var].values == 1
-        treatment_df = data_frame[treatment_mask]
-        control_df = data_frame[~treatment_mask]
-        
-        print(f"\nInitial sample sizes:")
-        print(f"Treatment group: {len(treatment_df)}")
-        print(f"Control group: {len(control_df)}")
-        
+   
+    with Timer("Splitting data into treatment and control groups"):
+        # Split into treatment and control groups
+        treatment_df = data_frame[data_frame[y_var] == 1].copy()
+        control_df = data_frame[data_frame[y_var] == 0].copy()
+   
         matched_pairs = []
-        
+   
         if match_combinations:
             with Timer("Exact matching process"):
                 total_matched = 0
                 
                 for treated_cats, control_cats in match_combinations:
-                    treated_mask = np.ones(len(treatment_df), dtype=bool)
-                    control_mask = np.ones(len(control_df), dtype=bool)
+                    # Create masks for this combination
+                    treated_mask = pd.Series(True, index=treatment_df.index)
+                    control_mask = pd.Series(True, index=control_df.index)
                     
                     for cat in treated_cats:
-                        treated_mask &= treatment_df[cat].values == 1
+                        treated_mask &= (treatment_df[cat] == 1)
                     for cat in control_cats:
-                        control_mask &= control_df[cat].values == 1
+                        control_mask &= (control_df[cat] == 1)
                     
                     treated_group = treatment_df[treated_mask]
                     control_group = control_df[control_mask]
                     
-                    print(f"\nMatching combination:")
-                    print(f"Treated categories: {treated_cats}")
-                    print(f"Control categories: {control_cats}")
-                    print(f"Treated units available: {len(treated_group)}")
-                    print(f"Control units available: {len(control_group)}")
-                    
                     if len(treated_group) > 0 and len(control_group) >= matching_ratio:
                         curr_matched_pairs = perform_faiss_matching(
                             treated_group, control_group, caliper,
-                            matching_ratio, N_NEIGHBORS
+                            matching_ratio, n_neighbors
                         )
                         matched_pairs.extend(curr_matched_pairs)
                         total_matched += len(curr_matched_pairs) // (matching_ratio + 1)
-                        print(f"Successfully matched {len(curr_matched_pairs) // (matching_ratio + 1)} pairs")
+                        print(f"Successfully matched {len(curr_matched_pairs) // (matching_ratio + 1)} pairs in this combination")
                     else:
                         print(f"Insufficient units for matching in this combination")
                 
                 print(f"\nTotal matched pairs across all combinations: {total_matched}")
+                
+                # If no matches found with exact matching, fall back to regular PSM
+                if len(matched_pairs) == 0:
+                    print("\nNo matches found with exact matching. Falling back to regular PSM...")
+                    matched_pairs = perform_faiss_matching(
+                        treatment_df, control_df, caliper,
+                        matching_ratio, n_neighbors
+                    )
         else:
-            matched_pairs = perform_faiss_matching(
-                treatment_df, control_df, caliper,
-                matching_ratio, N_NEIGHBORS
-            )
-        
-        if not matched_pairs:
-            return ft_model, None
-        
-        matched_df = pd.DataFrame(matched_pairs)
-        
-        # Calculate and print matching quality metrics
-        print("\nMatching Quality Metrics:")
-        for var in x_var:
-            treated_vals = matched_df[matched_df[y_var] == 1][var]
-            control_vals = matched_df[matched_df[y_var] == 0][var]
-            print(f"\n{var}:")
-            print(f"  Treated mean: {treated_vals.mean():.4f}")
-            print(f"  Control mean: {control_vals.mean():.4f}")
-            print(f"  Standardized diff: {(treated_vals.mean() - control_vals.mean()) / np.std(matched_df[var]):.4f}")
-    
-    return ft_model, matched_df
+            with Timer("Regular PSM matching"):
+                print("\nPerforming regular PSM without exact matching...")
+                matched_pairs = perform_faiss_matching(
+                    treatment_df, control_df, caliper,
+                    matching_ratio, n_neighbors
+                 )
+   
+            if not matched_pairs:
+                print("Warning: No matches found with current settings")
+                return ft_model, None
+                
+        with Timer("Creating final matched DataFrame"):
+            matched_df = pd.DataFrame(matched_pairs)
+   
+            print(f"\nFinal Matching Results:")
+            print(f"Matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
+            print(f"Matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
+   
+            return ft_model, matched_df
 
 def main():
     with Timer("\nTotal execution time"):
         # Load data
         print(f"\nLoading data from {DATA_PATH}...")
         with Timer("Loading data"):
-            df = pd.read_parquet(DATA_PATH)
-        
-        # Create dummy variables
+            try:
+                df = pd.read_parquet(DATA_PATH)
+            except Exception as e:
+                print(f"Error loading data: {str(e)}")
+                exit(1)
+            
+        # Create dummy variables using automatic detection
+        print("\nProcessing features and creating dummy variables...")
         df_encoded, categorical_cols = get_dummy_col(df, X_VARIABLES)
-        
-        # Update features list
+   
+        # Update features list with dummy variable columns
         features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
         for col in categorical_cols:
             dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
             features_for_model.extend(dummy_cols)
-        
-        # Example matching configuration
-        match_combinations = [(['gender_cd_F'], ['gender_cd_M'])]
-        
-        print("\nFeatures used for matching:")
-        print(f"Original features: {X_VARIABLES}")
-        print(f"Categorical features detected: {categorical_cols}")
-        print(f"Final features after encoding: {features_for_model}")
-        
+   
+        # Example matching configurations - choose one:
+   
+        # 1. Medical coverage tier matching
+        # match_combinations =[(['medical_coverage_tier_employee only'], ['medical_coverage_tier_employee plus 1'])]
+   
+        # 2. Regular PSM (no exact matching)
+        #match_combinations = None
+   
+        # 3. Female to Female matching
+        # match_combinations = [(['gender_cd_F'], ['gender_cd_F'])]
+   
+        # 4. Male to Female matching
+        match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
+   
         if match_combinations:
-            print("\nMatching combinations:")
             for treated_cats, control_cats in match_combinations:
-                print(f"Treated {treated_cats} -> Control {control_cats}")
-        
+                print(f"{treated_cats} -> {control_cats}")
+        else:
+            print("\nNo exact matching specified - performing regular PSM")
+   
         # Run PSM
+        print("\nRunning propensity score matching...")
         model, matched_data = psm_function(
             data_frame=df_encoded,
             x_var=features_for_model,
             y_var=TREATMENT_VAR,
             match_combinations=match_combinations
         )
-        
+   
         if matched_data is not None:
+            # Calculate treatment effect
             ate = matched_data[matched_data[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
                   matched_data[matched_data[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
             
             print(f"\nResults:")
             print(f"Average Treatment Effect: {ate:.4f}")
-            
-            # Save matched data
-            matched_data.to_parquet("matched_data.parquet")
-            print("\nMatched data saved to 'matched_data.parquet'")
+            print(matched_data.groupby(['grp_binary', 'gender_cd_M']).size())
+            print(matched_data.groupby(['grp_binary', 'medical_coverage_tier_employee only']).size())
 
 if __name__ == "__main__":
     main()
