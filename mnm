@@ -86,9 +86,15 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
         treated_df = treated_df.reset_index(drop=True)
         control_df = control_df.reset_index(drop=True)
         
-        # Prepare data for ScaNN
+        # Prepare data for ScaNN - convert to numpy arrays
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+        
+        # Convert any TensorFlow tensors to numpy arrays
+        if hasattr(treated_pscores, 'numpy'):
+            treated_pscores = treated_pscores.numpy()
+        if hasattr(control_pscores, 'numpy'):
+            control_pscores = control_pscores.numpy()
         
         # Handle any non-finite values
         treated_mask = np.isfinite(treated_pscores).ravel()
@@ -109,21 +115,23 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
             print("Error: No valid data remaining after removing non-finite values")
             return pd.DataFrame()
         
+        # Ensure all values are finite before normalization
+        np.clip(treated_pscores, -1e10, 1e10, out=treated_pscores)
+        np.clip(control_pscores, -1e10, 1e10, out=control_pscores)
+        
         # Add small epsilon to avoid zero division in normalization
         epsilon = 1e-8
         
-        # Normalize the data safely
-        control_norms = np.linalg.norm(control_pscores, axis=1)[:, np.newaxis]
-        control_norms = np.maximum(control_norms, epsilon)
-        control_pscores = control_pscores / control_norms
+        # Normalize the data safely using numpy operations
+        control_norms = np.maximum(np.linalg.norm(control_pscores, axis=1, keepdims=True), epsilon)
+        treated_norms = np.maximum(np.linalg.norm(treated_pscores, axis=1, keepdims=True), epsilon)
         
-        treated_norms = np.linalg.norm(treated_pscores, axis=1)[:, np.newaxis]
-        treated_norms = np.maximum(treated_norms, epsilon)
+        control_pscores = control_pscores / control_norms
         treated_pscores = treated_pscores / treated_norms
         
         try:
             searcher = scann.scann_ops.builder(
-                control_pscores, 
+                control_pscores,
                 n_neighbors,
                 "dot_product"
             ).tree(
@@ -132,10 +140,10 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
             ).score_brute_force(
                 quantize=False
             ).build()
-            
-        except AttributeError:
-            searcher = scann.scann_ops_pybind.builder(
-                control_pscores, 
+        except (AttributeError, TypeError):
+            # Try alternative initialization
+            searcher = scann.builder(
+                control_pscores,
                 n_neighbors,
                 "dot_product"
             ).tree(
@@ -151,36 +159,53 @@ def perform_scann_matching(treated_df, control_df, caliper, matching_ratio=MATCH
         unmatched_treated = 0
         
         # Perform batch search
-        neighbors, distances = searcher.search_batched(treated_pscores)
-        
-        # Process matches
-        for i in range(len(treated_df)):
-            matched_controls = []
-            treated_pscore = treated_df.loc[i, 'pscore']
+        try:
+            neighbors, distances = searcher.search_batched(treated_pscores)
             
-            # Check each potential match
-            for control_idx, distance in zip(neighbors[i], distances[i]):
-                if len(matched_controls) >= matching_ratio:
-                    break
-                    
-                control_pscore = control_df.loc[control_idx, 'pscore']
-                ps_diff = abs(treated_pscore - control_pscore)
+            # Convert TensorFlow tensors to numpy if needed
+            if hasattr(neighbors, 'numpy'):
+                neighbors = neighbors.numpy()
+            if hasattr(distances, 'numpy'):
+                distances = distances.numpy()
+            
+            # Process matches
+            for i in range(len(treated_df)):
+                matched_controls = []
+                treated_pscore = float(treated_df.loc[i, 'pscore'])
                 
-                if ps_diff <= caliper and control_idx not in used_control_indices:
-                    matched_controls.append(control_idx)
-                    used_control_indices.add(control_idx)
+                # Check each potential match
+                for control_idx, distance in zip(neighbors[i], distances[i]):
+                    # Convert tensor to int if needed
+                    if hasattr(control_idx, 'numpy'):
+                        control_idx = int(control_idx.numpy())
+                    else:
+                        control_idx = int(control_idx)
+                    
+                    if len(matched_controls) >= matching_ratio:
+                        break
+                        
+                    control_pscore = float(control_df.loc[control_idx, 'pscore'])
+                    ps_diff = abs(treated_pscore - control_pscore)
+                    
+                    if ps_diff <= caliper and control_idx not in used_control_indices:
+                        matched_controls.append(control_idx)
+                        used_control_indices.add(control_idx)
+                
+                if len(matched_controls) == matching_ratio:
+                    matched_pairs.append(treated_df.loc[i].to_dict())
+                    for control_idx in matched_controls:
+                        matched_pairs.append(control_df.loc[control_idx].to_dict())
+                else:
+                    unmatched_treated += 1
             
-            if len(matched_controls) == matching_ratio:
-                matched_pairs.append(treated_df.loc[i])
-                for control_idx in matched_controls:
-                    matched_pairs.append(control_df.loc[control_idx])
-            else:
-                unmatched_treated += 1
-        
-        print(f"\nMatching Statistics:")
-        print(f"Successfully matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
-        print(f"Unmatched treated units: {unmatched_treated}")
-        print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
+            print(f"\nMatching Statistics:")
+            print(f"Successfully matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
+            print(f"Unmatched treated units: {unmatched_treated}")
+            print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
+            
+        except Exception as e:
+            print(f"Error during matching: {str(e)}")
+            return pd.DataFrame()
         
         # Convert matched pairs to DataFrame
         if matched_pairs:
@@ -277,6 +302,14 @@ def main():
         # Clean data before processing
         df_encoded = clean_data(df_encoded, features_for_model)
         
+        # Convert any remaining object columns to numeric
+        for col in df_encoded.columns:
+            if df_encoded[col].dtype == 'object':
+                try:
+                    df_encoded[col] = pd.to_numeric(df_encoded[col])
+                except:
+                    print(f"Warning: Could not convert column {col} to numeric")
+        
         match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
         
         if match_combinations:
@@ -294,20 +327,28 @@ def main():
         )
         
         if matched_data is not None:
-            ate = matched_data[matched_data[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
-                  matched_data[matched_data[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
-            
-            print(f"\nResults:")
-            print(f"Average Treatment Effect: {ate:.4f}")
-            print("\nMatched pairs by gender:")
-            print(matched_data.groupby(['grp_binary', 'gender_cd_M']).size())
-            print("\nMatched pairs by coverage tier:")
-            print(matched_data.groupby(['grp_binary', 'medical_coverage_tier_employee only']).size())
-            
-            # Save matched data to file
-            output_file = "matched_data.parquet"
-            matched_data.to_parquet(output_file)
-            print(f"\nMatched data saved to {output_file}")
+            try:
+                # Convert any tensor values to float
+                matched_data = matched_data.applymap(lambda x: float(x) if hasattr(x, 'numpy') else x)
+                
+                ate = matched_data[matched_data[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
+                      matched_data[matched_data[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
+                
+                print(f"\nResults:")
+                print(f"Average Treatment Effect: {ate:.4f}")
+                print("\nMatched pairs by gender:")
+                print(matched_data.groupby(['grp_binary', 'gender_cd_M']).size())
+                print("\nMatched pairs by coverage tier:")
+                print(matched_data.groupby(['grp_binary', 'medical_coverage_tier_employee only']).size())
+                
+                # Save matched data to file
+                output_file = "matched_data.parquet"
+                matched_data.to_parquet(output_file)
+                print(f"\nMatched data saved to {output_file}")
+                
+            except Exception as e:
+                print(f"Error in processing results: {str(e)}")
+                print("Try examining the matched_data DataFrame directly for debugging")
 
 if __name__ == "__main__":
     main()
