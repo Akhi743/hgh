@@ -126,6 +126,29 @@ def knn_faiss_ivf(treated_df, control_df, caliper, matching_ratio=1, n_neighbors
         return process_faiss_matches(treated_df, control_df, treated_pscores, control_pscores, 
                                    distances, indices, caliper, matching_ratio)
 
+def knn_faiss_hnsw(treated_df, control_df, caliper, matching_ratio=1, n_neighbors=5):
+    """Perform matching using FAISS HNSW index for optimal speed-accuracy trade-off."""
+    with Timer("KNN FAISS HNSW matching"):
+        treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
+        control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+        
+        dimension = 1
+        m = 16  # number of connections per layer
+        ef_construction = 40  # controls index building quality
+        
+        index = faiss.IndexHNSWFlat(dimension, m)
+        index.hnsw.efConstruction = ef_construction
+        index.add(control_pscores)
+        
+        ef_search = 10  # controls search quality
+        index.hnsw.efSearch = ef_search
+        
+        k = min(n_neighbors, len(control_df))
+        distances, indices = index.search(treated_pscores, k)
+        
+        return process_faiss_matches(treated_df, control_df, treated_pscores, control_pscores, 
+                                   distances, indices, caliper, matching_ratio)
+
 def process_faiss_matches(treated_df, control_df, treated_pscores, control_pscores, 
                          distances, indices, caliper, matching_ratio):
     """Helper function to process FAISS matching results."""
@@ -175,7 +198,7 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
         x_variables (list): List of feature names
         treatment_var (str): Name of treatment indicator column
         outcome_var (str): Name of outcome variable
-        match_method (str): One of 'sklearn', 'faiss', or 'faiss_ivf'
+        match_method (str): One of 'sklearn', 'faiss', 'faiss_ivf', or 'faiss_hnsw'
         match_combinations (list): List of tuples for exact matching
         matching_ratio (int): Number of control units per treatment unit
         n_neighbors (int): Number of neighbors for KNN
@@ -200,7 +223,8 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
     matching_functions = {
         'sklearn': knn_sklearn,
         'faiss': knn_faiss,
-        'faiss_ivf': knn_faiss_ivf
+        'faiss_ivf': knn_faiss_ivf,
+        'faiss_hnsw': knn_faiss_hnsw
     }
     matching_func = matching_functions.get(match_method)
     if not matching_func:
@@ -293,7 +317,7 @@ if __name__ == "__main__":
     match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
     
     # Run matching with selected method
-    selected_method = 'sklearn'  # Change this to 'faiss' or 'faiss_ivf' as needed
+    selected_method = 'faiss_hnsw'  # Options: 'sklearn', 'faiss', 'faiss_ivf', 'faiss_hnsw'
     model, matched_data = psm_main_function(
         match_method=selected_method,
         match_combinations=match_combinations,
