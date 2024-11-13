@@ -1,0 +1,270 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+import faiss
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+class Timer:
+    def __init__(self, description):
+        self.description = description
+    
+    def __enter__(self):
+        self.start = time.time()
+        return self
+    
+    def __exit__(self, *args):
+        self.end = time.time()
+        self.duration = self.end - self.start
+        print(f"{self.description}: {self.duration:.4f} seconds")
+
+def get_dummy_col(df, features):
+    """Create dummy variables for categorical features, ignoring binary variables."""
+    with Timer("Creating dummy variables"):
+        df_copy = df.copy()
+        categorical_cols = []
+        
+        for col in features:
+            if col in df_copy.columns:
+                # Only create dummies if column is object type (like 'race')
+                # and not already binary (0/1)
+                if df_copy[col].dtype == 'object':
+                    categorical_cols.append(col)
+                    dummies = pd.get_dummies(df_copy[col], prefix=col, drop_first=False)
+                    df_copy = pd.concat([df_copy, dummies], axis=1)
+                    df_copy = df_copy.drop(columns=[col])
+    
+    return df_copy, categorical_cols
+
+def get_propensity_score(data_frame, x, y, method="glm"):
+    """Calculate propensity scores using logistic regression."""
+    with Timer("Calculating propensity scores"):
+        if method == 'glm':
+            model = LogisticRegression(
+                penalty='l2',
+                C=1e6,
+                solver='lbfgs',
+                random_state=42,
+                max_iter=1000
+            )
+            model.fit(data_frame[x], data_frame[y])
+            scores = model.predict_proba(data_frame[x])[:, 1]
+            
+            print("\nPropensity Score Model Coefficients:")
+            coef_df = pd.DataFrame({
+                'Feature': x,
+                'Coefficient': model.coef_[0]})
+            print(coef_df.to_string(index=False))
+            
+        return model, scores
+
+def knn_sklearn(treated_df, control_df, x_var, caliper, matching_ratio=1, n_neighbors=5):
+    """Perform matching using sklearn KNeighborsClassifier."""
+    with Timer("KNN sklearn matching"):
+        matched_pairs = []
+        used_control_indices = set()
+        
+        knn = KNeighborsClassifier(n_neighbors=n_neighbors)
+        knn.fit(control_df[x_var], np.zeros(len(control_df)))
+        
+        for idx, treated_unit in treated_df.iterrows():
+            distances, indices = knn.kneighbors([treated_unit[x_var]])
+            potential_matches = control_df.iloc[indices[0]]
+            
+            eligible_matches = potential_matches[
+                (abs(potential_matches['pscore'] - treated_unit['pscore']) <= caliper) &
+                (~potential_matches.index.isin(used_control_indices))
+            ]
+            
+            if len(eligible_matches) >= matching_ratio:
+                selected_matches = eligible_matches.iloc[:matching_ratio]
+                matched_pairs.append(treated_unit)
+                for _, match in selected_matches.iterrows():
+                    matched_pairs.append(match)
+                    used_control_indices.add(match.name)
+        
+        print(f"Successfully matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
+        print(f"Unmatched treated units: {len(treated_df) - len(matched_pairs) // (matching_ratio + 1)}")
+        
+        return matched_pairs
+
+def knn_faiss(treated_df, control_df, caliper, matching_ratio=1, n_neighbors=5):
+    """Perform matching using basic FAISS index."""
+    with Timer("KNN FAISS matching"):
+        treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
+        control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+        
+        dimension = 1
+        index = faiss.IndexFlatL2(dimension)
+        index.add(control_pscores)
+        
+        k = min(n_neighbors, len(control_df))
+        distances, indices = index.search(treated_pscores, k)
+        
+        return process_faiss_matches(treated_df, control_df, treated_pscores, control_pscores, 
+                                   distances, indices, caliper, matching_ratio)
+
+def knn_faiss_ivf(treated_df, control_df, caliper, matching_ratio=1, n_neighbors=5):
+    """Perform matching using FAISS IVF index for improved performance."""
+    with Timer("KNN FAISS IVF matching"):
+        treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
+        control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+        
+        dimension = 1
+        nlist = min(64, len(control_pscores))
+        quantizer = faiss.IndexFlatL2(dimension)
+        index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+        
+        index.train(control_pscores)
+        index.add(control_pscores)
+        index.nprobe = min(20, nlist)
+        
+        k = min(n_neighbors, len(control_df))
+        distances, indices = index.search(treated_pscores, k)
+        
+        return process_faiss_matches(treated_df, control_df, treated_pscores, control_pscores, 
+                                   distances, indices, caliper, matching_ratio)
+
+def knn_faiss_hnsw(treated_df, control_df, caliper, matching_ratio=1, n_neighbors=5):
+    """Perform matching using FAISS HNSW index for optimal speed-accuracy trade-off."""
+    with Timer("KNN FAISS HNSW matching"):
+        treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
+        control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+        
+        dimension = 1
+        m = 16  # number of connections per layer
+        ef_construction = 40  # controls index building quality
+        
+        index = faiss.IndexHNSWFlat(dimension, m)
+        index.hnsw.efConstruction = ef_construction
+        index.add(control_pscores)
+        
+        ef_search = 10  # controls search quality
+        index.hnsw.efSearch = ef_search
+        
+        k = min(n_neighbors, len(control_df))
+        distances, indices = index.search(treated_pscores, k)
+        
+        return process_faiss_matches(treated_df, control_df, treated_pscores, control_pscores, 
+                                   distances, indices, caliper, matching_ratio)
+
+def process_faiss_matches(treated_df, control_df, treated_pscores, control_pscores, 
+                         distances, indices, caliper, matching_ratio):
+    """Helper function to process FAISS matching results."""
+    matched_pairs = []
+    used_control_indices = set()
+    unmatched_treated = 0
+    
+    for i, (dist, idx) in enumerate(zip(distances, indices)):
+        matched_controls = []
+        treated_pscore = treated_pscores[i][0]
+        
+        for d, control_idx in zip(dist, idx):
+            if len(matched_controls) >= matching_ratio:
+                break
+            
+            if control_idx == -1:  # FAISS returns -1 for no match found
+                continue
+                
+            control_pscore = control_pscores[control_idx][0]
+            ps_diff = abs(treated_pscore - control_pscore)
+            
+            if ps_diff <= caliper and control_idx not in used_control_indices:
+                matched_controls.append(control_idx)
+                used_control_indices.add(control_idx)
+        
+        if len(matched_controls) == matching_ratio:
+            matched_pairs.append(treated_df.iloc[i])
+            for control_idx in matched_controls:
+                matched_pairs.append(control_df.iloc[control_idx])
+        else:
+            unmatched_treated += 1
+    
+    print(f"Successfully matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
+    print(f"Unmatched treated units: {unmatched_treated}")
+    
+    return matched_pairs
+
+def run_all_methods(data_path, x_variables, treatment_var, outcome_var, 
+                   matching_ratio=1, n_neighbors=5, caliper_sd=0.25):
+    """Run all matching methods with a single propensity score calculation."""
+    
+    # Load and prepare data once
+    with Timer("Loading and preparing data"):
+        df = pd.read_csv(data_path)
+        df_encoded, categorical_cols = get_dummy_col(df, x_variables)
+        
+        features_for_model = [col for col in x_variables if col not in categorical_cols]
+        for col in categorical_cols:
+            dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
+            features_for_model.extend(dummy_cols)
+    
+    # Calculate propensity scores once
+    model, ps = get_propensity_score(df_encoded, features_for_model, treatment_var)
+    df_encoded['pscore'] = ps
+    caliper = np.std(df_encoded['pscore']) * caliper_sd
+    
+    # Prepare treated and control groups once
+    treated_df = df_encoded[df_encoded[treatment_var] == 1].copy()
+    control_df = df_encoded[df_encoded[treatment_var] == 0].copy()
+    
+    # Print initial statistics
+    print("\nInitial Dataset Statistics:")
+    print(f"Total observations: {len(df)}")
+    print(f"Treatment group size: {len(treated_df)}")
+    print(f"Control group size: {len(control_df)}")
+    
+    # Dictionary to store results
+    results = {}
+    
+    # Run each matching method
+    matching_functions = {
+        'sklearn': knn_sklearn,
+        'faiss': knn_faiss,
+        'faiss_ivf': knn_faiss_ivf,
+        'faiss_hnsw': knn_faiss_hnsw
+    }
+    
+    print("\nRunning all matching methods...")
+    for method_name, matching_func in matching_functions.items():
+        print(f"\nMethod: {method_name}")
+        
+        if method_name == 'sklearn':
+            matched_pairs = matching_func(
+                treated_df, control_df, features_for_model,
+                caliper, matching_ratio, n_neighbors
+            )
+        else:
+            matched_pairs = matching_func(
+                treated_df, control_df, caliper,
+                matching_ratio, n_neighbors
+            )
+            
+        if matched_pairs:
+            matched_df = pd.DataFrame(matched_pairs)
+            ate = matched_df[matched_df[treatment_var] == 1][outcome_var].mean() - \
+                  matched_df[matched_df[treatment_var] == 0][outcome_var].mean()
+            print(f"Average Treatment Effect: ${ate:.2f}")
+            results[method_name] = {'model': model, 'matched_data': matched_df, 'ate': ate}
+        else:
+            print("Warning: No matches found with current settings")
+            results[method_name] = {'model': model, 'matched_data': None, 'ate': None}
+    
+    return results
+
+if __name__ == "__main__":
+    # Example usage
+    params = {
+        'data_path': "lalonde.csv",
+        'x_variables': ['age', 'educ', 'race', 'married', 'nodegree', 're74', 're75'],
+        'treatment_var': "treat",
+        'outcome_var': "re78",
+        'matching_ratio': 1,
+        'n_neighbors': 5,
+        'caliper_sd': 0.25
+    }
+    
+    # Run all methods with a single propensity score calculation
+    results = run_all_methods(**params)
