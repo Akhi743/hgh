@@ -1,7 +1,6 @@
-# constants.py
 class Constants:
     # Model Architecture
-    DRNET_INPUT_NODES = 7  # age,educ,race,married,nodegree,re74,re75
+    DRNET_INPUT_NODES = 7  # LaLonde features
     DRNET_SHARED_NODES = 200
     DRNET_OUTPUT_NODES = 100
     
@@ -47,7 +46,18 @@ class Constants:
     INFO_GAN_LAMBDA = 0.2
     INFO_GAN_ALPHA = 1
 
-# dataloader.py
+
+
+
+
+
+
+
+
+
+
+
+
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -55,46 +65,48 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 class LaLondeDataset:
-    def __init__(self, csv_path, split_size=0.8):
-        # Read and preprocess data
+    def __init__(self):
+        pass
+        
+    def load_train_test_lalonde_random(self, csv_path, split_size):
+        # Read data
         df = pd.read_csv(csv_path)
         
         # Convert categorical variables
         df['race'] = df['race'].map({'white': 0, 'black': 1, 'hispan': 2})
         
         # Define features
-        self.feature_cols = ['age', 'educ', 'race', 'married', 'nodegree', 're74', 're75']
+        feature_cols = ['age', 'educ', 'race', 'married', 'nodegree', 're74', 're75']
         
         # Standardize features
         scaler = StandardScaler()
-        df[self.feature_cols] = scaler.fit_transform(df[self.feature_cols])
+        df[feature_cols] = scaler.fit_transform(df[feature_cols])
         
         # Extract arrays
-        self.X = df[self.feature_cols].values
-        self.T = df['treat'].values.reshape(-1, 1)
-        self.Y = df['re78'].values.reshape(-1, 1)
+        X = df[feature_cols].values
+        T = df['treat'].values.reshape(-1, 1)
+        Y = df['re78'].values.reshape(-1, 1)
         
         # Split data
         train_size = int(split_size * len(df))
         indices = np.random.permutation(len(df))
         
-        self.train_idx = indices[:train_size]
-        self.test_idx = indices[train_size:]
+        train_idx = indices[:train_size]
+        test_idx = indices[train_size:]
         
-    def load_train_test_ihdp_random(self, csv_path, split_size):
-        train_X = self.X[self.train_idx]
-        train_T = self.T[self.train_idx]
-        train_Y = self.Y[self.train_idx]
-        train_Ycf = np.zeros_like(train_Y)  # Placeholder for counterfactuals
-        
-        test_X = self.X[self.test_idx]
-        test_T = self.T[self.test_idx]
-        test_Y = self.Y[self.test_idx]
-        test_Ycf = np.zeros_like(test_Y)
-        
-        # Create mu0 and mu1 (potential outcomes)
+        # Training data
+        train_X = X[train_idx]
+        train_T = T[train_idx]
+        train_Y = Y[train_idx]
+        train_Ycf = np.zeros_like(train_Y)
         train_mu0 = np.zeros_like(train_Y)
         train_mu1 = np.zeros_like(train_Y)
+        
+        # Test data
+        test_X = X[test_idx]
+        test_T = T[test_idx]
+        test_Y = Y[test_idx]
+        test_Ycf = np.zeros_like(test_Y)
         test_mu0 = np.zeros_like(test_Y)
         test_mu1 = np.zeros_like(test_Y)
         
@@ -122,29 +134,53 @@ class TensorDataset(Dataset):
         return (self.X[idx], self.T[idx], self.Y_f[idx],
                 self.Y_cf[idx], self.mu0[idx], self.mu1[idx])
 
-# metrics.py
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+
 class Metrics:
     @staticmethod
     def PEHE(y1_true, y0_true, y1_pred, y0_pred):
+        """Precision in Estimation of Heterogeneous Effect."""
         return np.sqrt(np.mean((y1_true - y0_true - (y1_pred - y0_pred)) ** 2))
     
     @staticmethod
     def ATE(y1_true, y0_true, y1_pred, y0_pred):
+        """Average Treatment Effect."""
         true_ate = np.mean(y1_true - y0_true)
         pred_ate = np.mean(y1_pred - y0_pred)
         return np.abs(true_ate - pred_ate)
 
-# main.py
-if __name__ == '__main__':
-    from Constants import Constants
-    from Experiments import Experiments
-    
-    # Initialize experiment
-    running_mode = "original_data"
-    experiments = Experiments(running_mode)
-    
-    # Load and process LaLonde dataset
-    csv_path = "lalonde.csv"
-    
-    # Run experiments
-    experiments.run_all_experiments(None, None, iterations=100)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
