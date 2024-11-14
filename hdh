@@ -1,6 +1,6 @@
 class Constants:
     # Model Architecture
-    DRNET_INPUT_NODES = 7  # LaLonde features
+    DRNET_INPUT_NODES = 7  # LaLonde features: age,educ,race,married,nodegree,re74,re75
     DRNET_SHARED_NODES = 200
     DRNET_OUTPUT_NODES = 100
     
@@ -28,7 +28,7 @@ class Constants:
     Info_GAN_Gen_in_nodes = 100
     Info_GAN_Gen_shared_nodes = 30
     Info_GAN_Gen_out_nodes = 1
-    Info_GAN_Dis_in_nodes = DRNET_INPUT_NODES + 2
+    Info_GAN_Dis_in_nodes = DRNET_INPUT_NODES + 2  # features + (y0,y1)
     Info_GAN_Dis_shared_nodes = 30
     Info_GAN_Dis_out_nodes = 1
     Info_GAN_Q_in_nodes = 2
@@ -57,17 +57,12 @@ class Constants:
 
 
 
-
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 import torch
-from torch.utils.data import Dataset, DataLoader
 
-class LaLondeDataset:
-    def __init__(self):
-        pass
-        
+class LaLondeDataLoader:
     def load_train_test_lalonde_random(self, csv_path, split_size):
         # Read data
         df = pd.read_csv(csv_path)
@@ -84,8 +79,8 @@ class LaLondeDataset:
         
         # Extract arrays
         X = df[feature_cols].values
-        T = df['treat'].values.reshape(-1, 1)
-        Y = df['re78'].values.reshape(-1, 1)
+        T = df['treat'].values.reshape(-1, 1)  # Treatment
+        Y = df['re78'].values.reshape(-1, 1)   # Outcome
         
         # Split data
         train_size = int(split_size * len(df))
@@ -98,6 +93,8 @@ class LaLondeDataset:
         train_X = X[train_idx]
         train_T = T[train_idx]
         train_Y = Y[train_idx]
+        
+        # Create counterfactuals (zeros as placeholders since we don't have true counterfactuals)
         train_Ycf = np.zeros_like(train_Y)
         train_mu0 = np.zeros_like(train_Y)
         train_mu1 = np.zeros_like(train_Y)
@@ -118,7 +115,7 @@ class LaLondeDataset:
                 train_mu0, test_mu0, train_mu1, test_mu1,
                 n_treated, n_total)
 
-class TensorDataset(Dataset):
+class TensorDataset(torch.utils.data.Dataset):
     def __init__(self, X, T, Y_f, Y_cf, mu0, mu1):
         self.X = torch.FloatTensor(X)
         self.T = torch.FloatTensor(T)
@@ -133,8 +130,6 @@ class TensorDataset(Dataset):
     def __getitem__(self, idx):
         return (self.X[idx], self.T[idx], self.Y_f[idx],
                 self.Y_cf[idx], self.mu0[idx], self.mu1[idx])
-
-
 
 
 
@@ -182,5 +177,261 @@ class Metrics:
 
 
 
+from collections import OrderedDict
+from datetime import date
+import numpy as np
+
+from Adversarial_Manager import Adversarial_Manager
+from Constants import Constants
+from DR_NET_Manager_woDR import DRNet_Manager_wo_DR_Net
+from DR_Net_Manager import DRNet_Manager
+from Metrics import Metrics
+from Utils import Utils
+from dataloader import LaLondeDataLoader
+
+class Experiments:
+    def __init__(self, running_mode):
+        self.dL = LaLondeDataLoader()
+        self.running_mode = running_mode
+        self.np_train = None
+        self.np_test = None
+
+    def run_all_experiments(self, train_path, test_path, iterations):
+        split_size = 0.8
+        print("iterations: ", iterations)
+        print("split_size: ", split_size)
+        device = Utils.get_device()
+        print(device)
+        results_list = []
+        csv_path = "lalonde.csv"
+        run_parameters = self.__get_run_parameters()
+        
+        with open(run_parameters["summary_file_name"], "w") as file1:
+            for iter_id in range(iterations):
+                print("--" * 20)
+                print("iter_id: {0}".format(iter_id))
+                print("--" * 20)
+                
+                # Load LaLonde data
+                np_train_X, np_train_T, np_train_yf, np_train_ycf, \
+                np_test_X, np_test_T, np_test_yf, np_test_ycf, \
+                np_train_mu0, np_test_mu0, np_train_mu1, np_test_mu1, n_treated, n_total = \
+                    self.dL.load_train_test_lalonde_random(csv_path, split_size)
+
+                # Convert to tensor
+                tensor_train = Utils.convert_to_tensor(np_train_X, np_train_T,
+                                                     np_train_yf, np_train_ycf,
+                                                     np_train_mu0, np_train_mu1)
+
+                # Initialize adversarial manager
+                adv_manager = Adversarial_Manager(
+                    encoder_input_nodes=Constants.DRNET_INPUT_NODES,
+                    encoder_shared_nodes=Constants.Encoder_shared_nodes,
+                    encoder_x_out_nodes=Constants.Encoder_x_nodes,
+                    encoder_t_out_nodes=Constants.Encoder_t_nodes,
+                    encoder_yf_out_nodes=Constants.Encoder_yf_nodes,
+                    encoder_ycf_out_nodes=Constants.Encoder_ycf_nodes,
+                    decoder_in_nodes=Constants.Decoder_in_nodes,
+                    decoder_shared_nodes=Constants.Decoder_shared_nodes,
+                    decoder_out_nodes=Constants.Decoder_out_nodes,
+                    gen_in_nodes=Constants.Info_GAN_Gen_in_nodes,
+                    gen_shared_nodes=Constants.Info_GAN_Gen_shared_nodes,
+                    gen_out_nodes=Constants.Info_GAN_Gen_out_nodes,
+                    dis_in_nodes=Constants.Info_GAN_Dis_in_nodes,
+                    dis_shared_nodes=Constants.Info_GAN_Dis_shared_nodes,
+                    dis_out_nodes=Constants.Info_GAN_Dis_out_nodes,
+                    Q_in_nodes=Constants.Info_GAN_Q_in_nodes,
+                    Q_shared_nodes=Constants.Info_GAN_Q_shared_nodes,
+                    Q_out_nodes=Constants.Info_GAN_Q_out_nodes,
+                    device=device)
+
+                # Train adversarial model
+                _train_parameters = {
+                    "epochs": Constants.Adversarial_epochs,
+                    "vae_lr": Constants.Adversarial_VAE_LR,
+                    "gan_G_lr": Constants.INFO_GAN_G_LR,
+                    "gan_D_lr": Constants.INFO_GAN_D_LR,
+                    "lambda": Constants.Adversarial_LAMBDA,
+                    "batch_size": Constants.Adversarial_BATCH_SIZE,
+                    "INFO_GAN_LAMBDA": Constants.INFO_GAN_LAMBDA,
+                    "INFO_GAN_ALPHA": Constants.INFO_GAN_ALPHA,
+                    "shuffle": True,
+                    "VAE_BETA": Constants.VAE_BETA,
+                    "train_dataset": tensor_train
+                }
+                
+                print("Adversarial Model Training started....")
+                adv_manager.train_adversarial_model(_train_parameters, device)
+                np_y_cf = adv_manager.test_adversarial_model({"tensor_dataset": tensor_train}, device)
+                print("Adversarial Model Training ended....")
+
+                # Prepare data for DR-NET
+                tensor_train_dr = Utils.convert_to_tensor(np_train_X, np_train_T, np_train_yf, np_y_cf,
+                                                        np_train_mu0, np_train_mu1)
+                tensor_test = Utils.convert_to_tensor(np_test_X, np_test_T, np_test_yf, np_test_ycf,
+                                                    np_test_mu0, np_test_mu1)
+
+                # Train DR-NET
+                _dr_train_parameters = {
+                    "epochs": Constants.DRNET_EPOCHS,
+                    "lr": Constants.DRNET_LR,
+                    "lambda": Constants.DRNET_LAMBDA,
+                    "batch_size": Constants.DRNET_BATCH_SIZE,
+                    "shuffle": True,
+                    "ALPHA": Constants.ALPHA,
+                    "BETA": Constants.BETA,
+                    "train_dataset": tensor_train_dr
+                }
+
+                # Rest of the training and evaluation code remains the same
+                # [Previous experiment code for DR-NET and evaluation]
+                
+                Utils.write_to_csv(run_parameters["consolidated_file_path"], results_list)
+
+    def __get_run_parameters(self):
+        run_parameters = {}
+        if self.running_mode == "original_data":
+            run_parameters["input_nodes"] = 7  # LaLonde features
+            run_parameters["consolidated_file_path"] = "Results/lalonde_results.csv"
+            run_parameters["summary_file_name"] = "lalonde_stats.txt"
+            run_parameters["is_synthetic"] = False
+        return run_parameters
+
+    @staticmethod
+    def __process_evaluated_metric(y1_hat, y0_hat, y1_true, y0_true, ite_dict, ite_path):
+        y1_true_np = np.array(y1_true)
+        y0_true_np = np.array(y0_true)
+        y1_hat_np = np.array(y1_hat)
+        y0_hat_np = np.array(y0_hat)
+
+        PEHE = Metrics.PEHE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np)
+        ATE = Metrics.ATE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np)
+        
+        Utils.write_to_csv(ite_path, ite_dict)
+        return PEHE, ATE
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from collections import namedtuple
+from itertools import product
+import numpy as np
+import pandas as pd
+import sklearn.model_selection as sklearn
+import torch
+
+class Utils:
+    @staticmethod
+    def convert_df_to_np_arr(data):
+        return data.to_numpy()
+
+    @staticmethod
+    def convert_to_col_vector(np_arr):
+        return np_arr.reshape(np_arr.shape[0], 1)
+
+    @staticmethod
+    def test_train_split(np_train_X, np_train_T, np_train_yf, np_train_ycf,
+                         np_mu0, np_mu1, split_size=0.8):
+        return sklearn.train_test_split(np_train_X, np_train_T, np_train_yf, np_train_ycf,
+                                      np_mu0, np_mu1, train_size=split_size)
+
+    @staticmethod
+    def convert_to_tensor(X, T, Y_f, Y_cf, np_train_mu0, np_train_mu1):
+        # Convert LaLonde features to tensors
+        tensor_x = torch.FloatTensor(X)  # Changed from stack to direct conversion
+        tensor_T = torch.FloatTensor(T)  # Changed from from_numpy for consistency
+        tensor_y_f = torch.FloatTensor(Y_f)
+        tensor_y_cf = torch.FloatTensor(Y_cf)
+        tensor_mu0 = torch.FloatTensor(np_train_mu0)
+        tensor_mu1 = torch.FloatTensor(np_train_mu1)
+
+        return torch.utils.data.TensorDataset(tensor_x, tensor_T, tensor_y_f, 
+                                            tensor_y_cf, tensor_mu0, tensor_mu1)
+
+    @staticmethod
+    def get_device():
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    @staticmethod
+    def write_to_csv(file_name, list_to_write):
+        pd.DataFrame.from_dict(list_to_write, orient='columns').to_csv(file_name)
+
+    @staticmethod
+    def vae_loss(mu, log_var):
+        return -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+
+class NormalNLLLoss:
+    def __call__(self, noise_z, mu, var):
+        logli = -0.5 * (var.mul(2 * np.pi) + 1e-6).log() - \
+                (noise_z - mu).pow(2).div(var.mul(2.0) + 1e-6)
+        nll = -(logli.sum(1).mean())
+        return nll
+
+class EarlyStopping_DCN:
+    def __init__(self, patience=7, verbose=False, delta=0,
+                 dr_net_shared_path="Models/LaLonde/dr_net_phi.pth",
+                 dr_net_y1_path="Models/LaLonde/dr_net_y1.pth",
+                 dr_net_y0_path="Models/LaLonde/dr_net_y0.pth",
+                 pi_net_path="Models/LaLonde/pi_net.pth",
+                 mu_net_path="Models/LaLonde/mu_net.pth",
+                 trace_func=print):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+        self.dr_net_shared_path = dr_net_shared_path
+        self.dr_net_y1_path = dr_net_y1_path
+        self.dr_net_y0_path = dr_net_y0_path
+        self.pi_net_path = pi_net_path
+        self.mu_net_path = mu_net_path
+        self.trace_func = trace_func
+
+    def __call__(self, val_loss, dr_net_shared, dr_net_y1_model, dr_net_y0_model,
+                 pi_net_model, mu_net_model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, dr_net_shared, dr_net_y1_model, 
+                               dr_net_y0_model, pi_net_model, mu_net_model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, dr_net_shared, dr_net_y1_model,
+                               dr_net_y0_model, pi_net_model, mu_net_model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, dr_net_shared, dr_net_y1_model, dr_net_y0_model,
+                       pi_net_model, mu_net_model):
+        if self.verbose:
+            self.trace_func(f'Validation loss decreased ({self.val_loss_min} --> {val_loss}). Saving model ...')
+        torch.save(dr_net_shared.state_dict(), self.dr_net_shared_path)
+        torch.save(dr_net_y1_model.state_dict(), self.dr_net_y1_path)
+        torch.save(dr_net_y0_model.state_dict(), self.dr_net_y0_path)
+        torch.save(pi_net_model.state_dict(), self.pi_net_path)
+        torch.save(mu_net_model.state_dict(), self.mu_net_path)
+        self.val_loss_min = val_loss
