@@ -435,3 +435,68 @@ class EarlyStopping_DCN:
         torch.save(pi_net_model.state_dict(), self.pi_net_path)
         torch.save(mu_net_model.state_dict(), self.mu_net_path)
         self.val_loss_min = val_loss
+
+
+
+
+
+
+
+
+
+
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+import torch
+
+class DataLoader:
+    def load_train_test_ihdp_random(self, csv_path, split_size):
+        df = pd.read_csv(csv_path)
+        
+        # Convert features to binary
+        df['race'] = (df['race'] != 'white').astype(int)  # 1 if not white, 0 if white
+        df['married'] = df['married'].astype(int)  # Already binary
+        df['nodegree'] = df['nodegree'].astype(int)  # Already binary
+        df['treat'] = df['treat'].astype(int)  # Already binary
+        
+        # Binarize continuous variables using median
+        continuous_cols = ['age', 'educ', 're74', 're75']
+        for col in continuous_cols:
+            median = df[col].median()
+            df[col] = (df[col] > median).astype(int)
+        
+        feature_cols = ['age', 'educ', 'race', 'married', 'nodegree', 're74', 're75']
+        
+        X = df[feature_cols].values
+        T = df['treat'].values.reshape(-1, 1)
+        Y = (df['re78'] > df['re78'].median()).astype(int).values.reshape(-1, 1)
+        
+        train_size = int(split_size * len(df))
+        indices = np.random.permutation(len(df))
+        
+        train_idx = indices[:train_size]
+        test_idx = indices[train_size:]
+        
+        train_X = X[train_idx]
+        train_T = T[train_idx]
+        train_Y = Y[train_idx]
+        train_Ycf = np.zeros_like(train_Y)
+        train_mu0 = np.zeros_like(train_Y)
+        train_mu1 = np.zeros_like(train_Y)
+        
+        test_X = X[test_idx]
+        test_T = T[test_idx]
+        test_Y = Y[test_idx]
+        test_Ycf = np.zeros_like(test_Y)
+        test_mu0 = np.zeros_like(test_Y)
+        test_mu1 = np.zeros_like(test_Y)
+        
+        n_treated = np.sum(train_T)
+        n_total = len(train_T)
+        
+        return (train_X, train_T, train_Y, train_Ycf,
+                test_X, test_T, test_Y, test_Ycf,
+                train_mu0, test_mu0, train_mu1, test_mu1,
+                n_treated, n_total)
