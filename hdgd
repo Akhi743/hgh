@@ -1,0 +1,73 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+import torch
+
+class LaLondeDataLoader:
+    def load_train_test_lalonde_random(self, csv_path, split_size):
+        # Read data
+        df = pd.read_csv(csv_path)
+        
+        # Convert categorical variables
+        df['race'] = df['race'].map({'white': 0, 'black': 1, 'hispan': 2})
+       
+        # Define features
+        feature_cols = ['age', 'educ', 'race', 'married', 'nodegree', 're74', 're75']
+       
+        # Standardize features
+        scaler = StandardScaler()
+        df[feature_cols] = scaler.fit_transform(df[feature_cols])
+       
+        # Extract arrays
+        X = df[feature_cols].values
+        T = df['treat'].values.reshape(-1, 1)  # Treatment
+        Y = df['re78'].values.reshape(-1, 1)   # Outcome
+       
+        # Split data
+        train_size = int(split_size * len(df))
+        indices = np.random.permutation(len(df))
+       
+        train_idx = indices[:train_size]
+        test_idx = indices[train_size:]
+       
+        # Training data
+        train_X = X[train_idx]
+        train_T = T[train_idx]
+        train_Y = Y[train_idx]
+       
+        # Create counterfactuals (zeros as placeholders since we don't have true counterfactuals)
+        train_Ycf = np.zeros_like(train_Y)
+        train_mu0 = np.zeros_like(train_Y)
+        train_mu1 = np.zeros_like(train_Y)
+       
+        # Test data
+        test_X = X[test_idx]
+        test_T = T[test_idx]
+        test_Y = Y[test_idx]
+        test_Ycf = np.zeros_like(test_Y)
+        test_mu0 = np.zeros_like(test_Y)
+        test_mu1 = np.zeros_like(test_Y)
+       
+        n_treated = np.sum(train_T)
+        n_total = len(train_T)
+       
+        return (train_X, train_T, train_Y, train_Ycf,
+                test_X, test_T, test_Y, test_Ycf,
+                train_mu0, test_mu0, train_mu1, test_mu1,
+                n_treated, n_total)
+
+class TensorDataset(torch.utils.data.Dataset):
+    def __init__(self, X, T, Y_f, Y_cf, mu0, mu1):
+        self.X = torch.FloatTensor(X)
+        self.T = torch.FloatTensor(T)
+        self.Y_f = torch.FloatTensor(Y_f)
+        self.Y_cf = torch.FloatTensor(Y_cf)
+        self.mu0 = torch.FloatTensor(mu0)
+        self.mu1 = torch.FloatTensor(mu1)
+   
+    def __len__(self):
+        return len(self.X)
+   
+    def __getitem__(self, idx):
+        return (self.X[idx], self.T[idx], self.Y_f[idx],
+                self.Y_cf[idx], self.mu0[idx], self.mu1[idx])
