@@ -47,6 +47,13 @@ def get_dummy_col(df, features):
         
         for col in features:
             if col in df_copy.columns:
+                print(f"\nColumn {col} dtype:", df_copy[col].dtype)
+                print(f"Column {col} unique values:", df_copy[col].unique())
+                
+                # Convert numeric binary columns to string first
+                if df_copy[col].nunique() == 2 and df_copy[col].dtype in ['int64', 'float64']:
+                    df_copy[col] = df_copy[col].map({0: 'A', 1: 'B'})
+                
                 if df_copy[col].dtype == 'object' or df_copy[col].nunique() < 10:
                     categorical_cols.append(col)
                     unique_vals = df_copy[col].dropna().unique()
@@ -56,6 +63,8 @@ def get_dummy_col(df, features):
                         df_copy[col_name] = (df_copy[col] == val).astype(int)
                     
                     df_copy = df_copy.drop(columns=[col])
+                    
+                print(f"Created columns for {col}:", [c for c in df_copy.columns if c.startswith(f"{col}_")])
         
         return df_copy, categorical_cols
 
@@ -165,6 +174,9 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
                     
                     treated_group = treatment_df[treated_mask]
                     control_group = control_df[control_mask]
+                    
+                    print(f"\nTreated group size: {len(treated_group)}")
+                    print(f"Control group size: {len(control_group)}")
                     
                     if len(treated_group) > 0 and len(control_group) >= matching_ratio:
                         curr_matched_pairs = perform_hnsw_matching(
