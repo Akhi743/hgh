@@ -1,7 +1,13 @@
-# config.py
+# First, run your imports and setup (import_setup.py):
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+import faiss
+import time
 import warnings
 warnings.filterwarnings('ignore')
 
+# Config
 DATA_PATH = "HCA_unmatched_data_setup.parquet"
 X_VARIABLES = ["age", "gender_cd", "medical_coverage_tier"]
 TREATMENT_VAR = "grp_binary"
@@ -9,9 +15,6 @@ OUTCOME_VAR = "social_risk_score"
 MATCHING_RATIO = 2
 N_NEIGHBORS = 5
 CALIPER_SD = 0.25
-
-# utils.py
-import time
 
 class Timer:
     def __init__(self, description):
@@ -26,17 +29,9 @@ class Timer:
         self.duration = self.end - self.start
         print(f"{self.description}: {self.duration:.4f} seconds")
 
-# step1_data_prep.py
-import pandas as pd
-from config import *
-from utils import Timer
-
+# Step 1: Data Preparation
 print(f"\nLoading data from {DATA_PATH}...")
-try:
-    df = pd.read_parquet(DATA_PATH)
-except Exception as e:
-    print(f"Error loading data: {str(e)}")
-    exit(1)
+df = pd.read_parquet(DATA_PATH)
 
 # Handle missing values
 df_clean = df.copy()
@@ -71,13 +66,12 @@ with Timer("Creating dummy variables"):
                 
             print(f"Created columns for {col}:", [c for c in df_encoded.columns if c.startswith(f"{col}_")])
 
-# Prepare features for model
 features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
 for col in categorical_cols:
     dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
     features_for_model.extend(dummy_cols)
 
-# Handle any remaining missing values
+# Handle remaining missing values
 nan_check = df_encoded[features_for_model].isna().sum()
 if nan_check.any():
     print("NaN values found in features:")
@@ -92,28 +86,7 @@ if df_encoded[OUTCOME_VAR].isna().any():
     print("NaN values found in outcome variable")
     df_encoded = df_encoded.dropna(subset=[OUTCOME_VAR])
 
-# Save intermediate results
-df_encoded.to_parquet('prepared_data.parquet')
-pd.Series(features_for_model).to_csv('feature_list.csv', index=False)
-pd.Series(categorical_cols).to_csv('categorical_cols.csv', index=False)
-
-print("\nData preparation completed. Files saved:")
-print("- prepared_data.parquet")
-print("- feature_list.csv")
-print("- categorical_cols.csv")
-
-# step2_propensity_scores.py
-import pandas as pd
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-from config import *
-from utils import Timer
-
-# Load prepared data
-df_encoded = pd.read_parquet('prepared_data.parquet')
-features_for_model = pd.read_csv('feature_list.csv')['0'].tolist()
-
-# Calculate propensity scores
+# Step 2: Propensity Score Calculation
 with Timer("Calculating propensity scores"):
     model = LogisticRegression(
         penalty='l2',
@@ -131,27 +104,14 @@ with Timer("Calculating propensity scores"):
         'Coefficient': model.coef_[0]})
     print(coef_df.to_string(index=False))
 
-# Add propensity scores and save
 df_encoded['pscore'] = ps
-df_encoded.to_parquet('data_with_pscores.parquet')
-print("\nPropensity scores calculated and saved to data_with_pscores.parquet")
 
-# step3_matching.py
-import pandas as pd
-import numpy as np
-import faiss
-from config import *
-from utils import Timer
+# Step 3: Matching
+caliper = np.std(df_encoded['pscore']) * CALIPER_SD
 
-# Load data with propensity scores
-df = pd.read_parquet('data_with_pscores.parquet')
-caliper = np.std(df['pscore']) * CALIPER_SD
+treatment_df = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
+control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
 
-# Split into treatment and control groups
-treatment_df = df[df[TREATMENT_VAR] == 1].copy()
-control_df = df[df[TREATMENT_VAR] == 0].copy()
-
-# Prepare data for HNSW matching
 with Timer("HNSW initialization"):
     treated_pscores = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
     control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
@@ -170,7 +130,6 @@ with Timer("HNSW initialization"):
     k = min(N_NEIGHBORS, len(control_df))
     distances, indices = index.search(treated_pscores, k)
 
-# Perform matching
 with Timer(f"Matching process for {len(treatment_df)} treated units"):
     matched_pairs = []
     used_control_indices = set()
@@ -206,29 +165,17 @@ with Timer(f"Matching process for {len(treatment_df)} treated units"):
     print(f"Unmatched treated units: {unmatched_treated}")
     print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
 
-if matched_pairs:
-    matched_df = pd.DataFrame(matched_pairs)
-    matched_df.to_parquet('matched_data.parquet')
-    print("\nMatched data saved to matched_data.parquet")
+matched_df = pd.DataFrame(matched_pairs)
 
-# step4_analysis.py
-import pandas as pd
-from config import *
-
-# Load matched data and categorical columns
-matched_data = pd.read_parquet('matched_data.parquet')
-categorical_cols = pd.read_csv('categorical_cols.csv')['0'].tolist()
-
-# Calculate ATE
-ate = matched_data[matched_data[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
-      matched_data[matched_data[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
+# Step 4: Analysis
+ate = matched_df[matched_df[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
+      matched_df[matched_df[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
 
 print(f"\nResults:")
 print(f"Average Treatment Effect: {ate:.4f}")
 
-# Analyze distribution of categorical variables
 for col in categorical_cols:
-    col_dummies = [c for c in matched_data.columns if c.startswith(col+'_')]
+    col_dummies = [c for c in matched_df.columns if c.startswith(col+'_')]
     for dummy in col_dummies:
         print(f"\nDistribution for {dummy}:")
-        print(matched_data.groupby([TREATMENT_VAR, dummy]).size())
+        print(matched_df.groupby([TREATMENT_VAR, dummy]).size())
