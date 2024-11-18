@@ -1,17 +1,32 @@
+# Standard library imports
+import os
+from collections import OrderedDict
+from datetime import date
+from itertools import product
+
+# Third-party imports
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-from collections import OrderedDict
-from datetime import date
+
+# Enable anomaly detection
+torch.autograd.set_detect_anomaly(True)
+
+# Disable warnings
 import warnings
 warnings.filterwarnings('ignore')
 
-# Constants
+# Create necessary directories
+os.makedirs('Models', exist_ok=True)
+os.makedirs('MSE', exist_ok=True)
+
 class Constants:
     # Model Architecture
     DRNET_INPUT_NODES = 7  # LaLonde features: age,educ,race,married,nodegree,re74,re75
@@ -60,7 +75,6 @@ class Constants:
     INFO_GAN_LAMBDA = 0.2
     INFO_GAN_ALPHA = 1
 
-# Utility Classes
 class Utils:
     @staticmethod
     def convert_df_to_np_arr(data):
@@ -97,7 +111,6 @@ class Metrics:
     def ATE(y1_true, y0_true, y1_pred, y0_pred):
         return np.abs(np.mean(y1_true - y0_true) - np.mean(y1_pred - y0_pred))
 
-# Model Components
 class Encoder_shared(nn.Module):
     def __init__(self, input_nodes=Constants.DRNET_INPUT_NODES,
                  shared_nodes=Constants.Encoder_shared_nodes):
@@ -293,6 +306,7 @@ class QHead(nn.Module):
         var0 = torch.exp(self.out_var0(x).squeeze())
         return mu0, var0
 
+# Add gradient clipping and numerical stability improvements
 class Adversarial_Manager:
     def __init__(self, encoder_input_nodes, encoder_shared_nodes,
                  encoder_x_out_nodes, encoder_t_out_nodes,
@@ -303,6 +317,7 @@ class Adversarial_Manager:
                  dis_in_nodes, dis_shared_nodes, dis_out_nodes,
                  Q_in_nodes, Q_shared_nodes, Q_out_nodes,
                  device):
+        # Existing initialization code remains the same
         self.adversarial_vae = Adversarial_VAE(
             encoder_input_nodes=encoder_input_nodes,
             encoder_shared_nodes=encoder_shared_nodes,
@@ -330,6 +345,9 @@ class Adversarial_Manager:
             out_nodes=Q_out_nodes).to(device)
 
     def train_adversarial_model(self, train_parameters, device):
+        # Add gradient clipping threshold
+        max_grad_norm = 1.0
+        
         epochs = train_parameters["epochs"]
         batch_size = train_parameters["batch_size"]
         vae_lr = train_parameters["vae_lr"]
@@ -347,146 +365,130 @@ class Adversarial_Manager:
             shuffle=True
         )
 
+        # Add gradient clipping to optimizers
         adv_vae_optimizer = optim.Adam(
-            params=self.adversarial_vae.parameters(),
+            self.adversarial_vae.parameters(),
             lr=vae_lr,
             weight_decay=weight_decay
         )
 
         D_optimizer = optim.Adam(
-            params=self.netD.parameters(),
+            self.netD.parameters(),
             lr=gan_D_lr,
             weight_decay=weight_decay,
             betas=(0.5, 0.999)
         )
 
         G_optimizer = optim.Adam(
-            [
-                {'params': self.netG.parameters()},
-                {'params': self.netQ.parameters()}
-            ],
+            list(self.netG.parameters()) + list(self.netQ.parameters()),
             lr=gan_G_lr,
             weight_decay=weight_decay,
             betas=(0.5, 0.999)
         )
 
+        # Modified loss functions with numerical stability
         loss_VAE_recons_MSE = nn.MSELoss()
         loss_Q_con = NormalNLLLoss()
-        loss_D = nn.BCELoss()
+        loss_D = nn.BCEWithLogitsLoss()  # Changed from BCELoss for improved stability
         loss_G_F = nn.MSELoss()
 
         for epoch in range(epochs):
             total_loss_train = 0
             with tqdm(total=len(train_data_loader)) as t:
                 for batch in train_data_loader:
+                    batch_size = batch[0].size(0)
+                    
+                    # Move data to device
+                    real_x = batch[0].to(device)
+                    real_t = batch[1].to(device)
+                    real_yf = batch[2].to(device)
+                    
+                    # Train VAE with gradient clipping
                     self.adversarial_vae.train()
-                    covariates_X, T, y_f, y_cf, _, _ = batch
-                    batch_n = covariates_X.size(0)
-                    
-                    covariates_X = covariates_X.to(device)
-                    T = T.to(device)
-                    T_float = T.float().to(device)
-
-                    # VAE forward pass and reconstruction
-                    [covariates_X_hat, latent_z_code,
-                     latent_mu_x, latent_log_var_x,
-                     latent_mu_t, latent_log_var_t,
-                     latent_mu_yf, latent_log_var_yf,
-                     latent_mu_ycf, latent_log_var_ycf] = self.adversarial_vae(covariates_X)
-
-                    # VAE losses
-                    loss_recons = loss_VAE_recons_MSE(
-                        covariates_X_hat.float(),
-                        covariates_X.float()
-                    ).to(device)
-
-                    loss_KL_X = Utils.vae_loss(latent_mu_x, latent_log_var_x)
-                    loss_KL_T = Utils.vae_loss(latent_mu_t, latent_log_var_t)
-                    loss_KL_yf = Utils.vae_loss(latent_mu_yf, latent_log_var_yf)
-                    loss_KL_ycf = Utils.vae_loss(latent_mu_ycf, latent_log_var_ycf)
-
-                    loss_VAE = loss_recons + VAE_BETA * (
-                        loss_KL_X + loss_KL_T + loss_KL_yf + loss_KL_ycf
-                    )
-
-                    # VAE optimization step
                     adv_vae_optimizer.zero_grad()
-                    loss_VAE.backward()
-                    adv_vae_optimizer.step()
-
-                    # GAN training
-                    self.netG.train()
-                    self.netD.train()
-                    self.netQ.train()
                     
-                    latent_z_code = latent_z_code.detach()
-                    noise_z_size = (Constants.Info_GAN_Gen_in_nodes - Constants.Decoder_in_nodes)
-                    noise_z = torch.randn(batch_n, noise_z_size)
-                    noise_netG_input = torch.cat((latent_z_code, noise_z), dim=1)
-
-                    # Generator forward pass
-                    y0, y1 = self.netG(noise_netG_input)
-                    y_f_hat = T * y1 + (1 - T) * y0
-
-                    y0_sigmoid = torch.sigmoid(y0)
-                    y1_sigmoid = torch.sigmoid(y1)
-
-                    netD_y0 = ((1 - T) * y_f + T * y0_sigmoid).type(torch.FloatTensor)
-                    netD_y1 = (T * y_f + (1 - T) * y1_sigmoid).type(torch.FloatTensor)
-
-                    # Discriminator training
-                    d_logit = self.netD(
-                        covariates_X,
-                        netD_y0.to(device),
-                        netD_y1.to(device)
+                    [x_recon, latent_z, mu_x, logvar_x,
+                     mu_t, logvar_t, mu_yf, logvar_yf,
+                     mu_ycf, logvar_ycf] = self.adversarial_vae(real_x)
+                    
+                    # VAE losses with improved numerical stability
+                    recon_loss = loss_VAE_recons_MSE(x_recon, real_x)
+                    kl_loss = VAE_BETA * (
+                        Utils.vae_loss(mu_x, torch.clamp(logvar_x, min=-20, max=20)) +
+                        Utils.vae_loss(mu_t, torch.clamp(logvar_t, min=-20, max=20)) +
+                        Utils.vae_loss(mu_yf, torch.clamp(logvar_yf, min=-20, max=20)) +
+                        Utils.vae_loss(mu_ycf, torch.clamp(logvar_ycf, min=-20, max=20))
                     )
-                    loss_Discriminator = loss_D(d_logit, T_float).to(device)
+                    
+                    vae_loss = recon_loss + kl_loss
+                    if not torch.isnan(vae_loss):
+                        vae_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.adversarial_vae.parameters(), max_grad_norm)
+                        adv_vae_optimizer.step()
 
+                    # Train Discriminator with gradient clipping
+                    self.netD.train()
                     D_optimizer.zero_grad()
-                    loss_Discriminator.backward(retain_graph=True)
-                    D_optimizer.step()
+                    
+                    # Generate fake data
+                    noise = torch.randn(batch_size, Constants.Info_GAN_Gen_in_nodes - Constants.Decoder_in_nodes).to(device)
+                    latent_z_detached = latent_z.detach()
+                    fake_input = torch.cat([latent_z_detached, noise], dim=1)
+                    
+                    fake_y0, fake_y1 = self.netG(fake_input)
+                    
+                    # Real and fake labels with label smoothing
+                    real_label = torch.ones(batch_size, 1).to(device) * 0.9  # Label smoothing
+                    fake_label = torch.zeros(batch_size, 1).to(device) + 0.1  # Label smoothing
+                    
+                    # Discriminator training with improved stability
+                    real_y0 = ((1 - real_t) * real_yf).detach()
+                    real_y1 = (real_t * real_yf).detach()
+                    d_real = self.netD(real_x, real_y0, real_y1)
+                    d_fake = self.netD(real_x, fake_y0.detach(), fake_y1.detach())
+                    
+                    d_loss = (loss_D(d_real, real_label) + loss_D(d_fake, fake_label)) / 2
+                    if not torch.isnan(d_loss):
+                        d_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.netD.parameters(), max_grad_norm)
+                        D_optimizer.step()
 
-                    # Generator loss
-                    loss_Generator_F = loss_G_F(
-                        y_f_hat.float(),
-                        y_f.float().to(device)
-                    ).to(device)
-
-                    # Q Network training
-                    q_input = torch.cat((y0, y1), dim=1)
-                    q_mu0, q_var0 = self.netQ(q_input)
-                    con_loss0 = loss_Q_con(latent_z_code, q_mu0, q_var0) * 0.1
-
-                    # Combined Generator losses
-                    loss_Generator = -loss_D(d_logit, T_float).to(device)
-                    loss_Info = INFO_GAN_LAMBDA * con_loss0
-                    loss_Generator_total = (
-                        loss_Generator + 
-                        INFO_GAN_ALPHA * loss_Generator_F + 
-                        loss_Info
-                    )
-
-                    # Generator optimization step
+                    # Train Generator with gradient clipping
+                    self.netG.train()
+                    self.netQ.train()
                     G_optimizer.zero_grad()
-                    loss_Generator_total.backward()
-                    G_optimizer.step()
+                    
+                    fake_y0, fake_y1 = self.netG(fake_input)
+                    g_fake = self.netD(real_x, fake_y0, fake_y1)
+                    
+                    # Q Network
+                    q_input = torch.cat([fake_y0, fake_y1], dim=1)
+                    q_mu, q_var = self.netQ(q_input)
+                    q_loss = loss_Q_con(latent_z_detached, q_mu, torch.clamp(q_var, min=1e-6))
+                    
+                    # Generator losses
+                    g_loss = loss_D(g_fake, real_label)
+                    f_loss = loss_G_F(fake_y0 * (1 - real_t) + fake_y1 * real_t, real_yf)
+                    
+                    g_total_loss = g_loss + INFO_GAN_ALPHA * f_loss + INFO_GAN_LAMBDA * q_loss
+                    if not torch.isnan(g_total_loss):
+                        g_total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.netQ.parameters(), max_grad_norm)
+                        G_optimizer.step()
 
-                    total_loss_train += (
-                        loss_VAE.item() + 
-                        loss_Discriminator.item() + 
-                        loss_Generator_total.item()
-                    )
-
-                    # Update progress bar
-                    t.set_postfix(
-                        epoch=f'{epoch+1}',
-                        VAE_loss=f'{loss_VAE.item():.3f}',
-                        D_loss=f'{loss_Discriminator.item():.3f}',
-                        MI=f'{loss_Info.item():.3f}',
-                        loss_G_F=f'{loss_Generator_F.item():.3f}',
-                        loss_G=f'{loss_Generator_total.item():.3f}',
-                        loss_train=f'{total_loss_train:.3f}'
-                    )
+                    # Update progress bar only for valid losses
+                    if not any(torch.isnan(x) for x in [vae_loss, d_loss, g_total_loss]):
+                        total_loss = vae_loss.item() + d_loss.item() + g_total_loss.item()
+                        total_loss_train += total_loss
+                        
+                        t.set_postfix(
+                            epoch=f'{epoch+1}/{epochs}',
+                            vae_loss=f'{vae_loss.item():.3f}',
+                            d_loss=f'{d_loss.item():.3f}',
+                            g_loss=f'{g_total_loss.item():.3f}',
+                            total=f'{total_loss:.3f}'
+                        )
                     t.update()
 
         # Save models
@@ -506,25 +508,23 @@ class Adversarial_Manager:
 
         ycf_list = []
         
-        for batch in _data_loader:
-            covariates_X, T, y_f, _, _, _ = batch
-            batch_n = covariates_X.size(0)
-            covariates_X = covariates_X.to(device)
+        with torch.no_grad():
+            for batch in _data_loader:
+                covariates_X, T, y_f, _, _, _ = batch
+                batch_n = covariates_X.size(0)
+                covariates_X = covariates_X.to(device)
 
-            # VAE forward pass
-            [_, latent_z_code, _, _, _, _, _, _, _, _] = self.adversarial_vae(covariates_X)
+                # VAE forward pass
+                [_, latent_z, _, _, _, _, _, _, _, _] = self.adversarial_vae(covariates_X)
 
-            # GAN forward pass
-            latent_z_code = latent_z_code.detach()
-            noise_z_size = (Constants.Info_GAN_Gen_in_nodes - Constants.Decoder_in_nodes)
-            noise_z = torch.randn(batch_n, noise_z_size)
-            noise_netG_input = torch.cat((latent_z_code, noise_z), dim=1)
-
-            y0, y1 = self.netG(noise_netG_input)
-            y0_sigmoid = torch.sigmoid(y0)
-            y1_sigmoid = torch.sigmoid(y1)
-            y_cf = T * y0 + (1 - T) * y1
-            ycf_list.append(y_cf.item())
+                # GAN forward pass
+                noise = torch.randn(batch_n, Constants.Info_GAN_Gen_in_nodes - Constants.Decoder_in_nodes).to(device)
+                fake_input = torch.cat([latent_z, noise], dim=1)
+                
+                y0, y1 = self.netG(fake_input)
+                T = T.to(device)
+                y_cf = T * y0 + (1 - T) * y1
+                ycf_list.append(y_cf.cpu().item())
 
         return Utils.convert_to_col_vector(np.array(ycf_list))
 
@@ -674,6 +674,8 @@ class DRNet_Manager:
                     covariates_X, T, y_f, y_cf, _, _ = batch
                     covariates_X = covariates_X.to(device)
                     T = T.to(device)
+                    y_f = y_f.to(device)
+                    y_cf = y_cf.to(device)
 
                     optimizer_W.zero_grad()
                     optimizer_V1.zero_grad()
@@ -684,46 +686,31 @@ class DRNet_Manager:
                     pi = self.pi_net(covariates_X)
                     mu = self.mu_net(covariates_X, T)
 
-                    y1_hat = self.dr_net_h_y1(self.dr_net_phi(covariates_X))
-                    y0_hat = self.dr_net_h_y0(self.dr_net_phi(covariates_X))
+                    shared_features = self.dr_net_phi(covariates_X)
+                    y1_hat = self.dr_net_h_y1(shared_features)
+                    y0_hat = self.dr_net_h_y0(shared_features)
 
                     T_float = T.float()
 
                     y_f_hat = y1_hat * T_float + y0_hat * (1 - T_float)
                     y_cf_hat = y1_hat * (1 - T_float) + y0_hat * T_float
 
-                    y_f_dr = T_float * ((T_float * y1_hat - (T_float - pi) * mu) / pi) + \
-                            (1 - T_float) * (((1 - T_float) * y0_hat - (T_float - pi) * mu) / (1 - pi))
+                    y_f_dr = T_float * ((T_float * y1_hat - (T_float - pi) * mu) / (pi + 1e-8)) + \
+                            (1 - T_float) * (((1 - T_float) * y0_hat - (T_float - pi) * mu) / (1 - pi + 1e-8))
 
-                    y_cf_dr = (1 - T_float) * (((1 - T_float) * y1_hat - (T_float - pi) * mu) / pi) + \
-                             T_float * ((T_float * y0_hat - (T_float - pi) * mu) / (1 - pi))
+                    y_cf_dr = (1 - T_float) * (((1 - T_float) * y1_hat - (T_float - pi) * mu) / (pi + 1e-8)) + \
+                             T_float * ((T_float * y0_hat - (T_float - pi) * mu) / (1 - pi + 1e-8))
 
                     loss_pi = lossBCE(pi, T_float).to(device)
-                    
-                    if torch.cuda.is_available():
-                        loss_F = loss_F_MSE(y_f_hat.float().cuda(),
-                                          y_f.float().cuda()).to(device)
-                        loss_CF = loss_CF_MSE(y_cf_hat.float().cuda(),
-                                            y_cf.float().cuda()).to(device)
-                        loss_DR_F = loss_DR_F_MSE(y_f_dr.float().cuda(),
-                                                y_f.float().cuda()).to(device)
-                        loss_DR_CF = loss_DR_CF_MSE(y_cf_dr.float().cuda(),
-                                                  y_cf.float().cuda()).to(device)
-                    else:
-                        loss_F = loss_F_MSE(y_f_hat.float(),
-                                          y_f.float()).to(device)
-                        loss_CF = loss_CF_MSE(y_cf_hat.float(),
-                                            y_cf.float()).to(device)
-                        loss_DR_F = loss_DR_F_MSE(y_f_dr.float(),
-                                                y_f.float()).to(device)
-                        loss_DR_CF = loss_DR_CF_MSE(y_cf_dr.float(),
-                                                  y_cf.float()).to(device)
+                    loss_F = loss_F_MSE(y_f_hat, y_f).to(device)
+                    loss_CF = loss_CF_MSE(y_cf_hat, y_cf).to(device)
+                    loss_DR_F = loss_DR_F_MSE(y_f_dr, y_f).to(device)
+                    loss_DR_CF = loss_DR_CF_MSE(y_cf_dr, y_cf).to(device)
 
                     loss = loss_F + loss_CF + ALPHA * loss_pi + BETA * (loss_DR_F + loss_DR_CF)
                     loss.backward()
                     
-                    total_loss_train += loss_F.item() + loss_CF.item() + loss_DR_F.item() + \
-                                      loss_DR_CF.item() + loss_pi.item()
+                    total_loss_train += loss.item()
 
                     optimizer_pi.step()
                     optimizer_mu.step()
@@ -731,7 +718,7 @@ class DRNet_Manager:
                     optimizer_V1.step()
                     optimizer_V0.step()
 
-                    t.set_postfix(epoch=f'{epoch+1}',
+                    t.set_postfix(epoch=f'{epoch+1}/{epochs}',
                                 loss=f'{total_loss_train:.3f}')
                     t.update()
 
@@ -749,48 +736,51 @@ class DRNet_Manager:
         y0_true_list = []
         ITE_dict_list = []
 
-        for batch in _data_loader:
-            covariates_X, T, yf, ycf, mu0, mu1 = batch
-            covariates_X = covariates_X.to(device)
-            
-            y1_hat = torch.round(self.dr_net_h_y1(self.dr_net_phi(covariates_X)))
-            y0_hat = torch.round(self.dr_net_h_y0(self.dr_net_phi(covariates_X)))
+        with torch.no_grad():
+            for batch in _data_loader:
+                covariates_X, T, yf, ycf, mu0, mu1 = batch
+                covariates_X = covariates_X.to(device)
+                T = T.to(device)
+                yf = yf.to(device)
+                ycf = ycf.to(device)
+                mu0 = mu0.to(device)
+                mu1 = mu1.to(device)
+                
+                shared_features = self.dr_net_phi(covariates_X)
+                y1_hat = self.dr_net_h_y1(shared_features)
+                y0_hat = self.dr_net_h_y0(shared_features)
 
-            T_float = T.float()
+                T_float = T.float()
 
-            y_f_hat = y1_hat * T_float + y0_hat * (1 - T_float)
-            y_cf_hat = y1_hat * (1 - T_float) + y0_hat * T_float
+                y_f_hat = y1_hat * T_float + y0_hat * (1 - T_float)
+                y_cf_hat = y1_hat * (1 - T_float) + y0_hat * T_float
 
-            y1_hat_list.append(y1_hat.item())
-            y0_hat_list.append(y0_hat.item())
+                y1_hat_list.append(y1_hat.cpu().item())
+                y0_hat_list.append(y0_hat.cpu().item())
 
-            y1_true = T * yf + (1 - T) * ycf
-            y0_true = (1 - T) * yf + T * ycf
+                y1_true = T * yf + (1 - T) * ycf
+                y0_true = (1 - T) * yf + T * ycf
 
-            y1_true_list.append(mu1.item())
-            y0_true_list.append(mu0.item())
+                y1_true_list.append(mu1.cpu().item())
+                y0_true_list.append(mu0.cpu().item())
 
-            predicted_ITE = y1_hat - y0_hat
-            true_ITE = mu1 - mu0
+                predicted_ITE = y1_hat - y0_hat
+                true_ITE = mu1 - mu0
 
-            if torch.cuda.is_available():
-                diff_ite = abs(true_ITE.float().cuda() - predicted_ITE.float().cuda())
-                diff_yf = abs(yf.float().cuda() - y_f_hat.float().cuda())
-            else:
-                diff_ite = abs(true_ITE.float() - predicted_ITE.float())
-                diff_yf = abs(yf.float() - y_f_hat.float())
+                diff_ite = abs(true_ITE - predicted_ITE)
+                diff_yf = abs(yf - y_f_hat)
 
-            ITE_dict_list.append(self.create_ITE_Dict(
-                T.item(),
-                true_ITE.item(),
-                predicted_ITE.item(),
-                diff_ite.item(),
-                yf.item(),
-                ycf.item(),
-                y_f_hat.item(),
-                y_cf_hat.item(),
-                diff_yf.item()
-            ))
+                ITE_dict_list.append(self.create_ITE_Dict(
+                    T.cpu().item(),
+                    true_ITE.cpu().item(),
+                    predicted_ITE.cpu().item(),
+                    diff_ite.cpu().item(),
+                    yf.cpu().item(),
+                    ycf.cpu().item(),
+                    y_f_hat.cpu().item(),
+                    y_cf_hat.cpu().item(),
+                    diff_yf.cpu().item()
+                ))
 
         return {
             "y1_hat_list": np.array(y1_hat_list),
@@ -882,10 +872,10 @@ class Experiments:
         print("Device:", device)
         
         results_list = []
-        csv_path = "lalonde_test_00.csv"
+        csv_path = "lalonde.csv"
         
         # Create summary file
-        summary_file_name = "IHDP_stats.txt"
+        summary_file_name = "lalonde_stats.txt"
         file1 = open(summary_file_name, "w")
         
         for iter_id in range(iterations):
