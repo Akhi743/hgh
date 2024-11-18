@@ -49,8 +49,12 @@ def get_dummy_col(df, features):
             if col in df_copy.columns:
                 if df_copy[col].dtype == 'object' or df_copy[col].nunique() < 10:
                     categorical_cols.append(col)
-                    dummies = pd.get_dummies(df_copy[col], prefix=col, drop_first=False)
-                    df_copy = pd.concat([df_copy, dummies], axis=1)
+                    unique_vals = df_copy[col].dropna().unique()
+                    
+                    for val in unique_vals:
+                        col_name = f"{col}_{val}"
+                        df_copy[col_name] = (df_copy[col] == val).astype(int)
+                    
                     df_copy = df_copy.drop(columns=[col])
         
         return df_copy, categorical_cols
@@ -205,12 +209,11 @@ def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_met
 def main():
     with Timer("\nTotal execution time"):
         print(f"\nLoading data from {DATA_PATH}...")
-        with Timer("Loading data"):
-            try:
-                df = pd.read_parquet(DATA_PATH)
-            except Exception as e:
-                print(f"Error loading data: {str(e)}")
-                exit(1)
+        try:
+            df = pd.read_parquet(DATA_PATH)
+        except Exception as e:
+            print(f"Error loading data: {str(e)}")
+            exit(1)
         
         df = handle_missing_values(df, X_VARIABLES)
         
@@ -222,7 +225,6 @@ def main():
             dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
             features_for_model.extend(dummy_cols)
             
-        # Check for NaN values
         nan_check = df_encoded[features_for_model].isna().sum()
         if nan_check.any():
             print("NaN values found in features:")
@@ -236,8 +238,16 @@ def main():
         if df_encoded[OUTCOME_VAR].isna().any():
             print("NaN values found in outcome variable")
             df_encoded = df_encoded.dropna(subset=[OUTCOME_VAR])
-        
-        match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
+
+        print("\nUnique values in categorical variables:")
+        for col in categorical_cols:
+            print(f"{col}:", df_encoded[[c for c in df_encoded.columns if c.startswith(col+'_')]].columns.tolist())
+
+        match_combinations = []
+        for col in categorical_cols:
+            col_dummies = [c for c in df_encoded.columns if c.startswith(col+'_')]
+            if len(col_dummies) == 2:  # Binary categories
+                match_combinations.append(([col_dummies[0]], [col_dummies[1]]))
         
         if match_combinations:
             for treated_cats, control_cats in match_combinations:
@@ -259,8 +269,12 @@ def main():
             
             print(f"\nResults:")
             print(f"Average Treatment Effect: {ate:.4f}")
-            print(matched_data.groupby(['grp_binary', 'gender_cd_M']).size())
-            print(matched_data.groupby(['grp_binary', 'medical_coverage_tier_employee only']).size())
+            
+            for col in categorical_cols:
+                col_dummies = [c for c in matched_data.columns if c.startswith(col+'_')]
+                for dummy in col_dummies:
+                    print(f"\nDistribution for {dummy}:")
+                    print(matched_data.groupby([TREATMENT_VAR, dummy]).size())
 
 if __name__ == "__main__":
     main()
