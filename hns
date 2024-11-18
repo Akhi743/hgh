@@ -290,3 +290,82 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def psm_function(data_frame, x_var, y_var, match_combinations=None, distance_method='glm',
+                matching_ratio=MATCHING_RATIO, n_neighbors=N_NEIGHBORS):
+    with Timer("Total PSM process"):
+        ft_model, ps = get_propensity_score(data_frame, x_var, y_var, method=distance_method)
+        data_frame['pscore'] = ps
+        
+        caliper = np.std(data_frame['pscore']) * CALIPER_SD
+    
+    with Timer("Splitting data into treatment and control groups"):
+        treatment_df = data_frame[data_frame[y_var] == 1].copy()
+        control_df = data_frame[data_frame[y_var] == 0].copy()
+        
+        matched_pairs = []
+        
+        if match_combinations:
+            with Timer("Exact matching process"):
+                total_matched = 0
+                
+                for treated_cats, control_cats in match_combinations:
+                    treated_mask = pd.Series(True, index=treatment_df.index)
+                    control_mask = pd.Series(True, index=control_df.index)
+                    
+                    for cat in treated_cats:
+                        treated_mask &= (treatment_df[cat] == 1)
+                    for cat in control_cats:
+                        control_mask &= (control_df[cat] == 1)
+                    
+                    treated_group = treatment_df[treated_mask]
+                    control_group = control_df[control_mask]
+                    
+                    if len(treated_group) > 0 and len(control_group) >= matching_ratio:
+                        curr_matched_pairs = perform_hnsw_matching(
+                            treated_group, control_group, caliper,
+                            matching_ratio, n_neighbors
+                        )
+                        matched_pairs.extend(curr_matched_pairs)
+                        total_matched += len(curr_matched_pairs) // (matching_ratio + 1)
+                        print(f"Successfully matched {len(curr_matched_pairs) // (matching_ratio + 1)} pairs for combination: {treated_cats} -> {control_cats}")
+                    else:
+                        print(f"Insufficient units for matching combination: {treated_cats} -> {control_cats}")
+                
+                print(f"\nTotal matched pairs across all combinations: {total_matched}")
+        else:
+            with Timer("Regular PSM matching"):
+                print("\nPerforming regular PSM without exact matching...")
+                matched_pairs = perform_hnsw_matching(
+                    treatment_df, control_df, caliper,
+                    matching_ratio, n_neighbors
+                )
+        
+        if not matched_pairs:
+            print("Warning: No matches found with current settings")
+            return ft_model, None
+            
+        with Timer("Creating final matched DataFrame"):
+            matched_df = pd.DataFrame(matched_pairs)
+            
+            print(f"\nFinal Matching Results:")
+            print(f"Matched Dataframe: {matched_df.shape}")
+            print(f"Matched treated units: {len(matched_pairs) // (matching_ratio + 1)}")
+            print(f"Matched control units: {len(matched_pairs) - (len(matched_pairs) // (matching_ratio + 1))}")
+            
+            return ft_model, matched_df
