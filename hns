@@ -1,201 +1,92 @@
-import pandas as pd
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-import time
-import warnings
-warnings.filterwarnings('ignore')
-
-# Config
-DATA_PATH = "HCA_unmatched_data_setup.parquet"
-X_VARIABLES = ["age", "gender_cd", "medical_coverage_tier"]
-TREATMENT_VAR = "grp_binary"
-OUTCOME_VAR = "social_risk_score"
-MATCHING_RATIO = 2
-CALIPER_SD = 0.25
-
-class Timer:
-    def __init__(self, description):
-        self.description = description
+ Prepare data for HNSW matching
+with Timer("Preparing data for HNSW matching"):
+    # Include both propensity score and covariates in matching
+    matching_vars = features_for_model + ['pscore']
     
-    def __enter__(self):
-        self.start = time.time()
-        return self
+    # Normalize variables for distance calculation
+    scaler = StandardScaler()
     
-    def __exit__(self, *args):
-        self.end = time.time()
-        self.duration = self.end - self.start
-        print(f"{self.description}: {self.duration:.4f} seconds")
-
-# Load data
-print(f"\nLoading data from {DATA_PATH}...")
-df = pd.read_parquet(DATA_PATH)
-
-# Handle missing values
-df_clean = df.copy()
-for col in X_VARIABLES:
-    if df_clean[col].dtype in ['int64', 'float64']:
-        df_clean[col] = df_clean[col].fillna(df_clean[col].median())
-    else:
-        df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
-
-# Create dummy variables
-with Timer("Creating dummy variables"):
-    df_encoded = df_clean.copy()
-    categorical_cols = []
+    # Scale treatment group
+    treated_data = treatment_df[matching_vars].copy()
+    treated_scaled = scaler.fit_transform(treated_data)
     
-    for col in X_VARIABLES:
-        if col in df_encoded.columns:
-            print(f"\nColumn {col} dtype:", df_encoded[col].dtype)
-            print(f"Column {col} unique values:", df_encoded[col].unique())
-            
-            if df_encoded[col].nunique() == 2 and df_encoded[col].dtype in ['int64', 'float64']:
-                df_encoded[col] = df_encoded[col].map({0: 'A', 1: 'B'})
-            
-            if df_encoded[col].dtype == 'object' or df_encoded[col].nunique() < 10:
-                categorical_cols.append(col)
-                unique_vals = df_encoded[col].dropna().unique()
-                
-                for val in unique_vals:
-                    col_name = f"{col}_{val}"
-                    df_encoded[col_name] = (df_encoded[col] == val).astype(int)
-                
-                df_encoded = df_encoded.drop(columns=[col])
-                
-            print(f"Created columns for {col}:", [c for c in df_encoded.columns if c.startswith(f"{col}_")])
-
-# Prepare features for model
-features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
-for col in categorical_cols:
-    dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
-    features_for_model.extend(dummy_cols)
-
-# Handle any remaining missing values
-nan_check = df_encoded[features_for_model].isna().sum()
-if nan_check.any():
-    print("NaN values found in features:")
-    print(nan_check[nan_check > 0])
-    df_encoded = df_encoded.dropna(subset=features_for_model)
-
-if df_encoded[TREATMENT_VAR].isna().any():
-    print("NaN values found in treatment variable")
-    df_encoded = df_encoded.dropna(subset=[TREATMENT_VAR])
-
-if df_encoded[OUTCOME_VAR].isna().any():
-    print("NaN values found in outcome variable")
-    df_encoded = df_encoded.dropna(subset=[OUTCOME_VAR])
-
-# Check distributions before matching
-print("\nDistributions before matching:")
-for col in categorical_cols:
-    col_dummies = [c for c in df_encoded.columns if c.startswith(col+'_')]
-    for dummy in col_dummies:
-        print(f"\nDistribution for {dummy}:")
-        print(df_encoded.groupby([TREATMENT_VAR, dummy]).size())
-        print("Mean by group:")
-        print(df_encoded.groupby(TREATMENT_VAR)[dummy].mean())
-
-# Calculate propensity scores
-with Timer("Calculating propensity scores"):
-    model = LogisticRegression(
-        penalty='l2',
-        C=1e6,
-        solver='lbfgs',
-        random_state=42,
-        max_iter=1000
-    )
-    model.fit(df_encoded[features_for_model], df_encoded[TREATMENT_VAR])
-    ps = model.predict_proba(df_encoded[features_for_model])[:, 1]
+    # Scale control group using same scaler
+    control_data = control_df[matching_vars].copy()
+    control_scaled = scaler.transform(control_data)
     
-    print("\nPropensity Score Model Coefficients:")
-    coef_df = pd.DataFrame({
-        'Feature': features_for_model,
-        'Coefficient': model.coef_[0]})
-    print(coef_df.to_string(index=False))
+    # Convert to float32 for HNSW
+    treated_scaled = treated_scaled.astype('float32')
+    control_scaled = control_scaled.astype('float32')
+    
+    print("\nMatching dimensions:", len(matching_vars))
 
-df_encoded['pscore'] = ps
+# Initialize HNSW
+with Timer("HNSW initialization"):
+    dimension = len(matching_vars)
+    m = 32  # Increased connections per layer for better accuracy
+    ef_construction = 80  # Increased for better index quality
+    
+    index = faiss.IndexHNSWFlat(dimension, m)
+    index.hnsw.efConstruction = ef_construction
+    index.add(control_scaled)
+    
+    ef_search = 20  # Increased for more thorough search
+    index.hnsw.efSearch = ef_search
+    
+    k = min(50, len(control_df))  # Increased k to have more candidates
+    distances, indices = index.search(treated_scaled, k)
 
-# Split into treatment and control
-treatment_df = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
-control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
-
-print("\nSample sizes:")
-print(f"Treatment group: {len(treatment_df)}")
-print(f"Control group: {len(control_df)}")
-
-# Calculate caliper
-caliper = np.std(df_encoded['pscore']) * CALIPER_SD
-print(f"\nCaliper width: {caliper:.4f}")
-
-# Matching
-with Timer(f"Matching process"):
+# Perform matching with quality checks
+with Timer(f"Matching process for {len(treatment_df)} treated units"):
     matched_pairs = []
     used_control_indices = set()
+    unmatched_treated = 0
     
-    # Sort treatment group by propensity score
-    treatment_df = treatment_df.sort_values('pscore', ascending=True)
+    # Calculate distance threshold based on mahalanobis distance
+    distance_threshold = chi2.ppf(0.95, df=dimension)
     
-    for idx, treated_unit in treatment_df.iterrows():
-        # Find all potential matches within caliper
-        eligible_controls = control_df[
-            (abs(control_df['pscore'] - treated_unit['pscore']) <= caliper) &
-            (~control_df.index.isin(used_control_indices))
-        ]
+    for i, (dist, idx) in enumerate(zip(distances, indices)):
+        matched_controls = []
         
-        if len(eligible_controls) >= MATCHING_RATIO:
-            # Sort by absolute difference in propensity score
-            eligible_controls['score_diff'] = abs(eligible_controls['pscore'] - treated_unit['pscore'])
-            best_matches = eligible_controls.nsmallest(MATCHING_RATIO, 'score_diff')
-            
-            # Add treated unit and its matches to results
-            matched_pairs.append(treated_unit)
-            for _, match in best_matches.iterrows():
-                matched_pairs.append(match)
-                used_control_indices.add(match.name)
+        # Sort potential matches by distance
+        potential_matches = [(d, control_idx) for d, control_idx in zip(dist, idx) 
+                           if control_idx != -1 and control_idx not in used_control_indices]
+        potential_matches.sort(key=lambda x: x[0])
+        
+        for distance, control_idx in potential_matches:
+            if len(matched_controls) >= MATCHING_RATIO:
+                break
+                
+            # Check if distance is within threshold
+            if distance <= distance_threshold:
+                matched_controls.append(control_idx)
+                used_control_indices.add(control_idx)
+        
+        if len(matched_controls) == MATCHING_RATIO:
+            matched_pairs.append(treatment_df.iloc[i])
+            for control_idx in matched_controls:
+                matched_pairs.append(control_df.iloc[control_idx])
+        else:
+            unmatched_treated += 1
+    
+    matched_df = pd.DataFrame(matched_pairs)
+    
+    print(f"\nMatching Statistics:")
+    print(f"Successfully matched treated units: {len(matched_pairs) // (MATCHING_RATIO + 1)}")
+    print(f"Unmatched treated units: {unmatched_treated}")
+    print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
 
-matched_df = pd.DataFrame(matched_pairs)
-
-print("\nMatching results:")
-print(f"Matched treated units: {len(matched_pairs) // (MATCHING_RATIO + 1)}")
-print(f"Matched control units: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
-print(f"Total matched pairs: {len(matched_pairs)}")
-
-# Check covariate balance after matching
-print("\nCovariate balance after matching:")
-for col in categorical_cols:
-    col_dummies = [c for c in matched_df.columns if c.startswith(col+'_')]
-    for dummy in col_dummies:
-        print(f"\nDistribution for {dummy}:")
-        print(matched_df.groupby([TREATMENT_VAR, dummy]).size())
-        print("Mean by group:")
-        print(matched_df.groupby(TREATMENT_VAR)[dummy].mean())
-        # Calculate standardized difference
-        t_mean = matched_df[matched_df[TREATMENT_VAR] == 1][dummy].mean()
-        c_mean = matched_df[matched_df[TREATMENT_VAR] == 0][dummy].mean()
-        t_var = matched_df[matched_df[TREATMENT_VAR] == 1][dummy].var()
-        c_var = matched_df[matched_df[TREATMENT_VAR] == 0][dummy].var()
-        pooled_var = np.sqrt((t_var + c_var) / 2)
-        std_diff = (t_mean - c_mean) / pooled_var if pooled_var != 0 else 0
-        print(f"Standardized difference: {std_diff:.4f}")
-
-# Check numeric variable balance
-for col in [col for col in features_for_model if col not in [c for cat in categorical_cols for c in df_encoded.columns if c.startswith(cat+'_')]]:
-    print(f"\nBalance for {col}:")
-    print("Mean by group:")
-    print(matched_df.groupby(TREATMENT_VAR)[col].mean())
-    print("Std by group:")
-    print(matched_df.groupby(TREATMENT_VAR)[col].std())
-    # Calculate standardized difference
-    t_mean = matched_df[matched_df[TREATMENT_VAR] == 1][col].mean()
-    c_mean = matched_df[matched_df[TREATMENT_VAR] == 0][col].mean()
-    t_var = matched_df[matched_df[TREATMENT_VAR] == 1][col].var()
-    c_var = matched_df[matched_df[TREATMENT_VAR] == 0][col].var()
-    pooled_var = np.sqrt((t_var + c_var) / 2)
-    std_diff = (t_mean - c_mean) / pooled_var if pooled_var != 0 else 0
-    print(f"Standardized difference: {std_diff:.4f}")
-
-# Calculate ATE
-ate = matched_df[matched_df[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
-      matched_df[matched_df[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
-
-print(f"\nResults:")
-print(f"Average Treatment Effect: {ate:.4f}")
+# Check matching quality
+print("\nMatching Quality Assessment:")
+for var in matching_vars:
+    treated_mean = matched_df[matched_df[TREATMENT_VAR] == 1][var].mean()
+    treated_std = matched_df[matched_df[TREATMENT_VAR] == 1][var].std()
+    control_mean = matched_df[matched_df[TREATMENT_VAR] == 0][var].mean()
+    control_std = matched_df[matched_df[TREATMENT_VAR] == 0][var].std()
+    
+    std_diff = (treated_mean - control_mean) / np.sqrt((treated_std**2 + control_std**2) / 2)
+    
+    print(f"\n{var}:")
+    print(f"Treated: Mean = {treated_mean:.4f}, Std = {treated_std:.4f}")
+    print(f"Control: Mean = {control_mean:.4f}, Std = {control_std:.4f}")
+    print(f"Standardized Difference: {std_diff:.4f}")
