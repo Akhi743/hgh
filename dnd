@@ -52,40 +52,53 @@ def get_propensity_score(data_frame, x, y, method="glm"):
         return model, scores
 
 def handle_exact_matching(df_encoded, match_combinations, treatment_var):
+    """Correct implementation of exact matching with one-hot encoded variables."""
     all_matched_groups = []
     
     for match_pair in match_combinations:
         treated_conditions, control_conditions = match_pair
         
+        # Get treated units that match all treated conditions
         treated_mask = df_encoded[treatment_var] == 1
+        for treated_col in treated_conditions:
+            treated_mask &= df_encoded[treated_col] == 1
+            
+            # Ensure other categories are 0
+            base_col = '_'.join(treated_col.split('_')[:-1])
+            other_cols = [col for col in df_encoded.columns 
+                         if col.startswith(base_col) and col != treated_col]
+            for other_col in other_cols:
+                treated_mask &= df_encoded[other_col] == 0
+
+        # Get control units that match all control conditions
         control_mask = df_encoded[treatment_var] == 0
-        
-        for condition in treated_conditions:
-            for col in df_encoded.columns:
-                if col.startswith(condition.split('_')[0]):
-                    if col == condition:
-                        treated_mask &= (df_encoded[col] == 1)
-                    else:
-                        treated_mask &= (df_encoded[col] == 0)
-        
-        for condition in control_conditions:
-            for col in df_encoded.columns:
-                if col.startswith(condition.split('_')[0]):
-                    if col == condition:
-                        control_mask &= (df_encoded[col] == 1)
-                    else:
-                        control_mask &= (df_encoded[col] == 0)
-        
+        for control_col in control_conditions:
+            control_mask &= df_encoded[control_col] == 1
+            
+            # Ensure other categories are 0
+            base_col = '_'.join(control_col.split('_')[:-1])
+            other_cols = [col for col in df_encoded.columns 
+                         if col.startswith(base_col) and col != control_col]
+            for other_col in other_cols:
+                control_mask &= df_encoded[other_col] == 0
+
         treated_group = df_encoded[treated_mask].copy()
         control_group = df_encoded[control_mask].copy()
         
-        print(f"\nMatching: {treated_conditions} -> {control_conditions}")
-        print(f"Treated group size: {len(treated_group)}")
-        print(f"Control group size: {len(control_group)}")
+        print(f"\nExact Matching Results:")
+        print(f"Conditions: {treated_conditions} -> {control_conditions}")
+        print(f"Matched treated units: {len(treated_group)}")
+        print(f"Matched control units: {len(control_group)}")
         
         if len(treated_group) > 0 and len(control_group) > 0:
             all_matched_groups.append((treated_group, control_group))
-    
+        else:
+            print("Warning: No matches found for this combination")
+            
+    if not all_matched_groups:
+        print("Error: No valid matching groups found")
+        return None
+        
     return all_matched_groups
 
 def knn_sklearn(treated_df, control_df, x_var, caliper, matching_ratio=1, n_neighbors=5):
@@ -244,6 +257,10 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
         print("\nPerforming exact matching with PSM...")
         matched_groups = handle_exact_matching(df_encoded, match_combinations, treatment_var)
         
+        if matched_groups is None:
+            print("Exact matching failed - no valid groups found")
+            return model, None
+            
         for treated_group, control_group in matched_groups:
             if match_method == 'sklearn':
                 curr_matched_pairs = matching_func(
