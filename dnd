@@ -21,7 +21,6 @@ class Timer:
         print(f"{self.description}: {self.duration:.4f} seconds")
 
 def get_dummy_col(df, features):
-    """Create dummy variables for categorical features."""
     with Timer("Creating dummy variables"):
         df_copy = df.copy()
         categorical_cols = []
@@ -37,16 +36,10 @@ def get_dummy_col(df, features):
     return df_copy, categorical_cols
 
 def get_propensity_score(data_frame, x, y, method="glm"):
-    """Calculate propensity scores using logistic regression."""
     with Timer("Calculating propensity scores"):
         if method == 'glm':
-            model = LogisticRegression(
-                penalty='l2',
-                C=1e6,
-                solver='lbfgs',
-                random_state=42,
-                max_iter=1000
-            )
+            model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', 
+                                     random_state=42, max_iter=1000)
             model.fit(data_frame[x], data_frame[y])
             scores = model.predict_proba(data_frame[x])[:, 1]
             
@@ -58,8 +51,44 @@ def get_propensity_score(data_frame, x, y, method="glm"):
             
         return model, scores
 
+def handle_exact_matching(df_encoded, match_combinations, treatment_var):
+    all_matched_groups = []
+    
+    for match_pair in match_combinations:
+        treated_conditions, control_conditions = match_pair
+        
+        treated_mask = df_encoded[treatment_var] == 1
+        control_mask = df_encoded[treatment_var] == 0
+        
+        for condition in treated_conditions:
+            for col in df_encoded.columns:
+                if col.startswith(condition.split('_')[0]):
+                    if col == condition:
+                        treated_mask &= (df_encoded[col] == 1)
+                    else:
+                        treated_mask &= (df_encoded[col] == 0)
+        
+        for condition in control_conditions:
+            for col in df_encoded.columns:
+                if col.startswith(condition.split('_')[0]):
+                    if col == condition:
+                        control_mask &= (df_encoded[col] == 1)
+                    else:
+                        control_mask &= (df_encoded[col] == 0)
+        
+        treated_group = df_encoded[treated_mask].copy()
+        control_group = df_encoded[control_mask].copy()
+        
+        print(f"\nMatching: {treated_conditions} -> {control_conditions}")
+        print(f"Treated group size: {len(treated_group)}")
+        print(f"Control group size: {len(control_group)}")
+        
+        if len(treated_group) > 0 and len(control_group) > 0:
+            all_matched_groups.append((treated_group, control_group))
+    
+    return all_matched_groups
+
 def knn_sklearn(treated_df, control_df, x_var, caliper, matching_ratio=1, n_neighbors=5):
-    """Perform matching using sklearn KNeighborsClassifier."""
     with Timer("KNN sklearn matching"):
         matched_pairs = []
         used_control_indices = set()
@@ -90,7 +119,6 @@ def knn_sklearn(treated_df, control_df, x_var, caliper, matching_ratio=1, n_neig
         return matched_pairs
 
 def knn_faiss(treated_df, control_df, caliper, matching_ratio=1, n_neighbors=5):
-    """Perform matching using basic FAISS index."""
     with Timer("KNN FAISS matching"):
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
@@ -106,7 +134,6 @@ def knn_faiss(treated_df, control_df, caliper, matching_ratio=1, n_neighbors=5):
                                    distances, indices, caliper, matching_ratio)
 
 def knn_faiss_ivf(treated_df, control_df, caliper, matching_ratio=1, n_neighbors=5):
-    """Perform matching using FAISS IVF index for improved performance."""
     with Timer("KNN FAISS IVF matching"):
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
@@ -127,20 +154,19 @@ def knn_faiss_ivf(treated_df, control_df, caliper, matching_ratio=1, n_neighbors
                                    distances, indices, caliper, matching_ratio)
 
 def knn_faiss_hnsw(treated_df, control_df, caliper, matching_ratio=1, n_neighbors=5):
-    """Perform matching using FAISS HNSW index for optimal speed-accuracy trade-off."""
     with Timer("KNN FAISS HNSW matching"):
         treated_pscores = treated_df['pscore'].values.reshape(-1, 1).astype('float32')
         control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
         
         dimension = 1
-        m = 16  # number of connections per layer
-        ef_construction = 40  # controls index building quality
+        m = 16
+        ef_construction = 40
         
         index = faiss.IndexHNSWFlat(dimension, m)
         index.hnsw.efConstruction = ef_construction
         index.add(control_pscores)
         
-        ef_search = 10  # controls search quality
+        ef_search = 10
         index.hnsw.efSearch = ef_search
         
         k = min(n_neighbors, len(control_df))
@@ -151,7 +177,6 @@ def knn_faiss_hnsw(treated_df, control_df, caliper, matching_ratio=1, n_neighbor
 
 def process_faiss_matches(treated_df, control_df, treated_pscores, control_pscores, 
                          distances, indices, caliper, matching_ratio):
-    """Helper function to process FAISS matching results."""
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
@@ -164,7 +189,7 @@ def process_faiss_matches(treated_df, control_df, treated_pscores, control_pscor
             if len(matched_controls) >= matching_ratio:
                 break
             
-            if control_idx == -1:  # FAISS returns -1 for no match found
+            if control_idx == -1:
                 continue
                 
             control_pscore = control_pscores[control_idx][0]
@@ -187,48 +212,9 @@ def process_faiss_matches(treated_df, control_df, treated_pscores, control_pscor
     
     return matched_pairs
 
-def handle_exact_matching(df_encoded, match_combinations, treatment_var):
-    """Handle exact matching logic for categorical variables."""
-    all_matched_groups = []
-    
-    for treated_cats, control_cats in match_combinations:
-        # For each category in treated, ensure it's 1 and all other categories are 0
-        treated_mask = pd.Series(True, index=df_encoded.index)
-        for cat in treated_cats:
-            base_col = cat.rsplit('_', 1)[0]  # Get base column name
-            all_cats = [c for c in df_encoded.columns if c.startswith(f"{base_col}_")]
-            
-            treated_mask &= (df_encoded[cat] == 1)
-            other_cats = [c for c in all_cats if c != cat]
-            for other_cat in other_cats:
-                treated_mask &= (df_encoded[other_cat] == 0)
-
-        control_mask = pd.Series(True, index=df_encoded.index)
-        for cat in control_cats:
-            base_col = cat.rsplit('_', 1)[0]
-            all_cats = [c for c in df_encoded.columns if c.startswith(f"{base_col}_")]
-            
-            control_mask &= (df_encoded[cat] == 1)
-            other_cats = [c for c in all_cats if c != cat]
-            for other_cat in other_cats:
-                control_mask &= (df_encoded[other_cat] == 0)
-
-        treated_group = df_encoded[treated_mask & (df_encoded[treatment_var] == 1)].copy()
-        control_group = df_encoded[control_mask & (df_encoded[treatment_var] == 0)].copy()
-        
-        all_matched_groups.append((treated_group, control_group))
-        
-        print(f"\nMatching combination: {treated_cats} -> {control_cats}")
-        print(f"Treated group size: {len(treated_group)}")
-        print(f"Control group size: {len(control_group)}")
-    
-    return all_matched_groups
-
 def psm_main_function(data_path, x_variables, treatment_var, outcome_var, 
                      match_method='sklearn', match_combinations=None,
                      matching_ratio=1, n_neighbors=5, caliper_sd=0.25):
-    """Main function to perform propensity score matching with exact matching."""
-    # Load and prepare data
     with Timer("Loading and preparing data"):
         df = pd.read_parquet(data_path)
         df_encoded, categorical_cols = get_dummy_col(df, x_variables)
@@ -238,12 +224,10 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
             dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
             features_for_model.extend(dummy_cols)
     
-    # Calculate propensity scores
     model, ps = get_propensity_score(df_encoded, features_for_model, treatment_var)
     df_encoded['pscore'] = ps
     caliper = np.std(df_encoded['pscore']) * caliper_sd
     
-    # Select matching function
     matching_functions = {
         'sklearn': knn_sklearn,
         'faiss': knn_faiss,
@@ -261,21 +245,19 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
         matched_groups = handle_exact_matching(df_encoded, match_combinations, treatment_var)
         
         for treated_group, control_group in matched_groups:
-            if len(treated_group) > 0 and len(control_group) >= matching_ratio:
-                if match_method == 'sklearn':
-                    curr_matched_pairs = matching_func(
-                        treated_group, control_group, features_for_model, 
-                        caliper, matching_ratio, n_neighbors
-                    )
-                else:
-                    curr_matched_pairs = matching_func(
-                        treated_group, control_group, caliper, 
-                        matching_ratio, n_neighbors
-                    )
-                if curr_matched_pairs:
-                    all_matched_pairs.extend(curr_matched_pairs)
+            if match_method == 'sklearn':
+                curr_matched_pairs = matching_func(
+                    treated_group, control_group, features_for_model, 
+                    caliper, matching_ratio, n_neighbors
+                )
             else:
-                print("Insufficient units for matching in this combination")
+                curr_matched_pairs = matching_func(
+                    treated_group, control_group, caliper, 
+                    matching_ratio, n_neighbors
+                )
+            
+            if curr_matched_pairs:
+                all_matched_pairs.extend(curr_matched_pairs)
     else:
         print("\nPerforming regular PSM without exact matching...")
         treated_df = df_encoded[df_encoded[treatment_var] == 1].copy()
@@ -298,7 +280,6 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
     
     matched_df = pd.DataFrame(all_matched_pairs)
     
-    # Calculate treatment effect
     if matched_df is not None:
         ate = matched_df[matched_df[treatment_var] == 1][outcome_var].mean() - \
               matched_df[matched_df[treatment_var] == 0][outcome_var].mean()
@@ -307,10 +288,10 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
     return model, matched_df
 
 if __name__ == "__main__":
-    # Example usage
     params = {
         'data_path': "marketing_test_case.parquet",
-        'x_variables': ["age", "gender_cd", "social_risk_score", "hpd_hyd", "hpd_hyc", "hpd_ast", "hpd_dia"],
+        'x_variables': ["age", "gender_cd", "social_risk_score", 
+                       "hpd_hyd", "hpd_hyc", "hpd_ast", "hpd_dia"],
         'treatment_var': "grp_binary",
         'outcome_var': "social_risk_score",
         'matching_ratio': 1,
@@ -318,8 +299,10 @@ if __name__ == "__main__":
         'caliper_sd': 0.25
     }
     
-    # Example: Male to Female matching
     match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
     
-    # Run matching with selected method
-    selected_method = 'faiss_hnsw'  # Options: 'sklearn', 'faiss', 'faiss_ivf', 'faiss
+    model, matched_data = psm_main_function(
+        match_method='faiss_hnsw',
+        match_combinations=match_combinations,
+        **params
+    )
