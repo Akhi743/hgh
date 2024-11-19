@@ -15,7 +15,7 @@ MATCHING_RATIO = 2
 N_NEIGHBORS = 5
 CALIPER_SD = 0.25
 
-# 1. First let's load and examine the data
+# 1. Load and examine the data
 print("Step 1: Data Examination")
 print("======================")
 df = pd.read_csv(DATA_PATH)
@@ -30,39 +30,31 @@ for var in X_VARIABLES:
     print(f"\n{var}:")
     print(f"Data type: {df[var].dtype}")
     print(f"Unique values: {n_unique}")
+    if n_unique < 10:  # For categorical variables, show all unique values
+        print(f"Categories: {sorted(df[var].unique())}")
     print(f"Missing values: {n_missing}")
-    print("Sample values:", df[var].head().tolist())
 
 # Identify categorical variables
 categorical_vars = []
 numeric_vars = []
 
 for var in X_VARIABLES:
-    # Check if variable is already numeric
-    if df[var].dtype in ['int64', 'float64']:
-        if df[var].nunique() < 10:  # If few unique values, treat as categorical
-            categorical_vars.append(var)
-        else:
-            numeric_vars.append(var)
-    else:
+    if df[var].dtype == 'object' or (df[var].dtype in ['int64', 'float64'] and df[var].nunique() < 10):
         categorical_vars.append(var)
+    else:
+        numeric_vars.append(var)
 
 print("\nVariable Classification:")
 print("----------------------")
 print("Categorical variables:", categorical_vars)
 print("Numeric variables:", numeric_vars)
 
-# Treatment variable distribution
-print("\nTreatment Distribution:")
-print("---------------------")
-print(df[TREATMENT_VAR].value_counts(normalize=True))
-
 # 2. Prepare data with one-hot encoding
 print("\nStep 2: Data Preparation")
 print("======================")
 
-# One-hot encode categorical variables
-df_encoded = pd.get_dummies(df, columns=categorical_vars, prefix_sep='_')
+# Create dummy variables with drop_first=True to avoid dummy variable trap
+df_encoded = pd.get_dummies(df, columns=categorical_vars, prefix_sep='_', drop_first=True)
 
 # Get list of feature columns after encoding
 feature_columns = []
@@ -119,8 +111,6 @@ control_mask = ~treated_mask
 treated_indices = np.where(treated_mask)[0]
 control_indices = np.where(control_mask)[0]
 
-print("\nMatching Process:")
-print("----------------")
 print(f"Treated units: {len(treated_indices)}")
 print(f"Control units: {len(control_indices)}")
 
@@ -141,20 +131,32 @@ distances, indices = index.search(treated_ps, MATCHING_RATIO)
 
 # Create matches dataframe
 matches = []
+used_control_indices = set()  # Keep track of used control units
+
 for i, treated_idx in enumerate(treated_indices):
-    for j in range(MATCHING_RATIO):
-        if j < len(indices[i]):
-            control_idx = control_indices[indices[i][j]]
-            distance = distances[i][j]
+    matches_for_treated = 0
+    
+    for j in range(len(indices[i])):
+        if matches_for_treated >= MATCHING_RATIO:
+            break
+            
+        control_idx = control_indices[indices[i][j]]
+        
+        # Check if control unit hasn't been used and meets caliper
+        if control_idx not in used_control_indices:
             ps_diff = abs(propensity_scores[treated_idx] - propensity_scores[control_idx])
             
             if ps_diff <= caliper:
                 matches.append({
                     'treated_index': treated_idx,
                     'control_index': control_idx,
+                    'ps_treated': propensity_scores[treated_idx],
+                    'ps_control': propensity_scores[control_idx],
                     'ps_diff': ps_diff,
-                    'distance': distance
+                    'distance': float(distances[i][j])
                 })
+                used_control_indices.add(control_idx)
+                matches_for_treated += 1
 
 matches_df = pd.DataFrame(matches)
 
@@ -165,29 +167,56 @@ if len(matches_df) > 0:
     print(f"Average PS difference: {matches_df['ps_diff'].mean():.4f}")
 
 # 5. Create and save final matched dataset
-matched_indices = pd.concat([
-    pd.Series(matches_df['treated_index'].values),
-    pd.Series(matches_df['control_index'].values)
-])
-
-matched_data = df_encoded.iloc[matched_indices].copy()
-matched_data['matched_set'] = np.repeat(range(len(matches_df)), 2)
-matched_data['is_treated'] = np.tile([1, 0], len(matches_df))
-
-# Save results
-matched_data.to_csv('matched_dataset.csv', index=False)
-coefficients.to_csv('propensity_score_coefficients.csv', index=False)
-matches_df.to_csv('matching_pairs.csv', index=False)
-
-print("\nResults saved to:")
-print("- matched_dataset.csv")
-print("- propensity_score_coefficients.csv")
-print("- matching_pairs.csv")
-
-# Print final matching statistics
-print("\nFinal Matching Statistics:")
-print("------------------------")
-print(f"Total matched pairs: {len(matches_df)}")
-print(f"Unique treated units matched: {len(matches_df['treated_index'].unique())}")
-print(f"Unique control units matched: {len(matches_df['control_index'].unique())}")
-print(f"Average propensity score difference: {matches_df['ps_diff'].mean():.4f}")
+if len(matches_df) > 0:
+    # Get all matched indices
+    all_indices = pd.concat([
+        pd.Series(matches_df['treated_index'].values),
+        pd.Series(matches_df['control_index'].values)
+    ])
+    
+    # Create final matched dataset
+    matched_data = df_encoded.iloc[all_indices].copy()
+    matched_data['matched_set'] = np.repeat(range(len(matches_df)), 2)
+    matched_data['is_treated'] = np.tile([1, 0], len(matches_df))
+    
+    # Save results
+    matched_data.to_csv('matched_dataset.csv', index=False)
+    coefficients.to_csv('propensity_score_coefficients.csv', index=False)
+    matches_df.to_csv('matching_pairs.csv', index=False)
+    
+    print("\nResults saved to:")
+    print("- matched_dataset.csv")
+    print("- propensity_score_coefficients.csv")
+    print("- matching_pairs.csv")
+    
+    # Print final matching statistics
+    print("\nFinal Matching Statistics:")
+    print("------------------------")
+    print(f"Total matched pairs: {len(matches_df)}")
+    print(f"Unique treated units matched: {len(matches_df['treated_index'].unique())}")
+    print(f"Unique control units matched: {len(matches_df['control_index'].unique())}")
+    print(f"Average propensity score difference: {matches_df['ps_diff'].mean():.4f}")
+    
+    # Print balance statistics
+    print("\nBalance Statistics:")
+    print("-----------------")
+    balance_stats = []
+    for var in feature_columns:
+        treated_before = df_encoded[df_encoded[TREATMENT_VAR] == 1][var]
+        control_before = df_encoded[df_encoded[TREATMENT_VAR] == 0][var]
+        treated_after = matched_data[matched_data['is_treated'] == 1][var]
+        control_after = matched_data[matched_data['is_treated'] == 0][var]
+        
+        balance_stats.append({
+            'variable': var,
+            'mean_diff_before': treated_before.mean() - control_before.mean(),
+            'mean_diff_after': treated_after.mean() - control_after.mean(),
+            'std_before': np.sqrt((treated_before.var() + control_before.var()) / 2),
+            'std_after': np.sqrt((treated_after.var() + control_after.var()) / 2)
+        })
+    
+    balance_df = pd.DataFrame(balance_stats)
+    print(balance_df)
+    balance_df.to_csv('balance_statistics.csv', index=False)
+else:
+    print("\nNo matches found meeting the criteria.")
