@@ -187,23 +187,47 @@ def process_faiss_matches(treated_df, control_df, treated_pscores, control_pscor
     
     return matched_pairs
 
+def handle_exact_matching(df_encoded, match_combinations, treatment_var):
+    """Handle exact matching logic for categorical variables."""
+    all_matched_groups = []
+    
+    for treated_cats, control_cats in match_combinations:
+        # For each category in treated, ensure it's 1 and all other categories are 0
+        treated_mask = pd.Series(True, index=df_encoded.index)
+        for cat in treated_cats:
+            base_col = cat.rsplit('_', 1)[0]  # Get base column name
+            all_cats = [c for c in df_encoded.columns if c.startswith(f"{base_col}_")]
+            
+            treated_mask &= (df_encoded[cat] == 1)
+            other_cats = [c for c in all_cats if c != cat]
+            for other_cat in other_cats:
+                treated_mask &= (df_encoded[other_cat] == 0)
+
+        control_mask = pd.Series(True, index=df_encoded.index)
+        for cat in control_cats:
+            base_col = cat.rsplit('_', 1)[0]
+            all_cats = [c for c in df_encoded.columns if c.startswith(f"{base_col}_")]
+            
+            control_mask &= (df_encoded[cat] == 1)
+            other_cats = [c for c in all_cats if c != cat]
+            for other_cat in other_cats:
+                control_mask &= (df_encoded[other_cat] == 0)
+
+        treated_group = df_encoded[treated_mask & (df_encoded[treatment_var] == 1)].copy()
+        control_group = df_encoded[control_mask & (df_encoded[treatment_var] == 0)].copy()
+        
+        all_matched_groups.append((treated_group, control_group))
+        
+        print(f"\nMatching combination: {treated_cats} -> {control_cats}")
+        print(f"Treated group size: {len(treated_group)}")
+        print(f"Control group size: {len(control_group)}")
+    
+    return all_matched_groups
+
 def psm_main_function(data_path, x_variables, treatment_var, outcome_var, 
                      match_method='sklearn', match_combinations=None,
                      matching_ratio=1, n_neighbors=5, caliper_sd=0.25):
-    """
-    Main function to perform propensity score matching with optional exact matching.
-    
-    Args:
-        data_path (str): Path to input data file
-        x_variables (list): List of feature names
-        treatment_var (str): Name of treatment indicator column
-        outcome_var (str): Name of outcome variable
-        match_method (str): One of 'sklearn', 'faiss', 'faiss_ivf', or 'faiss_hnsw'
-        match_combinations (list): List of tuples for exact matching
-        matching_ratio (int): Number of control units per treatment unit
-        n_neighbors (int): Number of neighbors for KNN
-        caliper_sd (float): Caliper size in standard deviations
-    """
+    """Main function to perform propensity score matching with exact matching."""
     # Load and prepare data
     with Timer("Loading and preparing data"):
         df = pd.read_parquet(data_path)
@@ -219,7 +243,7 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
     df_encoded['pscore'] = ps
     caliper = np.std(df_encoded['pscore']) * caliper_sd
     
-    # Select matching function based on method
+    # Select matching function
     matching_functions = {
         'sklearn': knn_sklearn,
         'faiss': knn_faiss,
@@ -230,33 +254,13 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
     if not matching_func:
         raise ValueError(f"Invalid matching method. Choose from {list(matching_functions.keys())}")
     
-    # Initialize result container
     all_matched_pairs = []
     
     if match_combinations:
         print("\nPerforming exact matching with PSM...")
-        for treated_cats, control_cats in match_combinations:
-            # Create masks for exact matching
-            treated_mask = pd.Series(True, index=df_encoded.index)
-            control_mask = pd.Series(True, index=df_encoded.index)
-            
-            for cat in treated_cats:
-                treated_mask &= (df_encoded[cat] == 1)
-            for cat in control_cats:
-                control_mask &= (df_encoded[cat] == 1)
-            
-            # Get subsets for this combination
-            treated_group = df_encoded[
-                treated_mask & (df_encoded[treatment_var] == 1)
-            ].copy()
-            control_group = df_encoded[
-                control_mask & (df_encoded[treatment_var] == 0)
-            ].copy()
-            
-            print(f"\nMatching combination: {treated_cats} -> {control_cats}")
-            print(f"Treated group size: {len(treated_group)}")
-            print(f"Control group size: {len(control_group)}")
-            
+        matched_groups = handle_exact_matching(df_encoded, match_combinations, treatment_var)
+        
+        for treated_group, control_group in matched_groups:
             if len(treated_group) > 0 and len(control_group) >= matching_ratio:
                 if match_method == 'sklearn':
                     curr_matched_pairs = matching_func(
@@ -268,7 +272,8 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
                         treated_group, control_group, caliper, 
                         matching_ratio, n_neighbors
                     )
-                all_matched_pairs.extend(curr_matched_pairs)
+                if curr_matched_pairs:
+                    all_matched_pairs.extend(curr_matched_pairs)
             else:
                 print("Insufficient units for matching in this combination")
     else:
@@ -293,7 +298,7 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
     
     matched_df = pd.DataFrame(all_matched_pairs)
     
-    # Calculate and print treatment effect
+    # Calculate treatment effect
     if matched_df is not None:
         ate = matched_df[matched_df[treatment_var] == 1][outcome_var].mean() - \
               matched_df[matched_df[treatment_var] == 0][outcome_var].mean()
@@ -304,8 +309,8 @@ def psm_main_function(data_path, x_variables, treatment_var, outcome_var,
 if __name__ == "__main__":
     # Example usage
     params = {
-        'data_path': "HCA_unmatched_data_setup.parquet",
-        'x_variables': ["age", "gender_cd", "medical_coverage_tier"],
+        'data_path': "marketing_test_case.parquet",
+        'x_variables': ["age", "gender_cd", "social_risk_score", "hpd_hyd", "hpd_hyc", "hpd_ast", "hpd_dia"],
         'treatment_var': "grp_binary",
         'outcome_var': "social_risk_score",
         'matching_ratio': 1,
@@ -317,9 +322,4 @@ if __name__ == "__main__":
     match_combinations = [(['gender_cd_M'], ['gender_cd_F'])]
     
     # Run matching with selected method
-    selected_method = 'faiss_hnsw'  # Options: 'sklearn', 'faiss', 'faiss_ivf', 'faiss_hnsw'
-    model, matched_data = psm_main_function(
-        match_method=selected_method,
-        match_combinations=match_combinations,
-        **params
-    )
+    selected_method = 'faiss_hnsw'  # Options: 'sklearn', 'faiss', 'faiss_ivf', 'faiss
