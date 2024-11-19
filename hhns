@@ -1,65 +1,160 @@
-def handle_exact_matching(df_encoded, match_combinations, treatment_var):
-    """
-    Handle exact matching with proper column existence checks and mask handling.
-    """
-    all_matched_groups = []
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+import faiss
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# Config
+DATA_PATH = "marketing_test_case.csv"
+X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]  # Removed gender_cd
+TREATMENT_VAR = "grp_binary"
+OUTCOME_VAR = "social_risk_score"
+MATCHING_RATIO = 2
+N_NEIGHBORS = 5
+CALIPER_SD = 0.25
+
+class Timer:
+    def __init__(self, description):
+        self.description = description
     
-    for match_pair in match_combinations:
-        treated_conditions, control_conditions = match_pair
-        
-        # Verify all columns exist
-        all_conditions = treated_conditions + control_conditions
-        missing_cols = [col for col in all_conditions if col not in df_encoded.columns]
-        if missing_cols:
-            print(f"Warning: Missing columns: {missing_cols}")
-            print("Available columns:", df_encoded.columns.tolist())
-            continue
-            
-        # Initialize masks
-        treated_mask = df_encoded[treatment_var] == 1
-        control_mask = df_encoded[treatment_var] == 0
-        
-        # Apply conditions for treated group
-        for col in treated_conditions:
-            treated_mask &= df_encoded[col] == 1
-            
-            # Get prefix (e.g., 'gender_cd' from 'gender_cd_M')
-            prefix = '_'.join(col.split('_')[:-1])
-            related_cols = [c for c in df_encoded.columns if c.startswith(prefix + '_') and c != col]
-            
-            # Set all other related columns to 0
-            for rel_col in related_cols:
-                treated_mask &= (df_encoded[rel_col] == 0)
-        
-        # Apply conditions for control group
-        for col in control_conditions:
-            control_mask &= df_encoded[col] == 1
-            
-            prefix = '_'.join(col.split('_')[:-1])
-            related_cols = [c for c in df_encoded.columns if c.startswith(prefix + '_') and c != col]
-            
-            for rel_col in related_cols:
-                control_mask &= (df_encoded[rel_col] == 0)
-        
-        treated_group = df_encoded[treated_mask].copy()
-        control_group = df_encoded[control_mask].copy()
-        
-        # Debug information
-        print("\nExact Matching Results:")
-        print(f"Matching combination: {treated_conditions} -> {control_conditions}")
-        print(f"Treatment group size: {len(treated_group)}")
-        print(f"Control group size: {len(control_group)}")
-        
-        # Print column values for debugging
-        if len(treated_group) == 0 or len(control_group) == 0:
-            for col in treated_conditions + control_conditions:
-                print(f"\nColumn {col} value counts:")
-                print(df_encoded[col].value_counts())
-        
-        if len(treated_group) > 0 and len(control_group) > 0:
-            all_matched_groups.append((treated_group, control_group))
+    def __enter__(self):
+        self.start = time.time()
+        return self
     
-    if not all_matched_groups:
-        return None
+    def __exit__(self, *args):
+        self.end = time.time()
+        self.duration = self.end - self.start
+        print(f"{self.description}: {self.duration:.4f} seconds")
+
+def run_analysis(df, gender_label):
+    print(f"\nAnalyzing {gender_label} population...")
     
-    return all_matched_groups
+    # Handle missing values
+    df_clean = df.copy()
+    for col in X_VARIABLES:
+        if df_clean[col].dtype in ['int64', 'float64']:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+        else:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
+
+    # Create dummy variables
+    with Timer("Creating dummy variables"):
+        df_encoded = df_clean.copy()
+        categorical_cols = []
+        
+        for col in X_VARIABLES:
+            if col in df_encoded.columns:
+                if df_encoded[col].nunique() == 2 and df_encoded[col].dtype in ['int64', 'float64']:
+                    df_encoded[col] = df_encoded[col].map({0: 'A', 1: 'B'})
+                
+                if df_encoded[col].dtype == 'object' or df_encoded[col].nunique() < 10:
+                    categorical_cols.append(col)
+                    unique_vals = df_encoded[col].dropna().unique()
+                    
+                    for val in unique_vals:
+                        col_name = f"{col}_{val}"
+                        df_encoded[col_name] = (df_encoded[col] == val).astype(int)
+                    
+                    df_encoded = df_encoded.drop(columns=[col])
+
+    features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
+    for col in categorical_cols:
+        dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
+        features_for_model.extend(dummy_cols)
+
+    # Handle remaining missing values
+    df_encoded = df_encoded.dropna(subset=features_for_model + [TREATMENT_VAR, OUTCOME_VAR])
+
+    # Propensity Score Calculation
+    with Timer("Calculating propensity scores"):
+        model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', random_state=42, max_iter=1000)
+        model.fit(df_encoded[features_for_model], df_encoded[TREATMENT_VAR])
+        ps = model.predict_proba(df_encoded[features_for_model])[:, 1]
+        
+        print("\nPropensity Score Model Coefficients:")
+        coef_df = pd.DataFrame({
+            'Feature': features_for_model,
+            'Coefficient': model.coef_[0]})
+        print(coef_df.to_string(index=False))
+
+    df_encoded['pscore'] = ps
+
+    # Matching
+    caliper = np.std(df_encoded['pscore']) * CALIPER_SD
+    treatment_df = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
+    control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
+
+    with Timer("HNSW initialization"):
+        treated_pscores = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
+        control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+        
+        dimension = 1
+        index = faiss.IndexHNSWFlat(dimension, 16)
+        index.hnsw.efConstruction = 40
+        index.add(control_pscores)
+        
+        index.hnsw.efSearch = 10
+        k = min(N_NEIGHBORS, len(control_df))
+        distances, indices = index.search(treated_pscores, k)
+
+    with Timer(f"Matching process for {len(treatment_df)} treated units"):
+        matched_pairs = []
+        used_control_indices = set()
+        unmatched_treated = 0
+        
+        for i, (dist, idx) in enumerate(zip(distances, indices)):
+            matched_controls = []
+            treated_pscore = treated_pscores[i][0]
+            
+            for d, control_idx in zip(dist, idx):
+                if len(matched_controls) >= MATCHING_RATIO:
+                    break
+                
+                if control_idx == -1:
+                    continue
+                
+                control_pscore = control_pscores[control_idx][0]
+                ps_diff = abs(treated_pscore - control_pscore)
+                
+                if ps_diff <= caliper and control_idx not in used_control_indices:
+                    matched_controls.append(control_idx)
+                    used_control_indices.add(control_idx)
+            
+            if len(matched_controls) == MATCHING_RATIO:
+                matched_pairs.append(treatment_df.iloc[i])
+                for control_idx in matched_controls:
+                    matched_pairs.append(control_df.iloc[control_idx])
+            else:
+                unmatched_treated += 1
+        
+        print(f"\nMatching Statistics for {gender_label}:")
+        print(f"Successfully matched treated units: {len(matched_pairs) // (MATCHING_RATIO + 1)}")
+        print(f"Unmatched treated units: {unmatched_treated}")
+        print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
+
+    matched_df = pd.DataFrame(matched_pairs)
+    ate = matched_df[matched_df[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
+          matched_df[matched_df[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
+    
+    print(f"\nResults for {gender_label}:")
+    print(f"Average Treatment Effect: {ate:.4f}")
+    
+    return ate
+
+# Main execution
+print(f"\nLoading data from {DATA_PATH}...")
+df = pd.read_csv(DATA_PATH)
+
+# Split by gender and analyze
+male_df = df[df['gender_cd'] == 1]
+female_df = df[df['gender_cd'] == 0]
+
+male_ate = run_analysis(male_df, "Male")
+female_ate = run_analysis(female_df, "Female")
+
+print("\nFinal Comparison:")
+print(f"Male ATE: {male_ate:.4f}")
+print(f"Female ATE: {female_ate:.4f}")
+print(f"ATE Difference (Male - Female): {(male_ate - female_ate):.4f}")
