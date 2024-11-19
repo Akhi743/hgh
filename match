@@ -2,14 +2,17 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
     """Find matching pairs within caliper"""
     matched_pairs = []
     used_control_indices = set()
-    unmatched_treated = 0
+    total_treated = len(treatment_df)
+    matched_treated = 0
     
     for i, (dist, idx) in enumerate(zip(distances, indices)):
+        matched_controls = []
         treated_pscore = treatment_df['pscore'].iloc[i]
-        potential_matches = []
         
-        # First pass: collect all potential matches within caliper
         for d, control_idx in zip(dist, idx):
+            if len(matched_controls) >= MATCHING_RATIO:
+                break
+                
             if control_idx == -1:
                 continue
                 
@@ -17,20 +20,14 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             ps_diff = abs(treated_pscore - control_pscore)
             
             if ps_diff <= caliper and control_idx not in used_control_indices:
-                potential_matches.append((ps_diff, control_idx))
-        
-        # Sort potential matches by propensity score difference
-        potential_matches.sort(key=lambda x: x[0])
-        
-        # Take up to MATCHING_RATIO best matches
-        selected_matches = [m[1] for m in potential_matches[:MATCHING_RATIO]]
-        
-        if selected_matches:
-            matched_pairs.append(treatment_df.iloc[i])
-            for control_idx in selected_matches:
-                matched_pairs.append(control_df.iloc[control_idx])
+                matched_controls.append(control_idx)
                 used_control_indices.add(control_idx)
-        else:
-            unmatched_treated += 1
+        
+        if len(matched_controls) == MATCHING_RATIO:
+            matched_pairs.append(treatment_df.iloc[i])
+            for control_idx in matched_controls:
+                matched_pairs.append(control_df.iloc[control_idx])
+            matched_treated += 1
             
+    unmatched_treated = total_treated - matched_treated
     return matched_pairs, unmatched_treated
