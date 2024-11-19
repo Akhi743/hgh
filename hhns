@@ -1,10 +1,40 @@
-# Split data into male and female subsets
-male_df = df[df['gender_cd'] == 'Male'].copy()
-female_df = df[df['gender_cd'] == 'Female'].copy()
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+import faiss
+import time
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# Config
+DATA_PATH = "marketing_test_case.csv"  # Path to your input data file
+X_VARIABLES = ["age", "gender_cd", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]  # Features to use
+TREATMENT_VAR = "grp_binary"  # Name of treatment/control indicator column
+OUTCOME_VAR = "social_risk_score"  # Name of outcome variable
+MATCHING_RATIO = 2  # Number of control units per treatment unit
+N_NEIGHBORS = 5  # Number of neighbors for KNN matching
+CALIPER_SD = 0.25  # Caliper size in standard deviations of propensity score
+
+
+class Timer:
+    def __init__(self, description):
+        self.description = description
+
+    def __enter__(self):
+        self.start = time.time()
+        return self
+
+    def __exit__(self, *args):
+        self.end = time.time()
+        self.duration = self.end - self.start
+        print(f"{self.description}: {self.duration:.4f} seconds")
+
 
 # Function to run the analysis
 def run_analysis(data, gender_label):
     print(f"\nRunning analysis for {gender_label} dataset...")
+
     # Handle missing values
     data_clean = data.copy()
     for col in X_VARIABLES:
@@ -111,6 +141,18 @@ def run_analysis(data, gender_label):
 
     print(f"\n{gender_label} Results:")
     print(f"Average Treatment Effect: {ate:.4f}")
+
+
+# Main Script
+print(f"\nLoading data from {DATA_PATH}...")
+df = pd.read_csv(DATA_PATH)
+
+# Ensure gender_cd is properly formatted
+df['gender_cd'] = df['gender_cd'].str.strip().str.title()  # Clean and normalize strings
+
+# Split data into male and female subsets
+male_df = df[df['gender_cd'] == 'Male'].copy()
+female_df = df[df['gender_cd'] == 'Female'].copy()
 
 # Run the analysis for male and female subsets
 run_analysis(male_df, "Male")
