@@ -1,12 +1,8 @@
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 import faiss
 import warnings
-from joblib import Parallel, delayed
-import math
 warnings.filterwarnings('ignore')
 
 # Config
@@ -15,73 +11,94 @@ X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd
 TREATMENT_VAR = "grp_binary"
 OUTCOME_VAR = "social_risk_score"
 MATCHING_RATIO = 2
-N_NEIGHBORS = 50
+N_NEIGHBORS = 20
 CALIPER_SD = 0.5
-BATCH_SIZE = 100000
-N_JOBS = -1  # Use all available cores
 
 def preprocess_data(df_subset):
+    """Handle missing values and create dummy variables"""
+    # Handle missing values
     df_clean = df_subset.copy()
     for col in X_VARIABLES:
         if df_clean[col].dtype in ['int64', 'float64']:
             df_clean[col] = df_clean[col].fillna(df_clean[col].median())
         else:
             df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
+            
     return df_clean
 
-def create_feature_vectors(df_encoded, features):
-    scaler = StandardScaler()
-    vectors = scaler.fit_transform(df_encoded[features])
+def create_dummy_variables(df_clean):
+    """Create dummy variables for categorical features"""
+    df_encoded = df_clean.copy()
+    categorical_cols = []
     
-    # Apply PCA if dimensions > 100
-    if vectors.shape[1] > 100:
-        pca = PCA(n_components=0.95)  # Preserve 95% variance
-        vectors = pca.fit_transform(vectors)
-    
-    return vectors.astype('float32')
-
-def process_batch(batch_df, features_for_model):
-    model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', random_state=42, max_iter=1000)
-    return model.predict_proba(batch_df[features_for_model])[:, 1]
+    for col in X_VARIABLES:
+        if col in df_encoded.columns:
+            if df_encoded[col].nunique() == 2 and df_encoded[col].dtype in ['int64', 'float64']:
+                df_encoded[col] = df_encoded[col].map({0: 'A', 1: 'B'})
+            
+            if df_encoded[col].dtype == 'object' or df_encoded[col].nunique() < 10:
+                categorical_cols.append(col)
+                unique_vals = df_encoded[col].dropna().unique()
+                
+                for val in unique_vals:
+                    col_name = f"{col}_{val}"
+                    df_encoded[col_name] = (df_encoded[col] == val).astype(int)
+                
+                df_encoded = df_encoded.drop(columns=[col])
+                
+    return df_encoded, categorical_cols
 
 def calculate_propensity_scores(df_encoded, features_for_model):
-    n_batches = math.ceil(len(df_encoded) / BATCH_SIZE)
-    batches = np.array_split(df_encoded, n_batches)
-    
-    scores = Parallel(n_jobs=N_JOBS)(
-        delayed(process_batch)(batch, features_for_model) 
-        for batch in batches
-    )
-    return np.concatenate(scores)
+    """Calculate propensity scores using logistic regression"""
+    model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', random_state=42, max_iter=1000)
+    model.fit(df_encoded[features_for_model], df_encoded[TREATMENT_VAR])
+    return model.predict_proba(df_encoded[features_for_model])[:, 1]
 
-def perform_matching(treatment_df, control_df, feature_vectors):
-    treated_vectors = feature_vectors[treatment_df.index]
-    control_vectors = feature_vectors[control_df.index]
+def perform_matching(treatment_df, control_df, features_for_model, caliper):
+    """Perform nearest neighbor matching using FAISS"""
+    # Prepare feature matrices including both features and propensity score
+    treat_features = treatment_df[features_for_model].values.astype('float32')
+    control_features = control_df[features_for_model].values.astype('float32')
     
-    dimension = treated_vectors.shape[1]
-    index = faiss.IndexHNSWFlat(dimension, 32)  # M=32
-    index.hnsw.efConstruction = 200
-    index.hnsw.efSearch = 50
+    # Add propensity score as an additional feature
+    treat_ps = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
+    control_ps = control_df['pscore'].values.reshape(-1, 1).astype('float32')
     
-    # Normalize vectors
-    faiss.normalize_L2(treated_vectors)
-    faiss.normalize_L2(control_vectors)
+    # Normalize features
+    means = np.mean(np.vstack([treat_features, control_features]), axis=0)
+    stds = np.std(np.vstack([treat_features, control_features]), axis=0)
+    treat_features = (treat_features - means) / stds
+    control_features = (control_features - means) / stds
     
-    index.add(control_vectors)
-    distances, indices = index.search(treated_vectors, N_NEIGHBORS)
+    # Combine with propensity scores
+    treat_combined = np.hstack([treat_features, treat_ps])
+    control_combined = np.hstack([control_features, control_ps])
+    
+    dimension = len(features_for_model) + 1  # Add 1 for propensity score
+    index = faiss.IndexHNSWFlat(dimension, 32)  # Increase M for better connectivity
+    index.hnsw.efConstruction = 100  # Increase for better index quality
+    index.add(control_combined)
+    
+    index.hnsw.efSearch = 40  # Increase for better search
+    k = min(N_NEIGHBORS, len(control_df))
+    distances, indices = index.search(treat_combined, k)
     
     return distances, indices
 
 def find_matches(distances, indices, treatment_df, control_df, caliper):
+    """Find matching pairs within caliper"""
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
     
     for i, (dist, idx) in enumerate(zip(distances, indices)):
+        matched_controls = []
         treated_pscore = treatment_df['pscore'].iloc[i]
-        valid_matches = []
         
         for d, control_idx in zip(dist, idx):
+            if len(matched_controls) >= MATCHING_RATIO:
+                break
+            
             if control_idx == -1:
                 continue
             
@@ -89,35 +106,50 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             ps_diff = abs(treated_pscore - control_pscore)
             
             if ps_diff <= caliper and control_idx not in used_control_indices:
-                valid_matches.append((ps_diff, control_idx))
+                matched_controls.append(control_idx)
+                used_control_indices.add(control_idx)
         
-        valid_matches.sort(key=lambda x: x[0])
-        matched_controls = [m[1] for m in valid_matches[:MATCHING_RATIO]]
-        
-        if matched_controls:
+        if len(matched_controls) == MATCHING_RATIO:
             matched_pairs.append(treatment_df.iloc[i])
             for control_idx in matched_controls:
                 matched_pairs.append(control_df.iloc[control_idx])
-                used_control_indices.add(control_idx)
         else:
             unmatched_treated += 1
             
     return matched_pairs, unmatched_treated
 
+def calculate_ate(matched_df):
+    """Calculate Average Treatment Effect"""
+    ate = matched_df[matched_df[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
+          matched_df[matched_df[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
+    return ate
+
 def run_analysis(df_subset, gender):
+    """Main analysis function"""
     print(f"\nAnalyzing {gender} subset...")
+    
+    # Preprocessing
     df_clean = preprocess_data(df_subset)
     
     # Feature engineering
-    df_encoded = df_clean.copy()
-    features_for_model = X_VARIABLES.copy()
+    df_encoded, categorical_cols = create_dummy_variables(df_clean)
+    
+    # Drop gender_cd_bin if exists
+    if 'gender_cd_bin' in df_encoded.columns:
+        df_encoded = df_encoded.drop(columns=['gender_cd_bin'])
+    
+    # Prepare features for model
+    features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
+    for col in categorical_cols:
+        dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
+        features_for_model.extend(dummy_cols)
+    
+    # Handle remaining missing values
+    df_encoded = df_encoded.dropna(subset=features_for_model + [TREATMENT_VAR, OUTCOME_VAR])
     
     # Calculate propensity scores
     ps = calculate_propensity_scores(df_encoded, features_for_model)
     df_encoded['pscore'] = ps
-    
-    # Create feature vectors for matching
-    feature_vectors = create_feature_vectors(df_encoded, features_for_model + ['pscore'])
     
     # Prepare for matching
     caliper = np.std(df_encoded['pscore']) * CALIPER_SD
@@ -125,26 +157,35 @@ def run_analysis(df_subset, gender):
     control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
     
     # Perform matching
-    distances, indices = perform_matching(treatment_df, control_df, feature_vectors)
+    distances, indices = perform_matching(treatment_df, control_df, features_for_model, caliper)
     matched_pairs, unmatched_treated = find_matches(distances, indices, treatment_df, control_df, caliper)
     
-    # Calculate results
+    # Create matched dataset
     matched_df = pd.DataFrame(matched_pairs)
-    ate = matched_df[matched_df[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
-          matched_df[matched_df[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
     
-    print(f"\nResults for {gender}:")
-    print(f"Matched treated: {len(matched_pairs) // (MATCHING_RATIO + 1)}")
-    print(f"Unmatched treated: {unmatched_treated}")
-    print(f"Total matched controls: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
-    print(f"ATE: {ate:.4f}")
+    # Calculate ATE
+    ate = calculate_ate(matched_df)
+    
+    # Print results
+    total_treated = len(treatment_df)
+    matched_treated = len(matched_pairs) // (MATCHING_RATIO + 1)
+    
+    print(f"\nMatching Statistics for {gender}:")
+    print(f"Total treated units: {total_treated}")
+    print(f"Successfully matched treated units: {matched_treated}")
+    print(f"Unmatched treated units: {unmatched_treated}")
+    print(f"Match rate: {(matched_treated/total_treated)*100:.2f}%")
+    print(f"Total matched control units: {len(matched_pairs) - matched_treated}")
+    print(f"Average Treatment Effect for {gender}: {ate:.4f}")
     
     return matched_df, ate
 
 def main():
-    print(f"\nLoading data...")
+    # Load data
+    print(f"\nLoading data from {DATA_PATH}...")
     df = pd.read_csv(DATA_PATH)
     
+    # Split by gender and run analysis
     male_df = df[df['gender_cd'] == 'M']
     female_df = df[df['gender_cd'] == 'F']
     
