@@ -6,208 +6,188 @@ import faiss
 import warnings
 warnings.filterwarnings('ignore')
 
-def prepare_data(data_path, x_variables, treatment_var, outcome_var):
-    """
-    Load and prepare data for propensity score matching
-    """
-    # Load the data
-    df = pd.read_csv(data_path)
-    
-    # Identify categorical variables
-    categorical_vars = df[x_variables].select_dtypes(include=['object', 'category']).columns
-    print("Categorical variables identified:", categorical_vars.tolist())
-    
-    # One-hot encode categorical variables
-    df_encoded = pd.get_dummies(df, columns=categorical_vars, prefix_sep='_')
-    
-    # Update X_variables list with one-hot encoded column names
-    x_encoded = []
-    for var in x_variables:
-        if var in categorical_vars:
-            x_encoded.extend([col for col in df_encoded.columns if col.startswith(f"{var}_")])
+# Define inputs
+DATA_PATH = "marketing_test_case.csv"
+X_VARIABLES = ["age", "gender_cd", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
+TREATMENT_VAR = "grp_binary"
+OUTCOME_VAR = "social_risk_score"
+MATCHING_RATIO = 2
+N_NEIGHBORS = 5
+CALIPER_SD = 0.25
+
+# 1. First let's load and examine the data
+print("Step 1: Data Examination")
+print("======================")
+df = pd.read_csv(DATA_PATH)
+print(f"\nTotal observations: {len(df)}")
+
+# Examine each variable
+print("\nVariable Analysis:")
+print("-----------------")
+for var in X_VARIABLES:
+    n_unique = df[var].nunique()
+    n_missing = df[var].isnull().sum()
+    print(f"\n{var}:")
+    print(f"Data type: {df[var].dtype}")
+    print(f"Unique values: {n_unique}")
+    print(f"Missing values: {n_missing}")
+    print("Sample values:", df[var].head().tolist())
+
+# Identify categorical variables
+categorical_vars = []
+numeric_vars = []
+
+for var in X_VARIABLES:
+    # Check if variable is already numeric
+    if df[var].dtype in ['int64', 'float64']:
+        if df[var].nunique() < 10:  # If few unique values, treat as categorical
+            categorical_vars.append(var)
         else:
-            x_encoded.append(var)
-    
-    return df_encoded, x_encoded
+            numeric_vars.append(var)
+    else:
+        categorical_vars.append(var)
 
-def calculate_propensity_scores(df, x_variables, treatment_var):
-    """
-    Calculate propensity scores using logistic regression
-    """
-    # Standardize features
-    scaler = StandardScaler()
-    X = scaler.fit_transform(df[x_variables])
-    
-    # Fit logistic regression
-    lr = LogisticRegression(random_state=42)
-    lr.fit(X, df[treatment_var])
-    
-    # Calculate propensity scores
-    propensity_scores = lr.predict_proba(X)[:, 1]
-    
-    # Get coefficients and feature names
-    coefficients = pd.DataFrame({
-        'feature': x_variables,
-        'coefficient': lr.coef_[0]
-    })
-    coefficients = coefficients.sort_values('coefficient', ascending=False)
-    
-    print("\nPropensity Score Model Coefficients:")
-    print(coefficients)
-    
-    return propensity_scores, coefficients
+print("\nVariable Classification:")
+print("----------------------")
+print("Categorical variables:", categorical_vars)
+print("Numeric variables:", numeric_vars)
 
-def faiss_matching(treated_ps, control_ps, treated_indices, control_indices, matching_ratio, n_neighbors):
-    """
-    Perform matching using FAISS HNSW
-    """
-    # Reshape propensity scores for FAISS
-    treated_ps = treated_ps.reshape(-1, 1)
-    control_ps = control_ps.reshape(-1, 1)
-    
-    # Initialize FAISS index
-    index = faiss.IndexHNSWFlat(1, n_neighbors)  # 1 is dimension for propensity score
-    
-    # Add control units to index
-    index.add(control_ps.astype('float32'))
-    
-    # Search for nearest neighbors
-    distances, indices = index.search(treated_ps.astype('float32'), 
-                                    min(matching_ratio * 2, len(control_ps)))  # Search for more than needed
-    
-    # Convert FAISS indices to original indices and create matched pairs
-    matched_pairs = []
-    used_control_indices = set()
-    
-    for i in range(len(treated_indices)):
-        matches_found = 0
-        treated_idx = treated_indices[i]
-        
-        for j in range(len(indices[i])):
-            if matches_found >= matching_ratio:
-                break
-                
+# Treatment variable distribution
+print("\nTreatment Distribution:")
+print("---------------------")
+print(df[TREATMENT_VAR].value_counts(normalize=True))
+
+# 2. Prepare data with one-hot encoding
+print("\nStep 2: Data Preparation")
+print("======================")
+
+# One-hot encode categorical variables
+df_encoded = pd.get_dummies(df, columns=categorical_vars, prefix_sep='_')
+
+# Get list of feature columns after encoding
+feature_columns = []
+for var in numeric_vars:
+    feature_columns.append(var)
+for var in categorical_vars:
+    feature_columns.extend([col for col in df_encoded.columns if col.startswith(f"{var}_")])
+
+print("\nFeatures after encoding:")
+print("----------------------")
+print("Total features:", len(feature_columns))
+print("Feature names:", feature_columns)
+
+# 3. Calculate propensity scores
+print("\nStep 3: Propensity Score Calculation")
+print("=================================")
+
+# Standardize features
+scaler = StandardScaler()
+X = scaler.fit_transform(df_encoded[feature_columns])
+
+# Fit logistic regression
+lr = LogisticRegression(random_state=42)
+lr.fit(X, df_encoded[TREATMENT_VAR])
+
+# Calculate propensity scores
+propensity_scores = lr.predict_proba(X)[:, 1]
+
+# Analyze coefficients
+coefficients = pd.DataFrame({
+    'feature': feature_columns,
+    'coefficient': lr.coef_[0],
+    'abs_coefficient': abs(lr.coef_[0])
+})
+coefficients = coefficients.sort_values('abs_coefficient', ascending=False)
+
+print("\nPropensity Score Model:")
+print("---------------------")
+print("Top influential features:")
+print(coefficients.head())
+
+print("\nPropensity Score Distribution:")
+print("----------------------------")
+print(pd.Series(propensity_scores).describe())
+
+# 4. Perform matching
+print("\nStep 4: Matching Process")
+print("=====================")
+
+# Split into treated and control groups
+treated_mask = df_encoded[TREATMENT_VAR] == 1
+control_mask = ~treated_mask
+
+treated_indices = np.where(treated_mask)[0]
+control_indices = np.where(control_mask)[0]
+
+print("\nMatching Process:")
+print("----------------")
+print(f"Treated units: {len(treated_indices)}")
+print(f"Control units: {len(control_indices)}")
+
+# Prepare propensity scores for matching
+treated_ps = propensity_scores[treated_mask].reshape(-1, 1).astype('float32')
+control_ps = propensity_scores[control_mask].reshape(-1, 1).astype('float32')
+
+# Initialize FAISS index
+index = faiss.IndexHNSWFlat(1, N_NEIGHBORS)
+index.add(control_ps)
+
+# Calculate caliper
+caliper = CALIPER_SD * propensity_scores.std()
+print(f"Caliper width: {caliper:.4f}")
+
+# Perform matching
+distances, indices = index.search(treated_ps, MATCHING_RATIO)
+
+# Create matches dataframe
+matches = []
+for i, treated_idx in enumerate(treated_indices):
+    for j in range(MATCHING_RATIO):
+        if j < len(indices[i]):
             control_idx = control_indices[indices[i][j]]
             distance = distances[i][j]
+            ps_diff = abs(propensity_scores[treated_idx] - propensity_scores[control_idx])
             
-            # Check if control unit hasn't been used yet
-            if control_idx not in used_control_indices:
-                matched_pairs.append((treated_idx, control_idx, distance))
-                used_control_indices.add(control_idx)
-                matches_found += 1
-    
-    return matched_pairs
+            if ps_diff <= caliper:
+                matches.append({
+                    'treated_index': treated_idx,
+                    'control_index': control_idx,
+                    'ps_diff': ps_diff,
+                    'distance': distance
+                })
 
-def main(data_path, x_variables, treatment_var, outcome_var, matching_ratio, n_neighbors, caliper_sd=0.25):
-    """
-    Main function to perform propensity score matching using FAISS
-    """
-    print("Starting propensity score matching process with FAISS...")
-    
-    # Prepare data
-    df_encoded, x_encoded = prepare_data(data_path, x_variables, treatment_var, outcome_var)
-    
-    # Calculate propensity scores
-    propensity_scores, coefficients = calculate_propensity_scores(df_encoded, x_encoded, treatment_var)
-    df_encoded['propensity_score'] = propensity_scores
-    
-    # Split into treated and control groups
-    treated_mask = df_encoded[treatment_var] == 1
-    treated = df_encoded[treated_mask]
-    control = df_encoded[~treated_mask]
-    
-    print(f"\nNumber of treated units: {len(treated)}")
-    print(f"Number of control units: {len(control)}")
-    
-    # Calculate caliper
-    ps_std = df_encoded['propensity_score'].std()
-    caliper = caliper_sd * ps_std
-    print(f"Caliper width: {caliper:.4f} (SD units: {caliper_sd})")
-    
-    # Perform matching
-    matched_pairs = faiss_matching(
-        treated['propensity_score'].values,
-        control['propensity_score'].values,
-        treated.index.values,
-        control.index.values,
-        matching_ratio,
-        n_neighbors
-    )
-    
-    # Create matched pairs dataframe
-    matched_pairs_df = pd.DataFrame(matched_pairs, 
-                                  columns=['treated_index', 'control_index', 'distance'])
-    
-    # Apply caliper
-    matched_pairs_df['ps_treated'] = df_encoded.loc[matched_pairs_df['treated_index'], 
-                                                   'propensity_score'].values
-    matched_pairs_df['ps_control'] = df_encoded.loc[matched_pairs_df['control_index'], 
-                                                   'propensity_score'].values
-    matched_pairs_df['ps_diff'] = abs(matched_pairs_df['ps_treated'] - matched_pairs_df['ps_control'])
-    
-    # Filter matches within caliper
-    matched_pairs_df = matched_pairs_df[matched_pairs_df['ps_diff'] <= caliper]
-    
-    print(f"\nNumber of matched pairs within caliper: {len(matched_pairs_df)}")
-    
-    # Create matched dataset
-    treated_data = df_encoded.loc[matched_pairs_df['treated_index']]
-    control_data = df_encoded.loc[matched_pairs_df['control_index']]
-    
-    # Combine matched data
-    matched_data = pd.concat([treated_data, control_data])
-    
-    # Calculate balance statistics
-    balance_stats = calculate_balance_statistics(df_encoded, matched_data, x_encoded, treatment_var)
-    
-    return matched_data, matched_pairs_df, coefficients, balance_stats
+matches_df = pd.DataFrame(matches)
 
-def calculate_balance_statistics(original_data, matched_data, variables, treatment_var):
-    """
-    Calculate standardized mean differences before and after matching
-    """
-    def standardized_diff(treat, control, pooled_std):
-        return (treat.mean() - control.mean()) / pooled_std if pooled_std != 0 else 0
-    
-    balance_stats = []
-    
-    for var in variables:
-        # Before matching
-        treat_before = original_data[original_data[treatment_var] == 1][var]
-        control_before = original_data[original_data[treatment_var] == 0][var]
-        pooled_std_before = np.sqrt((treat_before.var() + control_before.var()) / 2)
-        std_diff_before = standardized_diff(treat_before, control_before, pooled_std_before)
-        
-        # After matching
-        treat_after = matched_data[matched_data[treatment_var] == 1][var]
-        control_after = matched_data[matched_data[treatment_var] == 0][var]
-        pooled_std_after = np.sqrt((treat_after.var() + control_after.var()) / 2)
-        std_diff_after = standardized_diff(treat_after, control_after, pooled_std_after)
-        
-        balance_stats.append({
-            'variable': var,
-            'std_diff_before': std_diff_before,
-            'std_diff_after': std_diff_after,
-            'improvement': abs(std_diff_before) - abs(std_diff_after)
-        })
-    
-    return pd.DataFrame(balance_stats)
+print("\nMatching Results:")
+print("----------------")
+print(f"Matched pairs found: {len(matches_df)}")
+if len(matches_df) > 0:
+    print(f"Average PS difference: {matches_df['ps_diff'].mean():.4f}")
 
-# Example usage
-matched_data, matched_pairs, coefficients, balance_stats = main(
-    DATA_PATH,
-    X_VARIABLES,
-    TREATMENT_VAR,
-    OUTCOME_VAR,
-    MATCHING_RATIO,
-    N_NEIGHBORS,
-    CALIPER_SD
-)
+# 5. Create and save final matched dataset
+matched_indices = pd.concat([
+    pd.Series(matches_df['treated_index'].values),
+    pd.Series(matches_df['control_index'].values)
+])
+
+matched_data = df_encoded.iloc[matched_indices].copy()
+matched_data['matched_set'] = np.repeat(range(len(matches_df)), 2)
+matched_data['is_treated'] = np.tile([1, 0], len(matches_df))
 
 # Save results
 matched_data.to_csv('matched_dataset.csv', index=False)
-matched_pairs.to_csv('matched_pairs.csv', index=False)
 coefficients.to_csv('propensity_score_coefficients.csv', index=False)
-balance_stats.to_csv('balance_statistics.csv', index=False)
+matches_df.to_csv('matching_pairs.csv', index=False)
 
-print("\nMatching completed! Results saved to CSV files.")
+print("\nResults saved to:")
+print("- matched_dataset.csv")
+print("- propensity_score_coefficients.csv")
+print("- matching_pairs.csv")
+
+# Print final matching statistics
+print("\nFinal Matching Statistics:")
+print("------------------------")
+print(f"Total matched pairs: {len(matches_df)}")
+print(f"Unique treated units matched: {len(matches_df['treated_index'].unique())}")
+print(f"Unique control units matched: {len(matches_df['control_index'].unique())}")
+print(f"Average propensity score difference: {matches_df['ps_diff'].mean():.4f}")
