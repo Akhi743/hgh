@@ -1,0 +1,65 @@
+def handle_exact_matching(df_encoded, match_combinations, treatment_var):
+    """
+    Handle exact matching with proper column existence checks and mask handling.
+    """
+    all_matched_groups = []
+    
+    for match_pair in match_combinations:
+        treated_conditions, control_conditions = match_pair
+        
+        # Verify all columns exist
+        all_conditions = treated_conditions + control_conditions
+        missing_cols = [col for col in all_conditions if col not in df_encoded.columns]
+        if missing_cols:
+            print(f"Warning: Missing columns: {missing_cols}")
+            print("Available columns:", df_encoded.columns.tolist())
+            continue
+            
+        # Initialize masks
+        treated_mask = df_encoded[treatment_var] == 1
+        control_mask = df_encoded[treatment_var] == 0
+        
+        # Apply conditions for treated group
+        for col in treated_conditions:
+            treated_mask &= df_encoded[col] == 1
+            
+            # Get prefix (e.g., 'gender_cd' from 'gender_cd_M')
+            prefix = '_'.join(col.split('_')[:-1])
+            related_cols = [c for c in df_encoded.columns if c.startswith(prefix + '_') and c != col]
+            
+            # Set all other related columns to 0
+            for rel_col in related_cols:
+                treated_mask &= (df_encoded[rel_col] == 0)
+        
+        # Apply conditions for control group
+        for col in control_conditions:
+            control_mask &= df_encoded[col] == 1
+            
+            prefix = '_'.join(col.split('_')[:-1])
+            related_cols = [c for c in df_encoded.columns if c.startswith(prefix + '_') and c != col]
+            
+            for rel_col in related_cols:
+                control_mask &= (df_encoded[rel_col] == 0)
+        
+        treated_group = df_encoded[treated_mask].copy()
+        control_group = df_encoded[control_mask].copy()
+        
+        # Debug information
+        print("\nExact Matching Results:")
+        print(f"Matching combination: {treated_conditions} -> {control_conditions}")
+        print(f"Treatment group size: {len(treated_group)}")
+        print(f"Control group size: {len(control_group)}")
+        
+        # Print column values for debugging
+        if len(treated_group) == 0 or len(control_group) == 0:
+            for col in treated_conditions + control_conditions:
+                print(f"\nColumn {col} value counts:")
+                print(df_encoded[col].value_counts())
+        
+        if len(treated_group) > 0 and len(control_group) > 0:
+            all_matched_groups.append((treated_group, control_group))
+    
+    if not all_matched_groups:
+        return None
+    
+    return all_matched_groups
