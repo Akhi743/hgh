@@ -1,35 +1,157 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import faiss
+import warnings
+from joblib import Parallel, delayed
+import math
+warnings.filterwarnings('ignore')
+
+# Config
+DATA_PATH = "marketing_test_case.csv"
+X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
+TREATMENT_VAR = "grp_binary"
+OUTCOME_VAR = "social_risk_score"
+MATCHING_RATIO = 2
+N_NEIGHBORS = 50
+CALIPER_SD = 0.5
+BATCH_SIZE = 100000
+N_JOBS = -1  # Use all available cores
+
+def preprocess_data(df_subset):
+    df_clean = df_subset.copy()
+    for col in X_VARIABLES:
+        if df_clean[col].dtype in ['int64', 'float64']:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+        else:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
+    return df_clean
+
+def create_feature_vectors(df_encoded, features):
+    scaler = StandardScaler()
+    vectors = scaler.fit_transform(df_encoded[features])
+    
+    # Apply PCA if dimensions > 100
+    if vectors.shape[1] > 100:
+        pca = PCA(n_components=0.95)  # Preserve 95% variance
+        vectors = pca.fit_transform(vectors)
+    
+    return vectors.astype('float32')
+
+def process_batch(batch_df, features_for_model):
+    model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', random_state=42, max_iter=1000)
+    return model.predict_proba(batch_df[features_for_model])[:, 1]
+
+def calculate_propensity_scores(df_encoded, features_for_model):
+    n_batches = math.ceil(len(df_encoded) / BATCH_SIZE)
+    batches = np.array_split(df_encoded, n_batches)
+    
+    scores = Parallel(n_jobs=N_JOBS)(
+        delayed(process_batch)(batch, features_for_model) 
+        for batch in batches
+    )
+    return np.concatenate(scores)
+
+def perform_matching(treatment_df, control_df, feature_vectors):
+    treated_vectors = feature_vectors[treatment_df.index]
+    control_vectors = feature_vectors[control_df.index]
+    
+    dimension = treated_vectors.shape[1]
+    index = faiss.IndexHNSWFlat(dimension, 32)  # M=32
+    index.hnsw.efConstruction = 200
+    index.hnsw.efSearch = 50
+    
+    # Normalize vectors
+    faiss.normalize_L2(treated_vectors)
+    faiss.normalize_L2(control_vectors)
+    
+    index.add(control_vectors)
+    distances, indices = index.search(treated_vectors, N_NEIGHBORS)
+    
+    return distances, indices
+
 def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Find matching pairs within caliper"""
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
     
     for i, (dist, idx) in enumerate(zip(distances, indices)):
         treated_pscore = treatment_df['pscore'].iloc[i]
-        matched_controls = []
-        
-        # First collect all valid matches
         valid_matches = []
+        
         for d, control_idx in zip(dist, idx):
             if control_idx == -1:
                 continue
-                
+            
             control_pscore = control_df['pscore'].iloc[control_idx]
             ps_diff = abs(treated_pscore - control_pscore)
             
             if ps_diff <= caliper and control_idx not in used_control_indices:
-                valid_matches.append(control_idx)
+                valid_matches.append((ps_diff, control_idx))
         
-        # Take first MATCHING_RATIO valid matches
-        if len(valid_matches) >= 1:
-            for idx in valid_matches[:MATCHING_RATIO]:
-                matched_controls.append(idx)
-                used_control_indices.add(idx)
-            
+        valid_matches.sort(key=lambda x: x[0])
+        matched_controls = [m[1] for m in valid_matches[:MATCHING_RATIO]]
+        
+        if matched_controls:
             matched_pairs.append(treatment_df.iloc[i])
             for control_idx in matched_controls:
                 matched_pairs.append(control_df.iloc[control_idx])
+                used_control_indices.add(control_idx)
         else:
             unmatched_treated += 1
             
     return matched_pairs, unmatched_treated
+
+def run_analysis(df_subset, gender):
+    print(f"\nAnalyzing {gender} subset...")
+    df_clean = preprocess_data(df_subset)
+    
+    # Feature engineering
+    df_encoded = df_clean.copy()
+    features_for_model = X_VARIABLES.copy()
+    
+    # Calculate propensity scores
+    ps = calculate_propensity_scores(df_encoded, features_for_model)
+    df_encoded['pscore'] = ps
+    
+    # Create feature vectors for matching
+    feature_vectors = create_feature_vectors(df_encoded, features_for_model + ['pscore'])
+    
+    # Prepare for matching
+    caliper = np.std(df_encoded['pscore']) * CALIPER_SD
+    treatment_df = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
+    control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
+    
+    # Perform matching
+    distances, indices = perform_matching(treatment_df, control_df, feature_vectors)
+    matched_pairs, unmatched_treated = find_matches(distances, indices, treatment_df, control_df, caliper)
+    
+    # Calculate results
+    matched_df = pd.DataFrame(matched_pairs)
+    ate = matched_df[matched_df[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
+          matched_df[matched_df[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
+    
+    print(f"\nResults for {gender}:")
+    print(f"Matched treated: {len(matched_pairs) // (MATCHING_RATIO + 1)}")
+    print(f"Unmatched treated: {unmatched_treated}")
+    print(f"Total matched controls: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
+    print(f"ATE: {ate:.4f}")
+    
+    return matched_df, ate
+
+def main():
+    print(f"\nLoading data...")
+    df = pd.read_csv(DATA_PATH)
+    
+    male_df = df[df['gender_cd'] == 'M']
+    female_df = df[df['gender_cd'] == 'F']
+    
+    male_matched, male_ate = run_analysis(male_df, "Male")
+    female_matched, female_ate = run_analysis(female_df, "Female")
+    
+    return male_matched, male_ate, female_matched, female_ate
+
+if __name__ == "__main__":
+    main()
