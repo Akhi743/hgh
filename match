@@ -2,17 +2,15 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
     """Find matching pairs within caliper"""
     matched_pairs = []
     used_control_indices = set()
-    total_treated = len(treatment_df)
-    matched_treated = 0
+    unmatched_treated = 0
     
     for i, (dist, idx) in enumerate(zip(distances, indices)):
-        matched_controls = []
         treated_pscore = treatment_df['pscore'].iloc[i]
+        matched_controls = []
         
+        # First collect all valid matches
+        valid_matches = []
         for d, control_idx in zip(dist, idx):
-            if len(matched_controls) >= MATCHING_RATIO:
-                break
-                
             if control_idx == -1:
                 continue
                 
@@ -20,14 +18,18 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             ps_diff = abs(treated_pscore - control_pscore)
             
             if ps_diff <= caliper and control_idx not in used_control_indices:
-                matched_controls.append(control_idx)
-                used_control_indices.add(control_idx)
+                valid_matches.append(control_idx)
         
-        if len(matched_controls) == MATCHING_RATIO:
+        # Take first MATCHING_RATIO valid matches
+        if len(valid_matches) >= 1:
+            for idx in valid_matches[:MATCHING_RATIO]:
+                matched_controls.append(idx)
+                used_control_indices.add(idx)
+            
             matched_pairs.append(treatment_df.iloc[i])
             for control_idx in matched_controls:
                 matched_pairs.append(control_df.iloc[control_idx])
-            matched_treated += 1
+        else:
+            unmatched_treated += 1
             
-    unmatched_treated = total_treated - matched_treated
     return matched_pairs, unmatched_treated
