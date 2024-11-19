@@ -1,128 +1,32 @@
-import pandas as pd
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-import faiss
-import warnings
-warnings.filterwarnings('ignore')
-
-# Config
-DATA_PATH = "marketing_test_case.csv"
-X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
-TREATMENT_VAR = "grp_binary"
-OUTCOME_VAR = "social_risk_score"
-MATCHING_RATIO = 2
-N_NEIGHBORS = 5
-CALIPER_SD = 0.25
-
-def run_analysis(df_subset, gender):
-    print(f"\nAnalyzing {gender} subset...")
-    
-    # Handle missing values
-    df_clean = df_subset.copy()
-    for col in X_VARIABLES:
-        if df_clean[col].dtype in ['int64', 'float64']:
-            df_clean[col] = df_clean[col].fillna(df_clean[col].median())
-        else:
-            df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
-
-    # Create dummy variables
-    df_encoded = df_clean.copy()
-    categorical_cols = []
-    
-    for col in X_VARIABLES:
-        if col in df_encoded.columns:
-            if df_encoded[col].nunique() == 2 and df_encoded[col].dtype in ['int64', 'float64']:
-                df_encoded[col] = df_encoded[col].map({0: 'A', 1: 'B'})
-            
-            if df_encoded[col].dtype == 'object' or df_encoded[col].nunique() < 10:
-                categorical_cols.append(col)
-                unique_vals = df_encoded[col].dropna().unique()
-                
-                for val in unique_vals:
-                    col_name = f"{col}_{val}"
-                    df_encoded[col_name] = (df_encoded[col] == val).astype(int)
-                
-                df_encoded = df_encoded.drop(columns=[col])
-
-    features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
-    for col in categorical_cols:
-        dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
-        features_for_model.extend(dummy_cols)
-
-    # Handle remaining missing values
-    df_encoded = df_encoded.dropna(subset=features_for_model + [TREATMENT_VAR, OUTCOME_VAR])
-
-    # Propensity Score Calculation
-    model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', random_state=42, max_iter=1000)
-    model.fit(df_encoded[features_for_model], df_encoded[TREATMENT_VAR])
-    ps = model.predict_proba(df_encoded[features_for_model])[:, 1]
-
-    df_encoded['pscore'] = ps
-
-    # Matching
-    caliper = np.std(df_encoded['pscore']) * CALIPER_SD
-    treatment_df = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
-    control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
-
-    treated_pscores = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
-    control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
-    
-    dimension = 1
-    index = faiss.IndexHNSWFlat(dimension, 16)
-    index.hnsw.efConstruction = 40
-    index.add(control_pscores)
-    
-    index.hnsw.efSearch = 10
-    k = min(N_NEIGHBORS, len(control_df))
-    distances, indices = index.search(treated_pscores, k)
-
-    matched_pairs = []
+matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
     
     for i, (dist, idx) in enumerate(zip(distances, indices)):
-        matched_controls = []
+        current_matches = []
         treated_pscore = treated_pscores[i][0]
         
+        # Try to find MATCHING_RATIO controls for current treated unit
         for d, control_idx in zip(dist, idx):
-            if len(matched_controls) >= MATCHING_RATIO:
+            if len(current_matches) >= MATCHING_RATIO:
                 break
-            
+                
             if control_idx == -1:
                 continue
-            
+                
             control_pscore = control_pscores[control_idx][0]
             ps_diff = abs(treated_pscore - control_pscore)
             
             if ps_diff <= caliper and control_idx not in used_control_indices:
-                matched_controls.append(control_idx)
+                current_matches.append(control_idx)
                 used_control_indices.add(control_idx)
         
-        if len(matched_controls) == MATCHING_RATIO:
-            matched_pairs.append(treatment_df.iloc[i])
-            for control_idx in matched_controls:
-                matched_pairs.append(control_df.iloc[control_idx])
+        # Only add if we found enough matches
+        if len(current_matches) == MATCHING_RATIO:
+            matched_pairs.append(treatment_df.index[i])  # Store treated index
+            matched_pairs.extend([control_df.index[idx] for idx in current_matches])  # Store control indices
         else:
             unmatched_treated += 1
 
-    print(f"\nMatching Statistics for {gender}:")
-    print(f"Successfully matched treated units: {len(matched_pairs) // (MATCHING_RATIO + 1)}")
-    print(f"Unmatched treated units: {unmatched_treated}")
-    print(f"Total matched control units: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
-
-    matched_df = pd.DataFrame(matched_pairs)
-    ate = matched_df[matched_df[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
-          matched_df[matched_df[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
-    
-    print(f"Average Treatment Effect for {gender}: {ate:.4f}")
-
-# Main execution
-print(f"\nLoading data from {DATA_PATH}...")
-df = pd.read_csv(DATA_PATH)
-
-# Split by gender and run analysis
-male_df = df[df['gender_cd'] == 'M']
-female_df = df[df['gender_cd'] == 'F']
-
-run_analysis(male_df, "Male")
-run_analysis(female_df, "Female")
+    # Create final matched dataset
+    matched_df = df_encoded.loc[matched_pairs].copy()
