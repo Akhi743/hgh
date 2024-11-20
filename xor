@@ -1,0 +1,44 @@
+def find_matches(distances, indices, treatment_df, control_df, caliper):
+    """Enhanced matching using reverse priority order"""
+    matched_pairs = []
+    used_control_indices = set()
+    unmatched_treated = 0
+    
+    # Get indices of treated units that are hardest to match (highest PS)
+    treated_indices = np.argsort(-treatment_df['pscore'].values)
+    
+    for treated_idx in treated_indices:
+        dist = distances[treated_idx]
+        idx = indices[treated_idx]
+        matched_controls = []
+        treated_pscore = treatment_df['pscore'].iloc[treated_idx]
+        
+        # Get all valid controls first
+        valid_controls = []
+        for d, control_idx in zip(dist, idx):
+            if control_idx == -1:
+                continue
+                
+            control_pscore = control_df['pscore'].iloc[control_idx]
+            ps_diff = abs(treated_pscore - control_pscore)
+            
+            if ps_diff <= caliper and control_idx not in used_control_indices:
+                valid_controls.append((control_pscore, control_idx))
+        
+        # Sort by propensity score
+        valid_controls.sort(key=lambda x: abs(x[0] - treated_pscore))
+        
+        # Take matches ensuring even distribution
+        for _, control_idx in valid_controls[:MATCHING_RATIO]:
+            if control_idx not in used_control_indices:
+                matched_controls.append(control_idx)
+        
+        if len(matched_controls) == MATCHING_RATIO:
+            matched_pairs.append(treatment_df.iloc[treated_idx])
+            for control_idx in matched_controls:
+                matched_pairs.append(control_df.iloc[control_idx])
+                used_control_indices.add(control_idx)
+        else:
+            unmatched_treated += 1
+    
+    return matched_pairs, unmatched_treated
