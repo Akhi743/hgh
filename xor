@@ -54,22 +54,33 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
 
 
 def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Matching strategy aiming to match all treated units"""
+    """Enhanced matching strategy to ensure all treated units get matched"""
     matched_pairs = []
     used_control_indices = set()
     
-    # First pass: match treated units with their best available controls
+    # First sort controls by number of potential matches (ascending)
+    treated_availability = []
     for treated_idx in range(len(treatment_df)):
+        treated_pscore = treatment_df['pscore'].iloc[treated_idx]
+        available_matches = sum(1 for control_idx in indices[treated_idx] 
+                              if control_idx != -1 and 
+                              abs(treated_pscore - control_df['pscore'].iloc[control_idx]) <= caliper)
+        treated_availability.append((available_matches, treated_idx))
+    
+    treated_availability.sort()  # Process hardest-to-match first
+    
+    # Process each treated unit
+    for _, treated_idx in treated_availability:
         dist = distances[treated_idx]
         idx = indices[treated_idx]
         matched_controls = []
         treated_pscore = treatment_df['pscore'].iloc[treated_idx]
         
-        # Try all available controls until we get enough matches
-        for d, control_idx in zip(dist, idx):
+        available_controls = []
+        for control_idx in idx:
             if control_idx == -1:
                 continue
-                
+            
             if control_idx in used_control_indices:
                 continue
                 
@@ -77,15 +88,20 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             ps_diff = abs(treated_pscore - control_pscore)
             
             if ps_diff <= caliper:
-                matched_controls.append(control_idx)
-                used_control_indices.add(control_idx)
-                if len(matched_controls) == MATCHING_RATIO:
-                    break
+                available_controls.append((ps_diff, control_idx))
         
-        # Add successful matches to results
+        # Sort by PS difference
+        available_controls.sort()
+        
+        # Take best available matches
+        for _, control_idx in available_controls[:MATCHING_RATIO]:
+            matched_controls.append(control_idx)
+            used_control_indices.add(control_idx)
+            
+        # Always add treated unit and its matches
         if matched_controls:
             matched_pairs.append(treatment_df.iloc[treated_idx])
             for control_idx in matched_controls:
                 matched_pairs.append(control_df.iloc[control_idx])
     
-    return matched_pairs, 0  # All treated units are matched
+    return matched_pairs, 0
