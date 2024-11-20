@@ -196,3 +196,52 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+def find_matches(distances, indices, treatment_df, control_df, caliper):
+    """Find matching pairs within caliper using greedy nearest neighbor"""
+    matched_pairs = []
+    used_control_indices = set()
+    unmatched_treated = 0
+    
+    # Sort treated units by propensity score to improve matching quality
+    treated_indices = np.argsort(treatment_df['pscore'].values)
+    
+    for treated_idx in treated_indices:
+        dist = distances[treated_idx]
+        idx = indices[treated_idx]
+        matched_controls = []
+        treated_pscore = treatment_df['pscore'].iloc[treated_idx]
+        
+        # Try to find exactly MATCHING_RATIO controls within caliper
+        for d, control_idx in zip(dist, idx):
+            if control_idx == -1:
+                continue
+                
+            control_pscore = control_df['pscore'].iloc[control_idx]
+            ps_diff = abs(treated_pscore - control_pscore)
+            
+            if ps_diff <= caliper and control_idx not in used_control_indices:
+                matched_controls.append(control_idx)
+                if len(matched_controls) == MATCHING_RATIO:
+                    break
+        
+        # If we found enough matches, add them to our results
+        if len(matched_controls) == MATCHING_RATIO:
+            matched_pairs.append(treatment_df.iloc[treated_idx])
+            for control_idx in matched_controls:
+                matched_pairs.append(control_df.iloc[control_idx])
+                used_control_indices.add(control_idx)
+        else:
+            unmatched_treated += 1
+            
+    return matched_pairs, unmatched_treated
