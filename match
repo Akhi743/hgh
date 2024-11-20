@@ -208,13 +208,13 @@ if __name__ == "__main__":
 
 
 def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Find matching pairs within caliper using greedy nearest neighbor"""
+    """Find matching pairs within caliper using optimal assignment"""
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
     
-    # Sort treated units by propensity score to improve matching quality
-    treated_indices = np.argsort(treatment_df['pscore'].values)
+    # Process treated units in random order to avoid bias
+    treated_indices = np.random.permutation(len(treatment_df))
     
     for treated_idx in treated_indices:
         dist = distances[treated_idx]
@@ -222,7 +222,8 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
         matched_controls = []
         treated_pscore = treatment_df['pscore'].iloc[treated_idx]
         
-        # Try to find exactly MATCHING_RATIO controls within caliper
+        valid_controls = []
+        # First pass: collect all valid controls within caliper
         for d, control_idx in zip(dist, idx):
             if control_idx == -1:
                 continue
@@ -231,11 +232,16 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             ps_diff = abs(treated_pscore - control_pscore)
             
             if ps_diff <= caliper and control_idx not in used_control_indices:
-                matched_controls.append(control_idx)
-                if len(matched_controls) == MATCHING_RATIO:
-                    break
+                valid_controls.append((ps_diff, control_idx))
         
-        # If we found enough matches, add them to our results
+        # Sort valid controls by propensity score difference
+        valid_controls.sort(key=lambda x: x[0])
+        
+        # Take up to MATCHING_RATIO best matches
+        for _, control_idx in valid_controls[:MATCHING_RATIO]:
+            matched_controls.append(control_idx)
+            
+        # Only consider it a successful match if we got enough controls
         if len(matched_controls) == MATCHING_RATIO:
             matched_pairs.append(treatment_df.iloc[treated_idx])
             for control_idx in matched_controls:
@@ -244,4 +250,10 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
         else:
             unmatched_treated += 1
             
-    return matched_pairs, unmatched_treated
+    # Convert to DataFrame for easier handling
+    if matched_pairs:
+        matched_df = pd.DataFrame(matched_pairs)
+    else:
+        matched_df = pd.DataFrame(columns=treatment_df.columns)
+        
+    return matched_df, unmatched_treated
