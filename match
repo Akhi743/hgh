@@ -208,14 +208,12 @@ if __name__ == "__main__":
 
 
 def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Enhanced matching algorithm with dynamic caliper adjustment"""
+    """Enhanced matching algorithm with optimal assignment"""
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
     
-    # Initial pass with strict caliper
     treated_indices = np.argsort(treatment_df['pscore'].values)
-    initial_matches = 0
     
     for treated_idx in treated_indices:
         dist = distances[treated_idx]
@@ -223,7 +221,6 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
         matched_controls = []
         treated_pscore = treatment_df['pscore'].iloc[treated_idx]
         
-        # Collect all potential matches within initial caliper
         potential_matches = []
         for d, control_idx in zip(dist, idx):
             if control_idx == -1:
@@ -235,10 +232,8 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             if ps_diff <= caliper and control_idx not in used_control_indices:
                 potential_matches.append((ps_diff, control_idx))
         
-        # Sort by propensity score difference
         potential_matches.sort(key=lambda x: x[0])
         
-        # Take best matches up to MATCHING_RATIO
         for _, control_idx in potential_matches[:MATCHING_RATIO]:
             matched_controls.append(control_idx)
         
@@ -247,42 +242,7 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             for control_idx in matched_controls:
                 matched_pairs.append(control_df.iloc[control_idx])
                 used_control_indices.add(control_idx)
-            initial_matches += 1
         else:
             unmatched_treated += 1
-    
-    # Second pass with relaxed caliper for unmatched treated units
-    if unmatched_treated > 0:
-        relaxed_caliper = caliper * 1.5
-        remaining_treated = set(range(len(treatment_df))) - set(idx for pair in matched_pairs if pair[TREATMENT_VAR] == 1)
-        
-        for treated_idx in remaining_treated:
-            dist = distances[treated_idx]
-            idx = indices[treated_idx]
-            matched_controls = []
-            treated_pscore = treatment_df['pscore'].iloc[treated_idx]
-            
-            potential_matches = []
-            for d, control_idx in zip(dist, idx):
-                if control_idx == -1 or control_idx in used_control_indices:
-                    continue
-                    
-                control_pscore = control_df['pscore'].iloc[control_idx]
-                ps_diff = abs(treated_pscore - control_pscore)
-                
-                if ps_diff <= relaxed_caliper:
-                    potential_matches.append((ps_diff, control_idx))
-            
-            potential_matches.sort(key=lambda x: x[0])
-            
-            for _, control_idx in potential_matches[:MATCHING_RATIO]:
-                matched_controls.append(control_idx)
-            
-            if len(matched_controls) == MATCHING_RATIO:
-                matched_pairs.append(treatment_df.iloc[treated_idx])
-                for control_idx in matched_controls:
-                    matched_pairs.append(control_df.iloc[control_idx])
-                    used_control_indices.add(control_idx)
-                unmatched_treated -= 1
     
     return matched_pairs, unmatched_treated
