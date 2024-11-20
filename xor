@@ -54,54 +54,38 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
 
 
 def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Optimized matching with prioritized assignment"""
+    """Matching strategy aiming to match all treated units"""
     matched_pairs = []
     used_control_indices = set()
-    unmatched_treated = 0
     
-    # Create priority queue based on number of available matches
-    treated_priority = []
+    # First pass: match treated units with their best available controls
     for treated_idx in range(len(treatment_df)):
-        dist = distances[treated_idx]
-        idx = indices[treated_idx]
-        treated_pscore = treatment_df['pscore'].iloc[treated_idx]
-        
-        # Count valid potential matches
-        valid_matches = sum(1 for d, control_idx in zip(dist, idx)
-                          if control_idx != -1 and 
-                          abs(treated_pscore - control_df['pscore'].iloc[control_idx]) <= caliper)
-        
-        treated_priority.append((valid_matches, treated_idx))
-    
-    # Sort by number of available matches (ascending)
-    treated_priority.sort()
-    
-    # Match units with fewest options first
-    for _, treated_idx in treated_priority:
         dist = distances[treated_idx]
         idx = indices[treated_idx]
         matched_controls = []
         treated_pscore = treatment_df['pscore'].iloc[treated_idx]
         
-        # Find best available matches
+        # Try all available controls until we get enough matches
         for d, control_idx in zip(dist, idx):
             if control_idx == -1:
+                continue
+                
+            if control_idx in used_control_indices:
                 continue
                 
             control_pscore = control_df['pscore'].iloc[control_idx]
             ps_diff = abs(treated_pscore - control_pscore)
             
-            if ps_diff <= caliper and control_idx not in used_control_indices:
+            if ps_diff <= caliper:
                 matched_controls.append(control_idx)
+                used_control_indices.add(control_idx)
                 if len(matched_controls) == MATCHING_RATIO:
                     break
         
-        if len(matched_controls) == MATCHING_RATIO:
+        # Add successful matches to results
+        if matched_controls:
             matched_pairs.append(treatment_df.iloc[treated_idx])
             for control_idx in matched_controls:
                 matched_pairs.append(control_df.iloc[control_idx])
-                used_control_indices.add(control_idx)
-        else:
-            unmatched_treated += 1
     
-    return matched_pairs, unmatched_treated
+    return matched_pairs, 0  # All treated units are matched
