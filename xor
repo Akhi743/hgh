@@ -53,6 +53,8 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
 
 
 
+
+
 def find_matches(distances, indices, treatment_df, control_df, caliper):
     """Strategy to match maximum treated units"""
     matched_pairs = []
@@ -85,11 +87,14 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             treated_matches[treated_idx].append(control_idx)
             used_control_indices.add(control_idx)
     
-    # Create final matched pairs
+    # Create final matched pairs and count unmatched
+    unmatched_treated = 0
     for treated_idx, control_indices in treated_matches.items():
         if len(control_indices) == MATCHING_RATIO:
             matched_pairs.append(treatment_df.iloc[treated_idx])
             for control_idx in control_indices:
                 matched_pairs.append(control_df.iloc[control_idx])
+        else:
+            unmatched_treated += 1
     
-    return matched_pairs, 0
+    return matched_pairs, unmatched_treated
