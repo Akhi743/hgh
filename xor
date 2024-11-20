@@ -54,21 +54,36 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
 
 
 def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Simple but effective matching strategy"""
+    """Optimized matching with prioritized assignment"""
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
     
-    # Use original order of treated units
-    treated_indices = range(len(treatment_df))
+    # Create priority queue based on number of available matches
+    treated_priority = []
+    for treated_idx in range(len(treatment_df)):
+        dist = distances[treated_idx]
+        idx = indices[treated_idx]
+        treated_pscore = treatment_df['pscore'].iloc[treated_idx]
+        
+        # Count valid potential matches
+        valid_matches = sum(1 for d, control_idx in zip(dist, idx)
+                          if control_idx != -1 and 
+                          abs(treated_pscore - control_df['pscore'].iloc[control_idx]) <= caliper)
+        
+        treated_priority.append((valid_matches, treated_idx))
     
-    for treated_idx in treated_indices:
+    # Sort by number of available matches (ascending)
+    treated_priority.sort()
+    
+    # Match units with fewest options first
+    for _, treated_idx in treated_priority:
         dist = distances[treated_idx]
         idx = indices[treated_idx]
         matched_controls = []
         treated_pscore = treatment_df['pscore'].iloc[treated_idx]
         
-        # Get matches within caliper
+        # Find best available matches
         for d, control_idx in zip(dist, idx):
             if control_idx == -1:
                 continue
