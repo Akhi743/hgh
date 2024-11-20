@@ -1,68 +1,249 @@
-# Missing values analysis
-print(df.isnull().sum())
-
-# Check for outliers
-def check_outliers(df, columns):
-    for col in columns:
-        q1 = df[col].quantile(0.25)
-        q3 = df[col].quantile(0.75)
-        iqr = q3 - q1
-        outliers = df[(df[col] < q1 - 1.5*iqr) | (df[col] > q3 + 1.5*iqr)]
-        print(f"Outliers in {col}: {len(outliers)}")
-
-# Distribution analysis
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+import faiss
+import warnings
+import matplotlib.pyplot as plt
 import seaborn as sns
-sns.boxplot(data=df, x='treatment', y='propensity_score')
+from scipy import stats
 
+warnings.filterwarnings('ignore')
 
+# Config
+DATA_PATH = "marketing_test_case.csv"
+X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
+TREATMENT_VAR = "grp_binary"
+OUTCOME_VAR = "social_risk_score"
+MATCHING_RATIO = 2
+CALIPER_SD = 0.25
 
-# Compare covariates distribution
-def compare_groups(df, treatment_col, covariates):
-    from scipy import stats
+def check_data_quality(df):
+    """Analyze dataset quality and selection bias"""
+    diagnostics = {}
     
-    results = []
-    for cov in covariates:
-        treated = df[df[treatment_col]==1][cov]
-        control = df[df[treatment_col]==0][cov]
+    # Basic data quality
+    diagnostics['basic_stats'] = {
+        'total_records': len(df),
+        'missing_values': df[X_VARIABLES].isnull().sum().to_dict(),
+        'missing_percentages': (df[X_VARIABLES].isnull().sum() / len(df) * 100).to_dict(),
+        'treatment_distribution': df[TREATMENT_VAR].value_counts().to_dict(),
+        'treatment_ratio': len(df[df[TREATMENT_VAR]==1]) / len(df[df[TREATMENT_VAR]==0])
+    }
+    
+    # Variable distributions by group
+    distributions = {}
+    for var in X_VARIABLES:
+        if df[var].dtype in ['int64', 'float64']:
+            treat_stats = df[df[TREATMENT_VAR]==1][var].describe()
+            control_stats = df[df[TREATMENT_VAR]==0][var].describe()
+            distributions[var] = {
+                'treated': treat_stats.to_dict(),
+                'control': control_stats.to_dict()
+            }
+    diagnostics['distributions'] = distributions
+    
+    # Selection bias checks
+    bias_tests = {}
+    for var in X_VARIABLES:
+        if df[var].dtype in ['int64', 'float64']:
+            treat_vals = df[df[TREATMENT_VAR]==1][var].dropna()
+            ctrl_vals = df[df[TREATMENT_VAR]==0][var].dropna()
+            
+            t_stat, p_val = stats.ttest_ind(treat_vals, ctrl_vals)
+            pooled_std = np.sqrt((np.var(treat_vals) + np.var(ctrl_vals)) / 2)
+            cohens_d = abs(np.mean(treat_vals) - np.mean(ctrl_vals)) / pooled_std if pooled_std != 0 else np.inf
+            
+            bias_tests[var] = {
+                't_statistic': t_stat,
+                'p_value': p_val,
+                'cohens_d': cohens_d,
+                'bias_present': p_val < 0.05 and cohens_d > 0.2
+            }
+    
+    diagnostics['bias_tests'] = bias_tests
+    
+    # Correlation analysis
+    correlations = {}
+    for var in X_VARIABLES:
+        if df[var].dtype in ['int64', 'float64']:
+            corr = df[var].corr(df[TREATMENT_VAR])
+            correlations[var] = {
+                'correlation': corr,
+                'strong_correlation': abs(corr) > 0.3
+            }
+    
+    diagnostics['correlations'] = correlations
+    
+    return diagnostics
+
+def plot_data_diagnostics(df):
+    """Generate diagnostic plots for dataset"""
+    # Treatment distribution
+    plt.figure(figsize=(12, 5))
+    plt.subplot(121)
+    sns.countplot(data=df, x=TREATMENT_VAR)
+    plt.title('Treatment Distribution')
+    
+    # Missing values
+    plt.subplot(122)
+    missing = df[X_VARIABLES].isnull().sum()
+    missing.plot(kind='bar')
+    plt.title('Missing Values by Variable')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+    
+    # Variable distributions by treatment
+    n_vars = len(X_VARIABLES)
+    n_cols = 2
+    n_rows = (n_vars + 1) // 2
+    
+    plt.figure(figsize=(15, 4*n_rows))
+    for i, var in enumerate(X_VARIABLES):
+        if df[var].dtype in ['int64', 'float64']:
+            plt.subplot(n_rows, n_cols, i+1)
+            sns.kdeplot(data=df, x=var, hue=TREATMENT_VAR)
+            plt.title(f'{var} Distribution by Treatment')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Correlation heatmap
+    numeric_vars = [var for var in X_VARIABLES if df[var].dtype in ['int64', 'float64']]
+    corr_matrix = df[numeric_vars + [TREATMENT_VAR]].corr()
+    
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(corr_matrix, annot=True, cmap='RdBu', center=0)
+    plt.title('Correlation Matrix')
+    plt.tight_layout()
+    plt.show()
+
+def preprocess_data(df):
+    """Handle missing values and prepare data"""
+    df_clean = df.copy()
+    
+    # Handle missing values
+    for col in X_VARIABLES:
+        if df_clean[col].dtype in ['int64', 'float64']:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+        else:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
+    
+    return df_clean
+
+def calculate_propensity_scores(df, features):
+    """Calculate propensity scores"""
+    model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', random_state=42, max_iter=1000)
+    model.fit(df[features], df[TREATMENT_VAR])
+    return model.predict_proba(df[features])[:, 1]
+
+def perform_matching(treatment_df, control_df):
+    """Perform nearest neighbor matching using FAISS"""
+    treated_pscores = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
+    control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+    
+    index = faiss.IndexFlatL2(1)
+    index.add(control_pscores)
+    
+    k = len(control_df)
+    distances, indices = index.search(treated_pscores, k)
+    
+    return distances, indices
+
+def find_matches(distances, indices, treatment_df, control_df, caliper):
+    """Find matching pairs within caliper"""
+    matched_pairs = []
+    used_control_indices = set()
+    unmatched_treated = 0
+    
+    # Create mapping of PS differences for all valid pairs
+    matching_options = []
+    for treated_idx in range(len(treatment_df)):
+        treated_pscore = treatment_df['pscore'].iloc[treated_idx]
         
-        # T-test for continuous variables
-        t_stat, p_val = stats.ttest_ind(treated, control)
-        
-        # Standardized difference
-        std_diff = (treated.mean() - control.mean()) / \
-                  np.sqrt((treated.var() + control.var()) / 2)
-                  
-        results.append({
-            'covariate': cov,
-            'p_value': p_val,
-            'std_diff': std_diff
-        })
+        for control_idx in indices[treated_idx]:
+            if control_idx == -1:
+                continue
+                
+            control_pscore = control_df['pscore'].iloc[control_idx]
+            ps_diff = abs(treated_pscore - control_pscore)
+            
+            if ps_diff <= caliper:
+                matching_options.append((ps_diff, treated_idx, control_idx))
     
-    return pd.DataFrame(results)
-
-# Check propensity score overlap
-def check_overlap(df, treatment_col, pscore_col):
-    sns.kdeplot(data=df, x=pscore_col, hue=treatment_col)
-
-
-
-
-
-
-
-    def assess_common_support(df, treatment_col, pscore_col, bins=10):
-    # Histogram of propensity scores by group
-    plt.figure(figsize=(10,6))
-    plt.hist([df[df[treatment_col]==1][pscore_col], 
-              df[df[treatment_col]==0][pscore_col]], 
-             bins=bins, label=['Treated', 'Control'])
-    plt.legend()
-    plt.xlabel('Propensity Score')
-    plt.ylabel('Frequency')
+    # Sort by PS difference
+    matching_options.sort()
     
-    # Calculate overlap statistics
-    treated = df[df[treatment_col]==1][pscore_col]
-    control = df[df[treatment_col]==0][pscore_col]
+    # Track matches per treated unit
+    treated_matches = {i: [] for i in range(len(treatment_df))}
     
-    print(f"Treated range: [{treated.min():.3f}, {treated.max():.3f}]")
-    print(f"Control range: [{control.min():.3f}, {control.max():.3f}]")
+    # Assign matches
+    for ps_diff, treated_idx, control_idx in matching_options:
+        if len(treated_matches[treated_idx]) < MATCHING_RATIO and control_idx not in used_control_indices:
+            treated_matches[treated_idx].append(control_idx)
+            used_control_indices.add(control_idx)
+    
+    # Create final matched pairs
+    for treated_idx, control_indices in treated_matches.items():
+        if len(control_indices) == MATCHING_RATIO:
+            matched_pairs.append(treatment_df.iloc[treated_idx])
+            for control_idx in control_indices:
+                matched_pairs.append(control_df.iloc[control_idx])
+        else:
+            unmatched_treated += 1
+    
+    return matched_pairs, unmatched_treated
+
+def main():
+    # Load data
+    print("Loading data...")
+    df = pd.read_csv(DATA_PATH)
+    
+    # Check data quality
+    print("\nChecking data quality...")
+    quality_diagnostics = check_data_quality(df)
+    print("\nData Quality Diagnostics:")
+    for key, value in quality_diagnostics['basic_stats'].items():
+        print(f"{key}: {value}")
+    
+    print("\nBias Tests Results:")
+    for var, stats in quality_diagnostics['bias_tests'].items():
+        print(f"{var}: {'Bias present' if stats['bias_present'] else 'No significant bias'}")
+    
+    # Plot diagnostics
+    plot_data_diagnostics(df)
+    
+    # Preprocess data
+    df_clean = preprocess_data(df)
+    
+    # Calculate propensity scores
+    print("\nCalculating propensity scores...")
+    ps = calculate_propensity_scores(df_clean, X_VARIABLES)
+    df_clean['pscore'] = ps
+    
+    # Split into treatment and control
+    treatment_df = df_clean[df_clean[TREATMENT_VAR] == 1].copy()
+    control_df = df_clean[df_clean[TREATMENT_VAR] == 0].copy()
+    
+    # Calculate caliper
+    caliper = np.std(df_clean['pscore']) * CALIPER_SD
+    
+    # Perform matching
+    print("\nPerforming matching...")
+    distances, indices = perform_matching(treatment_df, control_df)
+    matched_pairs, unmatched_treated = find_matches(distances, indices, treatment_df, control_df, caliper)
+    
+    # Create matched dataset
+    matched_df = pd.DataFrame(matched_pairs)
+    
+    # Print results
+    print(f"\nMatching Results:")
+    print(f"Total treated units: {len(treatment_df)}")
+    print(f"Matched treated units: {len(matched_df[matched_df[TREATMENT_VAR] == 1])}")
+    print(f"Unmatched treated units: {unmatched_treated}")
+    print(f"Match rate: {(len(matched_df[matched_df[TREATMENT_VAR] == 1]) / len(treatment_df)) * 100:.2f}%")
+    
+    return matched_df, quality_diagnostics
+
+if __name__ == "__main__":
+    matched_df, diagnostics = main()
