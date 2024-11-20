@@ -1,0 +1,68 @@
+# Missing values analysis
+print(df.isnull().sum())
+
+# Check for outliers
+def check_outliers(df, columns):
+    for col in columns:
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        outliers = df[(df[col] < q1 - 1.5*iqr) | (df[col] > q3 + 1.5*iqr)]
+        print(f"Outliers in {col}: {len(outliers)}")
+
+# Distribution analysis
+import seaborn as sns
+sns.boxplot(data=df, x='treatment', y='propensity_score')
+
+
+
+# Compare covariates distribution
+def compare_groups(df, treatment_col, covariates):
+    from scipy import stats
+    
+    results = []
+    for cov in covariates:
+        treated = df[df[treatment_col]==1][cov]
+        control = df[df[treatment_col]==0][cov]
+        
+        # T-test for continuous variables
+        t_stat, p_val = stats.ttest_ind(treated, control)
+        
+        # Standardized difference
+        std_diff = (treated.mean() - control.mean()) / \
+                  np.sqrt((treated.var() + control.var()) / 2)
+                  
+        results.append({
+            'covariate': cov,
+            'p_value': p_val,
+            'std_diff': std_diff
+        })
+    
+    return pd.DataFrame(results)
+
+# Check propensity score overlap
+def check_overlap(df, treatment_col, pscore_col):
+    sns.kdeplot(data=df, x=pscore_col, hue=treatment_col)
+
+
+
+
+
+
+
+    def assess_common_support(df, treatment_col, pscore_col, bins=10):
+    # Histogram of propensity scores by group
+    plt.figure(figsize=(10,6))
+    plt.hist([df[df[treatment_col]==1][pscore_col], 
+              df[df[treatment_col]==0][pscore_col]], 
+             bins=bins, label=['Treated', 'Control'])
+    plt.legend()
+    plt.xlabel('Propensity Score')
+    plt.ylabel('Frequency')
+    
+    # Calculate overlap statistics
+    treated = df[df[treatment_col]==1][pscore_col]
+    control = df[df[treatment_col]==0][pscore_col]
+    
+    print(f"Treated range: [{treated.min():.3f}, {treated.max():.3f}]")
+    print(f"Control range: [{control.min():.3f}, {control.max():.3f}]")
