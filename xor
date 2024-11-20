@@ -42,3 +42,69 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             unmatched_treated += 1
     
     return matched_pairs, unmatched_treated
+
+
+
+
+
+
+
+
+
+
+
+def find_matches(distances, indices, treatment_df, control_df, caliper):
+    """Region-based matching strategy"""
+    matched_pairs = []
+    used_control_indices = set()
+    unmatched_treated = 0
+    
+    # Create PS regions
+    ps_min = min(treatment_df['pscore'].min(), control_df['pscore'].min())
+    ps_max = max(treatment_df['pscore'].max(), control_df['pscore'].max())
+    n_regions = 10
+    region_size = (ps_max - ps_min) / n_regions
+    
+    # Group treated units by region
+    treated_by_region = {i: [] for i in range(n_regions)}
+    for idx in range(len(treatment_df)):
+        ps = treatment_df['pscore'].iloc[idx]
+        region = min(int((ps - ps_min) / region_size), n_regions - 1)
+        treated_by_region[region].append(idx)
+    
+    # Process each region
+    for region in range(n_regions):
+        treated_indices = treated_by_region[region]
+        np.random.shuffle(treated_indices)  # Randomize within region
+        
+        for treated_idx in treated_indices:
+            dist = distances[treated_idx]
+            idx = indices[treated_idx]
+            matched_controls = []
+            treated_pscore = treatment_df['pscore'].iloc[treated_idx]
+            
+            potential_matches = []
+            for d, control_idx in zip(dist, idx):
+                if control_idx == -1:
+                    continue
+                    
+                control_pscore = control_df['pscore'].iloc[control_idx]
+                ps_diff = abs(treated_pscore - control_pscore)
+                
+                if ps_diff <= caliper and control_idx not in used_control_indices:
+                    potential_matches.append((ps_diff, control_idx))
+            
+            potential_matches.sort(key=lambda x: x[0])
+            
+            for _, control_idx in potential_matches[:MATCHING_RATIO]:
+                matched_controls.append(control_idx)
+            
+            if len(matched_controls) == MATCHING_RATIO:
+                matched_pairs.append(treatment_df.iloc[treated_idx])
+                for control_idx in matched_controls:
+                    matched_pairs.append(control_df.iloc[control_idx])
+                    used_control_indices.add(control_idx)
+            else:
+                unmatched_treated += 1
+    
+    return matched_pairs, unmatched_treated
