@@ -5,7 +5,20 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
     unmatched_treated = 0
 
     for i, matches in enumerate(indices):
-        valid_matches = [m for m in matches if m != -1 and m not in used_control_indices]
+        treated_pscore = treatment_df['pscore'].iloc[i]
+        valid_matches = []
+        
+        for control_idx in matches:
+            if control_idx == -1:
+                continue
+                
+            control_pscore = control_df['pscore'].iloc[control_idx]
+            ps_diff = abs(treated_pscore - control_pscore)
+            
+            if ps_diff <= caliper and control_idx not in used_control_indices:
+                valid_matches.append(control_idx)
+                if len(valid_matches) == MATCHING_RATIO:
+                    break
         
         if len(valid_matches) == MATCHING_RATIO:
             matched_pairs.append(treatment_df.iloc[i])
