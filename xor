@@ -109,40 +109,38 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
 
 
 
-def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Find matching pairs within caliper, prioritizing matching all treated units"""
-    matched_pairs = []
-    used_control_indices = set()
-    unmatched_treated = 0
-    total_treated = len(treatment_df)
+def find_matches(distances, indices, treatment_df, control_df, caliper, max_attempts=3):
+  matched_pairs = []
+  used_control_indices = set()
+  unmatched_treated = 0
 
-    for i, treated_idx in enumerate(treatment_df.index):
-        dist = distances[i]
-        idx = indices[i]
-        matched_controls = []
-        treated_pscore = treatment_df.loc[treated_idx, 'pscore']
-        
-        for d, control_idx in zip(dist, idx):
-            if control_idx in control_df.index and control_idx not in used_control_indices:
-                control_pscore = control_df.loc[control_idx, 'pscore']
-                ps_diff = abs(treated_pscore - control_pscore)
-                if ps_diff <= caliper:
-                    matched_controls.append(control_idx)
-                    if len(matched_controls) == MATCHING_RATIO:
-                        break
+  treated_indices = np.sort(treatment_df['pscore'].values)
 
-        # If we found at least one match, add it to matched_pairs
-        if matched_controls:
-            matched_pairs.append(treatment_df.loc[treated_idx])
-            for control_idx in matched_controls:
-                matched_pairs.append(control_df.loc[control_idx])
-                used_control_indices.add(control_idx)
-        else:
-            unmatched_treated += 1
+  for attempt in range(max_attempts):
+    for treated_idx in treated_indices:
+      dist = distances[treated_idx]
+      idx = indices[treated_idx]
+      matched_controls = []
+      treated_pscore = treatment_df['pscore'].iloc[treated_idx]
 
-        # Print progress
-        if (i + 1) % 1000 == 0:
-            print(f"Processed {i+1}/{total_treated} treated units. Matched: {len(matched_pairs)//(MATCHING_RATIO+1)}, Unmatched: {unmatched_treated}")
+      for d, control_idx in zip(dist, idx):
+        if control_idx == -1:
+          continue
 
-    print(f"Final results - Matched: {len(matched_pairs)//(MATCHING_RATIO+1)}, Unmatched: {unmatched_treated}")
-    return matched_pairs, unmatched_treated
+        control_pscore = control_df['pscore'].iloc[control_idx]
+        ps_diff = abs(treated_pscore - control_pscore)
+
+        if ps_diff <= caliper and control_idx not in used_control_indices:
+          matched_controls.append(control_idx)
+          if len(matched_controls) == 1:  # Stop at first match in this attempt
+            break
+
+      if matched_controls:
+        matched_pairs.append(treatment_df.iloc[treated_idx])
+        for control_idx in matched_controls:
+          matched_pairs.append(control_df.iloc[control_idx])
+          used_control_indices.add(control_idx)
+      else:
+        unmatched_treated += 1
+
+  return matched_pairs, unmatched_treated
