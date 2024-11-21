@@ -3,8 +3,13 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
-
-    for i, matches in enumerate(indices):
+    
+    # Sort treatment units by propensity score
+    treatment_idx_by_ps = treatment_df['pscore'].sort_values().index
+    
+    for treated_idx in treatment_idx_by_ps:
+        i = treatment_df.index.get_loc(treated_idx)
+        matches = indices[i]
         treated_pscore = treatment_df['pscore'].iloc[i]
         valid_matches = []
         
