@@ -110,13 +110,16 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
 
 
 def find_matches(distances, indices, treatment_df, control_df, caliper, max_attempts=3):
-    """Find matching pairs within caliper with iterative matching"""
+    """Find matching pairs within caliper with iterative matching and unique matching"""
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
 
     for attempt in range(max_attempts):
         for treated_idx in range(len(treatment_df)):
+            if treated_idx in [pair[0] for pair in matched_pairs]:
+                continue  # Skip already matched treated units
+
             dist = distances[treated_idx]
             idx = indices[treated_idx]
             matched_controls = []
@@ -135,10 +138,8 @@ def find_matches(distances, indices, treatment_df, control_df, caliper, max_atte
                         break
 
             if matched_controls:
-                matched_pairs.append(treatment_df.iloc[treated_idx])
-                for control_idx in matched_controls:
-                    matched_pairs.append(control_df.iloc[control_idx])
-                    used_control_indices.add(control_idx)
+                matched_pairs.append((treated_idx, matched_controls[0]))
+                used_control_indices.add(matched_controls[0])
             else:
                 unmatched_treated += 1
 
