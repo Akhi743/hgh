@@ -119,17 +119,19 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
     treated_indices = treatment_df.index[treatment_df['pscore'].argsort()]
 
     for treated_idx in treated_indices:
-        dist = distances[treated_idx]
-        idx = indices[treated_idx]
+        dist = distances[treatment_df.index.get_loc(treated_idx)]
+        idx = indices[treatment_df.index.get_loc(treated_idx)]
         matched_controls = []
         treated_pscore = treatment_df.loc[treated_idx, 'pscore']
         
         # Sort potential matches by propensity score difference
-        potential_matches = sorted(
-            [(control_idx, abs(treated_pscore - control_df.loc[control_idx, 'pscore']))
-             for control_idx in idx if control_idx != -1],
-            key=lambda x: x[1]
-        )
+        potential_matches = []
+        for i, control_idx in enumerate(idx):
+            if control_idx != -1 and control_idx in control_df.index:
+                ps_diff = abs(treated_pscore - control_df.loc[control_idx, 'pscore'])
+                potential_matches.append((control_idx, ps_diff))
+        
+        potential_matches.sort(key=lambda x: x[1])
         
         for control_idx, ps_diff in potential_matches:
             if ps_diff <= caliper and control_idx not in used_control_indices:
