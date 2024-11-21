@@ -118,23 +118,25 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
     # Sort treated units by their propensity score
     treated_indices = treatment_df.index[treatment_df['pscore'].argsort()]
 
-    for treated_idx in treated_indices:
-        dist = distances[treatment_df.index.get_loc(treated_idx)]
-        idx = indices[treatment_df.index.get_loc(treated_idx)]
+    for i, treated_idx in enumerate(treated_indices):
+        dist = distances[i]
+        idx = indices[i]
         matched_controls = []
         treated_pscore = treatment_df.loc[treated_idx, 'pscore']
         
         # Sort potential matches by propensity score difference
         potential_matches = []
-        for i, control_idx in enumerate(idx):
-            if control_idx != -1 and control_idx in control_df.index:
-                ps_diff = abs(treated_pscore - control_df.loc[control_idx, 'pscore'])
-                potential_matches.append((control_idx, ps_diff))
+        for d, control_idx in zip(dist, idx):
+            if control_idx in control_df.index:
+                control_pscore = control_df.loc[control_idx, 'pscore']
+                ps_diff = abs(treated_pscore - control_pscore)
+                if ps_diff <= caliper:
+                    potential_matches.append((control_idx, ps_diff))
         
         potential_matches.sort(key=lambda x: x[1])
         
-        for control_idx, ps_diff in potential_matches:
-            if ps_diff <= caliper and control_idx not in used_control_indices:
+        for control_idx, _ in potential_matches:
+            if control_idx not in used_control_indices:
                 matched_controls.append(control_idx)
                 if len(matched_controls) == MATCHING_RATIO:
                     break
