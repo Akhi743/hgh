@@ -114,33 +114,23 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
+    total_treated = len(treatment_df)
 
-    # Sort treated units by their propensity score
-    treated_indices = treatment_df.index[treatment_df['pscore'].argsort()]
-
-    for i, treated_idx in enumerate(treated_indices):
+    for i, treated_idx in enumerate(treatment_df.index):
         dist = distances[i]
         idx = indices[i]
         matched_controls = []
         treated_pscore = treatment_df.loc[treated_idx, 'pscore']
         
-        # Sort potential matches by propensity score difference
-        potential_matches = []
         for d, control_idx in zip(dist, idx):
-            if control_idx in control_df.index:
+            if control_idx in control_df.index and control_idx not in used_control_indices:
                 control_pscore = control_df.loc[control_idx, 'pscore']
                 ps_diff = abs(treated_pscore - control_pscore)
                 if ps_diff <= caliper:
-                    potential_matches.append((control_idx, ps_diff))
-        
-        potential_matches.sort(key=lambda x: x[1])
-        
-        for control_idx, _ in potential_matches:
-            if control_idx not in used_control_indices:
-                matched_controls.append(control_idx)
-                if len(matched_controls) == MATCHING_RATIO:
-                    break
-        
+                    matched_controls.append(control_idx)
+                    if len(matched_controls) == MATCHING_RATIO:
+                        break
+
         # If we found at least one match, add it to matched_pairs
         if matched_controls:
             matched_pairs.append(treatment_df.loc[treated_idx])
@@ -150,4 +140,9 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
         else:
             unmatched_treated += 1
 
+        # Print progress
+        if (i + 1) % 1000 == 0:
+            print(f"Processed {i+1}/{total_treated} treated units. Matched: {len(matched_pairs)//(MATCHING_RATIO+1)}, Unmatched: {unmatched_treated}")
+
+    print(f"Final results - Matched: {len(matched_pairs)//(MATCHING_RATIO+1)}, Unmatched: {unmatched_treated}")
     return matched_pairs, unmatched_treated
