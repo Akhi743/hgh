@@ -98,3 +98,52 @@ def find_matches(distances, indices, treatment_df, control_df, caliper):
             unmatched_treated += 1
     
     return matched_pairs, unmatched_treated
+
+
+
+
+
+
+
+
+
+
+
+def find_matches(distances, indices, treatment_df, control_df, caliper):
+    """Find matching pairs within caliper, prioritizing matching all treated units"""
+    matched_pairs = []
+    used_control_indices = set()
+    unmatched_treated = 0
+
+    # Sort treated units by their propensity score
+    treated_indices = treatment_df.index[treatment_df['pscore'].argsort()]
+
+    for treated_idx in treated_indices:
+        dist = distances[treated_idx]
+        idx = indices[treated_idx]
+        matched_controls = []
+        treated_pscore = treatment_df.loc[treated_idx, 'pscore']
+        
+        # Sort potential matches by propensity score difference
+        potential_matches = sorted(
+            [(control_idx, abs(treated_pscore - control_df.loc[control_idx, 'pscore']))
+             for control_idx in idx if control_idx != -1],
+            key=lambda x: x[1]
+        )
+        
+        for control_idx, ps_diff in potential_matches:
+            if ps_diff <= caliper and control_idx not in used_control_indices:
+                matched_controls.append(control_idx)
+                if len(matched_controls) == MATCHING_RATIO:
+                    break
+        
+        # If we found at least one match, add it to matched_pairs
+        if matched_controls:
+            matched_pairs.append(treatment_df.loc[treated_idx])
+            for control_idx in matched_controls:
+                matched_pairs.append(control_df.loc[control_idx])
+                used_control_indices.add(control_idx)
+        else:
+            unmatched_treated += 1
+
+    return matched_pairs, unmatched_treated
