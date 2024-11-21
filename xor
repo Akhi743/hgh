@@ -1,146 +1,129 @@
-def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Enhanced matching using reverse priority order"""
-    matched_pairs = []
-    used_control_indices = set()
-    unmatched_treated = 0
-    
-    # Get indices of treated units that are hardest to match (highest PS)
-    treated_indices = np.argsort(-treatment_df['pscore'].values)
-    
-    for treated_idx in treated_indices:
-        dist = distances[treated_idx]
-        idx = indices[treated_idx]
-        matched_controls = []
-        treated_pscore = treatment_df['pscore'].iloc[treated_idx]
-        
-        # Get all valid controls first
-        valid_controls = []
-        for d, control_idx in zip(dist, idx):
-            if control_idx == -1:
-                continue
-                
-            control_pscore = control_df['pscore'].iloc[control_idx]
-            ps_diff = abs(treated_pscore - control_pscore)
-            
-            if ps_diff <= caliper and control_idx not in used_control_indices:
-                valid_controls.append((control_pscore, control_idx))
-        
-        # Sort by propensity score
-        valid_controls.sort(key=lambda x: abs(x[0] - treated_pscore))
-        
-        # Take matches ensuring even distribution
-        for _, control_idx in valid_controls[:MATCHING_RATIO]:
-            if control_idx not in used_control_indices:
-                matched_controls.append(control_idx)
-        
-        if len(matched_controls) == MATCHING_RATIO:
-            matched_pairs.append(treatment_df.iloc[treated_idx])
-            for control_idx in matched_controls:
-                matched_pairs.append(control_df.iloc[control_idx])
-                used_control_indices.add(control_idx)
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+import faiss
+import warnings
+warnings.filterwarnings('ignore')
+
+# Config
+DATA_PATH = "marketing_test_case.csv"
+X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
+TREATMENT_VAR = "grp_binary"
+OUTCOME_VAR = "social_risk_score"
+N_MATCHES = 2  # Number of matches per treated unit
+CALIPER = 0.2  # In standard deviations
+
+def preprocess_data(df_subset):
+    """Handle missing values"""
+    df_clean = df_subset.copy()
+    for col in X_VARIABLES:
+        if df_clean[col].dtype in ['int64', 'float64']:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].median())
         else:
-            unmatched_treated += 1
+            df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
+    return df_clean
+
+def create_dummy_variables(df_clean):
+    """Create dummy variables for categorical features"""
+    df_encoded = df_clean.copy()
+    categorical_cols = []
     
-    return matched_pairs, unmatched_treated
+    for col in X_VARIABLES:
+        if df_encoded[col].dtype == 'object' or (df_encoded[col].nunique() < 10 and df_encoded[col].dtype in ['int64', 'float64']):
+            categorical_cols.append(col)
+            df_encoded = pd.get_dummies(df_encoded, columns=[col], prefix=col)
+    
+    return df_encoded, categorical_cols
 
+def calculate_propensity_scores(df_encoded, features):
+    """Calculate propensity scores using logistic regression"""
+    model = LogisticRegression(random_state=42)
+    model.fit(df_encoded[features], df_encoded[TREATMENT_VAR])
+    return model.predict_proba(df_encoded[features])[:, 1]
 
+def find_matches(treated_ps, control_ps, caliper_width):
+    """Find matches using FAISS"""
+    # Convert to required format
+    treated_ps = treated_ps.reshape(-1, 1).astype('float32')
+    control_ps = control_ps.reshape(-1, 1).astype('float32')
+    
+    # Build index
+    index = faiss.IndexFlatL2(1)
+    index.add(control_ps)
+    
+    # Search for nearest neighbors
+    distances, indices = index.search(treated_ps, N_MATCHES)
+    
+    # Apply caliper
+    valid_matches = distances <= caliper_width**2
+    indices[~valid_matches] = -1
+    
+    return indices
 
-
-
-
-
-
-
-
-
-
-
-def find_matches(distances, indices, treatment_df, control_df, caliper):
-    """Strategy to match maximum treated units"""
+def match_and_calculate_effect(df_encoded, ps_scores):
+    """Perform matching and calculate treatment effect"""
+    # Split into treated and control
+    treated = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
+    control = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
+    
+    treated_ps = ps_scores[df_encoded[TREATMENT_VAR] == 1]
+    control_ps = ps_scores[df_encoded[TREATMENT_VAR] == 0]
+    
+    # Calculate caliper width
+    caliper_width = CALIPER * np.std(ps_scores)
+    
+    # Find matches
+    match_indices = find_matches(treated_ps.values, control_ps.values, caliper_width)
+    
+    # Create matched dataset
     matched_pairs = []
-    used_control_indices = set()
+    used_control = set()
     
-    # Create mapping of PS differences for all valid pairs
-    matching_options = []
-    for treated_idx in range(len(treatment_df)):
-        treated_pscore = treatment_df['pscore'].iloc[treated_idx]
-        
-        for control_idx in indices[treated_idx]:
-            if control_idx == -1:
-                continue
-                
-            control_pscore = control_df['pscore'].iloc[control_idx]
-            ps_diff = abs(treated_pscore - control_pscore)
-            
-            if ps_diff <= caliper:
-                matching_options.append((ps_diff, treated_idx, control_idx))
+    for i, matches in enumerate(match_indices):
+        valid_matches = [m for m in matches if m != -1 and m not in used_control]
+        if len(valid_matches) == N_MATCHES:
+            matched_pairs.append(treated.iloc[i])
+            for match in valid_matches:
+                matched_pairs.append(control.iloc[match])
+                used_control.add(match)
     
-    # Sort all possible matches by PS difference
-    matching_options.sort()
+    matched_df = pd.DataFrame(matched_pairs)
     
-    # Track how many controls each treated unit has
-    treated_matches = {i: [] for i in range(len(treatment_df))}
+    # Calculate effect
+    ate = matched_df[matched_df[TREATMENT_VAR] == 1][OUTCOME_VAR].mean() - \
+          matched_df[matched_df[TREATMENT_VAR] == 0][OUTCOME_VAR].mean()
     
-    # Assign matches greedily but ensuring even distribution
-    for ps_diff, treated_idx, control_idx in matching_options:
-        if len(treated_matches[treated_idx]) < MATCHING_RATIO and control_idx not in used_control_indices:
-            treated_matches[treated_idx].append(control_idx)
-            used_control_indices.add(control_idx)
+    return matched_df, ate, len(matched_pairs) // (N_MATCHES + 1)
+
+def run_analysis(df_subset, gender):
+    """Main analysis function"""
+    print(f"\nAnalyzing {gender} subset...")
     
-    # Create final matched pairs and count unmatched
-    unmatched_treated = 0
-    for treated_idx, control_indices in treated_matches.items():
-        if len(control_indices) == MATCHING_RATIO:
-            matched_pairs.append(treatment_df.iloc[treated_idx])
-            for control_idx in control_indices:
-                matched_pairs.append(control_df.iloc[control_idx])
-        else:
-            unmatched_treated += 1
+    # Preprocessing
+    df_clean = preprocess_data(df_subset)
+    df_encoded, categorical_cols = create_dummy_variables(df_clean)
     
-    return matched_pairs, unmatched_treated
+    # Get features for propensity score model
+    features = [col for col in df_encoded.columns 
+               if col not in [TREATMENT_VAR, OUTCOME_VAR, 'gender_cd', 'gender_cd_bin']]
+    
+    # Calculate propensity scores
+    ps_scores = calculate_propensity_scores(df_encoded, features)
+    
+    # Perform matching and calculate effect
+    matched_df, ate, n_matches = match_and_calculate_effect(df_encoded, ps_scores)
+    
+    print(f"\nResults for {gender}:")
+    print(f"Number of matched pairs: {n_matches}")
+    print(f"Average Treatment Effect: {ate:.4f}")
+    
+    return matched_df, ate
 
+# Main execution
+df = pd.read_csv(DATA_PATH)
 
+male_df = df[df['gender_cd'] == 'M']
+female_df = df[df['gender_cd'] == 'F']
 
-
-
-
-
-
-
-
-
-def find_matches(distances, indices, treatment_df, control_df, caliper, max_attempts=3):
-    """Find matching pairs within caliper with iterative matching and unique matching"""
-    matched_pairs = []
-    used_control_indices = set()
-    unmatched_treated = 0
-
-    for attempt in range(max_attempts):
-        for treated_idx in range(len(treatment_df)):
-            if treated_idx in [pair[0] for pair in matched_pairs]:
-                continue  # Skip already matched treated units
-
-            dist = distances[treated_idx]
-            idx = indices[treated_idx]
-            matched_controls = []
-            treated_pscore = treatment_df['pscore'].iloc[treated_idx]
-
-            for d, control_idx in zip(dist, idx):
-                if control_idx == -1:
-                    continue
-
-                control_pscore = control_df['pscore'].iloc[control_idx]
-                ps_diff = abs(treated_pscore - control_pscore)
-
-                if ps_diff <= caliper and control_idx not in used_control_indices:
-                    matched_controls.append(control_idx)
-                    if len(matched_controls) == 1:  # Stop at first match in this attempt
-                        break
-
-            if matched_controls:
-                matched_pairs.append((treated_idx, matched_controls[0]))
-                used_control_indices.add(matched_controls[0])
-            else:
-                unmatched_treated += 1
-
-    return matched_pairs, unmatched_treated
+male_results = run_analysis(male_df, "Male")
+female_results = run_analysis(female_df, "Female")
