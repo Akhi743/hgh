@@ -7,7 +7,7 @@ warnings.filterwarnings('ignore')
 
 # Config
 DATA_PATH = "marketing_test_case.csv"
-X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
+X_VARIABLES = ["age", "gender_cd", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
 TREATMENT_VAR = "grp_binary"
 OUTCOME_VAR = "social_risk_score"
 MATCHING_RATIO = 2
