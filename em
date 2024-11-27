@@ -3,16 +3,24 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 import faiss
 import warnings
+import time
 warnings.filterwarnings('ignore')
 
+def log_time(start_time, message):
+    print(f"{message}: {time.time() - start_time:.2f} seconds")
+
 def create_subset(df, exact_match):
+    start = time.time()
     if not exact_match:
         df['exact_match_key'] = '1'
     else:
         df['exact_match_key'] = df[exact_match].astype(str).agg('_'.join, axis=1)
-    return [group for _, group in df.groupby('exact_match_key')], df['exact_match_key']
+    result = [group for _, group in df.groupby('exact_match_key')]
+    log_time(start, "Subset creation")
+    return result, df['exact_match_key']
 
 def preprocess_and_score(df, x_variables, treatment_var, outcome_var):
+    start = time.time()
     df_clean = df.copy()
     
     # Handle missing values
@@ -21,8 +29,10 @@ def preprocess_and_score(df, x_variables, treatment_var, outcome_var):
             df_clean[col] = df_clean[col].fillna(df_clean[col].median())
         else:
             df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
+    log_time(start, "Missing value handling")
     
     # Create dummy variables
+    dummy_start = time.time()
     df_encoded = df_clean.copy()
     categorical_cols = []
     
@@ -37,26 +47,34 @@ def preprocess_and_score(df, x_variables, treatment_var, outcome_var):
                 for val in unique_vals:
                     df_encoded[f"{col}_{val}"] = (df_encoded[col] == val).astype(int)
                 df_encoded = df_encoded.drop(columns=[col])
+    log_time(dummy_start, "Dummy variable creation")
     
     # Prepare features
+    feature_start = time.time()
     features = [col for col in x_variables if col not in categorical_cols]
     for col in categorical_cols:
         features.extend([c for c in df_encoded.columns if c.startswith(col + '_')])
     
     df_encoded = df_encoded.dropna(subset=features + [treatment_var, outcome_var])
+    log_time(feature_start, "Feature preparation")
     
     # Calculate propensity scores
+    score_start = time.time()
     model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', random_state=42, max_iter=1000)
     model.fit(df_encoded[features], df_encoded[treatment_var])
     df_encoded['pscore'] = model.predict_proba(df_encoded[features])[:, 1]
+    log_time(score_start, "Propensity score calculation")
     
+    log_time(start, "Total preprocessing and scoring")
     return df_encoded
 
 def perform_matching(df_encoded, treatment_var, n_neighbors, matching_ratio, caliper_sd):
+    start = time.time()
     treatment_df = df_encoded[df_encoded[treatment_var] == 1]
     control_df = df_encoded[df_encoded[treatment_var] == 0]
     
     # Single KNN for all data
+    knn_start = time.time()
     treated_pscores = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
     control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
     
@@ -67,8 +85,10 @@ def perform_matching(df_encoded, treatment_var, n_neighbors, matching_ratio, cal
     index.hnsw.efSearch = 40
     k = min(n_neighbors, len(control_df))
     distances, indices = index.search(treated_pscores, k)
+    log_time(knn_start, "KNN matching")
     
     # Find matches by subset
+    match_start = time.time()
     matched_pairs = []
     matching_maps = {}
     
@@ -114,9 +134,12 @@ def perform_matching(df_encoded, treatment_var, n_neighbors, matching_ratio, cal
                 
                 matching_maps[treatment_df.index[treat_idx]] = ctrl_indices
     
+    log_time(match_start, "Match finding")
+    log_time(start, "Total matching process")
     return pd.DataFrame(matched_pairs), matching_maps
 
 def psm_function(df, exact_match=[]):
+    total_start = time.time()
     x_variables = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
     treatment_var = "grp_binary"
     outcome_var = "social_risk_score"
@@ -134,8 +157,12 @@ def psm_function(df, exact_match=[]):
     matched_results, matching_maps = perform_matching(
         df_encoded, treatment_var, n_neighbors, matching_ratio, caliper_sd)
     
+    log_time(total_start, "Total PSM process")
     return matched_results, matching_maps
 
 if __name__ == "__main__":
+    data_start = time.time()
     df = pd.read_csv("marketing_test_case.csv")
+    log_time(data_start, "Data loading")
+    
     matched_results, matching_maps = psm_function(df, exact_match=['gender_cd'])
