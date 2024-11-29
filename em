@@ -14,7 +14,6 @@ def create_subset(df, exact_match):
     return result
 
 def prepare_data_for_matching(df_subset):
-    t0 = time.time()
     df_clean = df_subset.copy()
     for col in X_VARIABLES:
         if df_clean[col].dtype in ['int64', 'float64']:
@@ -52,28 +51,34 @@ def prepare_data_for_matching(df_subset):
     ps = model.predict_proba(df_encoded[features_for_model])[:, 1]
     df_encoded['pscore'] = ps
     
-    print(f"Data preparation time: {time.time() - t0:.2f} seconds")
     return df_encoded, features_for_model
 
-def perform_matching(treatment_df, control_df):
-    t0 = time.time()
-    treated_pscores = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
-    control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+def perform_matching(treatment_groups, control_groups):
+    all_treated_pscores = np.vstack([treatment_groups[subset_id]['pscore'].values.reshape(-1, 1) for subset_id in treatment_groups]).astype('float32')
+    all_control_pscores = np.vstack([control_groups[subset_id]['pscore'].values.reshape(-1, 1) for subset_id in control_groups]).astype('float32')
     
     dimension = 1
     index = faiss.IndexHNSWFlat(dimension, 32)
     index.hnsw.efConstruction = 80
-    index.add(control_pscores)
+    index.add(all_control_pscores)
     
     index.hnsw.efSearch = 40
-    k = min(N_NEIGHBORS, len(control_df))
-    distances, indices = index.search(treated_pscores, k)
+    k = min(N_NEIGHBORS, len(all_control_pscores))
+    distances, indices = index.search(all_treated_pscores, k)
     
-    print(f"KNN matching time: {time.time() - t0:.2f} seconds")
-    return distances, indices
+    start_idx = 0
+    all_matches = {}
+    for subset_id in treatment_groups:
+        n_treated = len(treatment_groups[subset_id])
+        all_matches[subset_id] = (
+            distances[start_idx:start_idx + n_treated],
+            indices[start_idx:start_idx + n_treated]
+        )
+        start_idx += n_treated
+    
+    return all_matches
 
 def find_matches(distances, indices, treatment_df, control_df, caliper, with_replacement=False):
-    t0 = time.time()
     matched_pairs = []
     used_control_indices = set()
     unmatched_treated = 0
@@ -119,12 +124,11 @@ def find_matches(distances, indices, treatment_df, control_df, caliper, with_rep
             matching_map[treated_idx] = control_indices
         else:
             unmatched_treated += 1
-    
-    print(f"Match finding time: {time.time() - t0:.2f} seconds")
+            
     return matched_pairs, unmatched_treated, matching_map
 
 def psm_function(df, exact_match=[]):
-    total_start_time = time.time()
+    start_time = time.time()
     
     global X_VARIABLES, TREATMENT_VAR, OUTCOME_VAR, MATCHING_RATIO, N_NEIGHBORS, CALIPER_SD
     X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
@@ -134,18 +138,13 @@ def psm_function(df, exact_match=[]):
     N_NEIGHBORS = 25
     CALIPER_SD = 0.25
     
-    subset_start = time.time()
     list_data_frame = create_subset(df, exact_match)
-    print(f"Subset creation time: {time.time() - subset_start:.2f} seconds")
     
     treatment_groups = {}
     control_groups = {}
     subset_descriptions = {}
     encoded_dataframes = {}
-    all_treatment_df = pd.DataFrame()
-    all_control_df = pd.DataFrame()
     
-    data_prep_start = time.time()
     for i, dfx in enumerate(list_data_frame):
         if len(dfx) > 10:
             subset_description = f"subset_{i}"
@@ -160,44 +159,30 @@ def psm_function(df, exact_match=[]):
             treatment_df = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
             control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
             
-            treatment_df['subset'] = subset_description
-            control_df['subset'] = subset_description
-            
-            all_treatment_df = pd.concat([all_treatment_df, treatment_df])
-            all_control_df = pd.concat([all_control_df, control_df])
-            
             treatment_groups[subset_description] = treatment_df
             control_groups[subset_description] = control_df
             subset_descriptions[i] = subset_description
     
-    print(f"Total data preparation time: {time.time() - data_prep_start:.2f} seconds")
-    
     print("\nPerforming KNN matching")
-    distances, indices = perform_matching(all_treatment_df, all_control_df)
+    knn_results = perform_matching(treatment_groups, control_groups)
     
-    matching_start = time.time()
     all_results = pd.DataFrame()
     all_matching_maps = {}
     
-    current_index = 0
     for i, dfx in enumerate(list_data_frame):
         if len(dfx) > 10:
             subset_description = subset_descriptions[i]
             df_encoded = encoded_dataframes[subset_description]
             
-            treatment_df = treatment_groups[subset_description]
-            control_df = control_groups[subset_description]
-            
-            n_treated = len(treatment_df)
-            subset_distances = distances[current_index:current_index + n_treated]
-            subset_indices = indices[current_index:current_index + n_treated]
-            current_index += n_treated
+            treatment_df = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
+            control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
             
             caliper = np.std(df_encoded['pscore']) * CALIPER_SD
+            distances, indices = knn_results[subset_description]
             
             print(f"\nFinding matches for {subset_description}")
             matched_pairs, unmatched_treated, matching_map = find_matches(
-                subset_distances, subset_indices, treatment_df, control_df, caliper, with_replacement=True
+                distances, indices, treatment_df, control_df, caliper, with_replacement=True
             )
             
             matched_df = pd.DataFrame(matched_pairs)
@@ -210,14 +195,10 @@ def psm_function(df, exact_match=[]):
             print(f"Unmatched treated units: {unmatched_treated}")
             print(f"Matched control units: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
     
-    print(f"Total matching time: {time.time() - matching_start:.2f} seconds")
-    print(f"Total execution time: {time.time() - total_start_time:.2f} seconds")
+    print(f"\nTotal execution time: {time.time() - start_time:.2f} seconds")
     return all_results, all_matching_maps
 
 if __name__ == "__main__":
     print("Loading data...")
-    load_start = time.time()
     df = pd.read_csv("marketing_test_case.csv")
-    print(f"Data loading time: {time.time() - load_start:.2f} seconds")
-    
     matched_results, matching_maps = psm_function(df, exact_match=['gender_cd'])
