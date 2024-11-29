@@ -1,4 +1,4 @@
-import pandas as pd 
+import pandas as pd
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 import faiss
@@ -6,37 +6,26 @@ import warnings
 import time
 warnings.filterwarnings('ignore')
 
-def log_time(start_time, message):
-    print(f"{message}: {time.time() - start_time:.2f} seconds")
-
 def create_subset(df, exact_match):
-    start = time.time()
     if not exact_match:
-        df['exact_match_key'] = '1'
-    else:
-        df['exact_match_key'] = df[exact_match].astype(str).agg('_'.join, axis=1)
+        return [df]
+    df['exact_match_key'] = df[exact_match].astype(str).agg('_'.join, axis=1)
     result = [group for _, group in df.groupby('exact_match_key')]
-    log_time(start, "Subset creation")
-    return result, df['exact_match_key']
+    return result
 
-def preprocess_and_score(df, x_variables, treatment_var, outcome_var):
-    start = time.time()
-    df_clean = df.copy()
-    
-    # Handle missing values
-    for col in x_variables:
+def prepare_data_for_matching(df_subset):
+    t0 = time.time()
+    df_clean = df_subset.copy()
+    for col in X_VARIABLES:
         if df_clean[col].dtype in ['int64', 'float64']:
             df_clean[col] = df_clean[col].fillna(df_clean[col].median())
         else:
             df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
-    log_time(start, "Missing value handling")
     
-    # Create dummy variables
-    dummy_start = time.time()
     df_encoded = df_clean.copy()
     categorical_cols = []
     
-    for col in x_variables:
+    for col in X_VARIABLES:
         if col in df_encoded.columns:
             if df_encoded[col].nunique() == 2 and df_encoded[col].dtype in ['int64', 'float64']:
                 df_encoded[col] = df_encoded[col].map({0: 'A', 1: 'B'})
@@ -44,125 +33,191 @@ def preprocess_and_score(df, x_variables, treatment_var, outcome_var):
             if df_encoded[col].dtype == 'object' or df_encoded[col].nunique() < 10:
                 categorical_cols.append(col)
                 unique_vals = df_encoded[col].dropna().unique()
+                
                 for val in unique_vals:
-                    df_encoded[f"{col}_{val}"] = (df_encoded[col] == val).astype(int)
+                    col_name = f"{col}_{val}"
+                    df_encoded[col_name] = (df_encoded[col] == val).astype(int)
+                
                 df_encoded = df_encoded.drop(columns=[col])
-    log_time(dummy_start, "Dummy variable creation")
     
-    # Prepare features
-    feature_start = time.time()
-    features = [col for col in x_variables if col not in categorical_cols]
+    features_for_model = [col for col in X_VARIABLES if col not in categorical_cols]
     for col in categorical_cols:
-        features.extend([c for c in df_encoded.columns if c.startswith(col + '_')])
+        dummy_cols = [c for c in df_encoded.columns if c.startswith(col + '_')]
+        features_for_model.extend(dummy_cols)
     
-    df_encoded = df_encoded.dropna(subset=features + [treatment_var, outcome_var])
-    log_time(feature_start, "Feature preparation")
+    df_encoded = df_encoded.dropna(subset=features_for_model + [TREATMENT_VAR, OUTCOME_VAR])
     
-    # Calculate propensity scores
-    score_start = time.time()
     model = LogisticRegression(penalty='l2', C=1e6, solver='lbfgs', random_state=42, max_iter=1000)
-    model.fit(df_encoded[features], df_encoded[treatment_var])
-    df_encoded['pscore'] = model.predict_proba(df_encoded[features])[:, 1]
-    log_time(score_start, "Propensity score calculation")
+    model.fit(df_encoded[features_for_model], df_encoded[TREATMENT_VAR])
+    ps = model.predict_proba(df_encoded[features_for_model])[:, 1]
+    df_encoded['pscore'] = ps
     
-    log_time(start, "Total preprocessing and scoring")
-    return df_encoded
+    print(f"Data preparation time: {time.time() - t0:.2f} seconds")
+    return df_encoded, features_for_model
 
-def perform_matching(df_encoded, treatment_var, n_neighbors, matching_ratio, caliper_sd):
-    start = time.time()
-    treatment_df = df_encoded[df_encoded[treatment_var] == 1]
-    control_df = df_encoded[df_encoded[treatment_var] == 0]
-    
-    # Single KNN for all data
-    knn_start = time.time()
+def perform_matching(treatment_df, control_df):
+    t0 = time.time()
     treated_pscores = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
     control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
     
-    index = faiss.IndexHNSWFlat(1, 32)
+    dimension = 1
+    index = faiss.IndexHNSWFlat(dimension, 32)
     index.hnsw.efConstruction = 80
     index.add(control_pscores)
     
     index.hnsw.efSearch = 40
-    k = min(n_neighbors, len(control_df))
+    k = min(N_NEIGHBORS, len(control_df))
     distances, indices = index.search(treated_pscores, k)
-    log_time(knn_start, "KNN matching")
     
-    # Find matches by subset
-    match_start = time.time()
+    print(f"KNN matching time: {time.time() - t0:.2f} seconds")
+    return distances, indices
+
+def find_matches(distances, indices, treatment_df, control_df, caliper, with_replacement=False):
+    t0 = time.time()
     matched_pairs = []
-    matching_maps = {}
+    used_control_indices = set()
+    unmatched_treated = 0
+    matching_map = {}
     
-    for exact_key in df_encoded['exact_match_key'].unique():
-        mask_treat = treatment_df['exact_match_key'] == exact_key
-        mask_control = control_df['exact_match_key'] == exact_key
+    treatment_idx_by_ps = treatment_df['pscore'].sort_values().index
+    
+    for treated_idx in treatment_idx_by_ps:
+        i = treatment_df.index.get_loc(treated_idx)
+        matches = indices[i]
+        treated_pscore = treatment_df['pscore'].iloc[i]
+        valid_matches = []
         
-        subset_treat = treatment_df[mask_treat]
-        subset_control = control_df[mask_control]
-        
-        if len(subset_treat) < 1 or len(subset_control) < matching_ratio:
-            continue
+        for control_idx in matches:
+            if control_idx == -1:
+                continue
+                
+            control_pscore = control_df['pscore'].iloc[control_idx]
+            ps_diff = abs(treated_pscore - control_pscore)
             
-        caliper = np.std(df_encoded[df_encoded['exact_match_key'] == exact_key]['pscore']) * caliper_sd
-        subset_indices = np.where(mask_treat)[0]
-        
-        for i, treat_idx in enumerate(subset_indices):
-            current_indices = indices[treat_idx]
-            current_distances = distances[treat_idx]
-            
-            valid_matches = []
-            for j, ctrl_idx in enumerate(current_indices):
-                if ctrl_idx == -1 or not mask_control.iloc[ctrl_idx]:
-                    continue
-                if current_distances[j] <= caliper:
-                    valid_matches.append(ctrl_idx)
-                if len(valid_matches) == matching_ratio:
+            if ps_diff <= caliper and (with_replacement or control_idx not in used_control_indices):
+                valid_matches.append(control_idx)
+                if len(valid_matches) == MATCHING_RATIO:
                     break
-                    
-            if len(valid_matches) == matching_ratio:
-                treat_record = treatment_df.iloc[treat_idx].copy()
-                treat_record['match_group'] = treat_idx
-                treat_record['unit_role'] = 'treated'
-                matched_pairs.append(treat_record)
-                
-                ctrl_indices = []
-                for match in valid_matches:
-                    ctrl_record = control_df.iloc[match].copy()
-                    ctrl_record['match_group'] = treat_idx
-                    ctrl_record['unit_role'] = 'control'
-                    matched_pairs.append(ctrl_record)
-                    ctrl_indices.append(control_df.index[match])
-                
-                matching_maps[treatment_df.index[treat_idx]] = ctrl_indices
+        
+        if len(valid_matches) == MATCHING_RATIO:
+            treated_record = treatment_df.iloc[i].copy()
+            treated_record['match_group'] = treated_idx
+            treated_record['unit_role'] = 'treated'
+            treated_record['original_index'] = treated_idx
+            matched_pairs.append(treated_record)
+            
+            control_indices = []
+            for match in valid_matches:
+                control_record = control_df.iloc[match].copy()
+                control_record['match_group'] = treated_idx
+                control_record['unit_role'] = 'control'
+                control_record['original_index'] = control_df.index[match]
+                matched_pairs.append(control_record)
+                used_control_indices.add(match)
+                control_indices.append(control_df.index[match])
+            
+            matching_map[treated_idx] = control_indices
+        else:
+            unmatched_treated += 1
     
-    log_time(match_start, "Match finding")
-    log_time(start, "Total matching process")
-    return pd.DataFrame(matched_pairs), matching_maps
+    print(f"Match finding time: {time.time() - t0:.2f} seconds")
+    return matched_pairs, unmatched_treated, matching_map
 
 def psm_function(df, exact_match=[]):
-    total_start = time.time()
-    x_variables = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
-    treatment_var = "grp_binary"
-    outcome_var = "social_risk_score"
-    matching_ratio = 2
-    n_neighbors = 25
-    caliper_sd = 0.25
+    total_start_time = time.time()
     
-    # Create subsets but keep data in single DataFrame
-    _, df['exact_match_key'] = create_subset(df, exact_match)
+    global X_VARIABLES, TREATMENT_VAR, OUTCOME_VAR, MATCHING_RATIO, N_NEIGHBORS, CALIPER_SD
+    X_VARIABLES = ["age", "social_risk_score", "hpd_hyp", "hpd_hyc", "hpd_ast", "hpd_dia"]
+    TREATMENT_VAR = "grp_binary"
+    OUTCOME_VAR = "social_risk_score"
+    MATCHING_RATIO = 2
+    N_NEIGHBORS = 25
+    CALIPER_SD = 0.25
     
-    # Preprocess and calculate scores
-    df_encoded = preprocess_and_score(df, x_variables, treatment_var, outcome_var)
+    subset_start = time.time()
+    list_data_frame = create_subset(df, exact_match)
+    print(f"Subset creation time: {time.time() - subset_start:.2f} seconds")
     
-    # Perform matching
-    matched_results, matching_maps = perform_matching(
-        df_encoded, treatment_var, n_neighbors, matching_ratio, caliper_sd)
+    treatment_groups = {}
+    control_groups = {}
+    subset_descriptions = {}
+    encoded_dataframes = {}
+    all_treatment_df = pd.DataFrame()
+    all_control_df = pd.DataFrame()
     
-    log_time(total_start, "Total PSM process")
-    return matched_results, matching_maps
+    data_prep_start = time.time()
+    for i, dfx in enumerate(list_data_frame):
+        if len(dfx) > 10:
+            subset_description = f"subset_{i}"
+            if exact_match:
+                match_values = dfx[exact_match].iloc[0].values
+                subset_description = "_".join(f"{col}_{val}" for col, val in zip(exact_match, match_values))
+            
+            print(f"\nProcessing {subset_description}")
+            df_encoded, _ = prepare_data_for_matching(dfx)
+            encoded_dataframes[subset_description] = df_encoded
+            
+            treatment_df = df_encoded[df_encoded[TREATMENT_VAR] == 1].copy()
+            control_df = df_encoded[df_encoded[TREATMENT_VAR] == 0].copy()
+            
+            treatment_df['subset'] = subset_description
+            control_df['subset'] = subset_description
+            
+            all_treatment_df = pd.concat([all_treatment_df, treatment_df])
+            all_control_df = pd.concat([all_control_df, control_df])
+            
+            treatment_groups[subset_description] = treatment_df
+            control_groups[subset_description] = control_df
+            subset_descriptions[i] = subset_description
+    
+    print(f"Total data preparation time: {time.time() - data_prep_start:.2f} seconds")
+    
+    print("\nPerforming KNN matching")
+    distances, indices = perform_matching(all_treatment_df, all_control_df)
+    
+    matching_start = time.time()
+    all_results = pd.DataFrame()
+    all_matching_maps = {}
+    
+    current_index = 0
+    for i, dfx in enumerate(list_data_frame):
+        if len(dfx) > 10:
+            subset_description = subset_descriptions[i]
+            df_encoded = encoded_dataframes[subset_description]
+            
+            treatment_df = treatment_groups[subset_description]
+            control_df = control_groups[subset_description]
+            
+            n_treated = len(treatment_df)
+            subset_distances = distances[current_index:current_index + n_treated]
+            subset_indices = indices[current_index:current_index + n_treated]
+            current_index += n_treated
+            
+            caliper = np.std(df_encoded['pscore']) * CALIPER_SD
+            
+            print(f"\nFinding matches for {subset_description}")
+            matched_pairs, unmatched_treated, matching_map = find_matches(
+                subset_distances, subset_indices, treatment_df, control_df, caliper, with_replacement=True
+            )
+            
+            matched_df = pd.DataFrame(matched_pairs)
+            
+            if not matched_df.empty:
+                all_results = pd.concat([all_results, matched_df])
+                all_matching_maps.update(matching_map)
+                
+            print(f"Matched treated units: {len(matched_pairs) // (MATCHING_RATIO + 1)}")
+            print(f"Unmatched treated units: {unmatched_treated}")
+            print(f"Matched control units: {len(matched_pairs) - (len(matched_pairs) // (MATCHING_RATIO + 1))}")
+    
+    print(f"Total matching time: {time.time() - matching_start:.2f} seconds")
+    print(f"Total execution time: {time.time() - total_start_time:.2f} seconds")
+    return all_results, all_matching_maps
 
 if __name__ == "__main__":
-    data_start = time.time()
+    print("Loading data...")
+    load_start = time.time()
     df = pd.read_csv("marketing_test_case.csv")
-    log_time(data_start, "Data loading")
+    print(f"Data loading time: {time.time() - load_start:.2f} seconds")
     
     matched_results, matching_maps = psm_function(df, exact_match=['gender_cd'])
