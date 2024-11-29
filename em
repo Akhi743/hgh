@@ -202,3 +202,44 @@ if __name__ == "__main__":
     print("Loading data...")
     df = pd.read_csv("marketing_test_case.csv")
     matched_results, matching_maps = psm_function(df, exact_match=['gender_cd'])
+
+
+
+
+
+
+
+
+
+
+def perform_matching(treatment_groups, control_groups):
+    # Get cumulative sizes for index adjustment
+    control_sizes = {id: len(df) for id, df in control_groups.items()}
+    cumsum = 0
+    control_offsets = {}
+    for subset_id in control_groups:
+        control_offsets[subset_id] = cumsum
+        cumsum += control_sizes[subset_id]
+    
+    # Perform matching subset by subset
+    all_matches = {}
+    for subset_id in treatment_groups:
+        treatment_df = treatment_groups[subset_id]
+        control_df = control_groups[subset_id]
+        
+        treated_pscores = treatment_df['pscore'].values.reshape(-1, 1).astype('float32')
+        control_pscores = control_df['pscore'].values.reshape(-1, 1).astype('float32')
+        
+        dimension = 1
+        index = faiss.IndexHNSWFlat(dimension, 32)
+        index.hnsw.efConstruction = 80
+        index.add(control_pscores)
+        
+        index.hnsw.efSearch = 40
+        k = min(N_NEIGHBORS, len(control_df))
+        distances, indices = index.search(treated_pscores, k)
+        
+        # Adjust indices to match control_df's local indexing
+        all_matches[subset_id] = (distances, indices)
+    
+    return all_matches
