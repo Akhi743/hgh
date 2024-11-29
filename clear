@@ -1,0 +1,5 @@
+spark = SparkSession.builder \
+    .appName("MemoryCleanup") \
+    .getOrCreate()
+
+spark.catalog.clearCache()
