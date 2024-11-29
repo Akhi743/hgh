@@ -1,32 +1,13 @@
-spark = SparkSession.builder \
-    .appName("MemoryCleanup") \
-    .getOrCreate()
-
-spark.catalog.clearCache()
-
-
-
-
-
-from psutil import Process
-print(Process().memory_info().rss / 1024 / 1024)  # MB
-
-
-
-
-
-
-
-
-import gc
-import os
-
-# Clear Python garbage collector
-gc.collect()
-
-# Clear system cache (requires sudo)
-os.system('sudo sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"')
-
-# Check memory after cleanup
-from psutil import Process
-print(f"Memory after cleanup: {Process().memory_info().rss / 1024 / 1024:.2f} MB")
+def clear_variables():
+    # Get current memory usage
+    print(f"Memory before cleanup: {Process().memory_info().rss / 1024 / 1024:.2f} MB")
+    
+    # Clear global variables 
+    for name in list(globals()):
+        if not name.startswith('__'):
+            del globals()[name]
+    
+    # Force garbage collection
+    gc.collect()
+    
+    print(f"Memory after cleanup: {Process().memory_info().rss / 1024 / 1024:.2f} MB")
