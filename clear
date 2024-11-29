@@ -10,3 +10,23 @@ spark.catalog.clearCache()
 
 from psutil import Process
 print(Process().memory_info().rss / 1024 / 1024)  # MB
+
+
+
+
+
+
+
+
+import gc
+import os
+
+# Clear Python garbage collector
+gc.collect()
+
+# Clear system cache (requires sudo)
+os.system('sudo sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"')
+
+# Check memory after cleanup
+from psutil import Process
+print(f"Memory after cleanup: {Process().memory_info().rss / 1024 / 1024:.2f} MB")
