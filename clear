@@ -3,3 +3,10 @@ spark = SparkSession.builder \
     .getOrCreate()
 
 spark.catalog.clearCache()
+
+
+
+
+
+from psutil import Process
+print(Process().memory_info().rss / 1024 / 1024)  # MB
