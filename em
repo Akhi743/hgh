@@ -609,78 +609,60 @@ def calculate_global_knn(df_encoded):
 def find_matches(distances, indices, treatment_df, control_df, caliper, with_replacement=False):
     start_time = time.time()
     
-    # Convert to numpy arrays for faster operations
+    # Pre-calculate all valid matches using vectorized operations
     treatment_pscores = treatment_df['pscore'].values
     control_pscores = control_df['pscore'].values
-    treatment_indices = treatment_df.index.values
-    control_indices = control_df.index.values
     
-    # Sort treatment cases by propensity score
-    sort_idx = np.argsort(treatment_pscores)
-    treatment_pscores = treatment_pscores[sort_idx]
-    treatment_indices = treatment_indices[sort_idx]
-    indices = indices[sort_idx]
+    # Create matrices for broadcasting
+    treatment_matrix = treatment_pscores[:, np.newaxis]
+    control_matrix = control_pscores[indices]
     
-    n_treated = len(treatment_indices)
+    # Calculate all PS differences at once
+    ps_differences = np.abs(treatment_matrix - control_matrix)
+    valid_matches = ps_differences <= caliper
+    
     matched_pairs = []
-    used_control_mask = np.zeros(len(control_df), dtype=bool)
+    used_controls = set()
     matching_map = {}
     
-    # Vectorized distance calculation
-    control_idx_matrix = indices.reshape(n_treated, -1)
-    control_pscore_matrix = control_pscores[control_idx_matrix]
-    ps_diff_matrix = np.abs(treatment_pscores.reshape(-1, 1) - control_pscore_matrix)
-    valid_matches_mask = ps_diff_matrix <= caliper
-    
-    if not with_replacement:
-        for i in range(n_treated):
-            valid_matches = control_idx_matrix[i][valid_matches_mask[i]]
-            unused_matches = valid_matches[~used_control_mask[valid_matches]]
-            
-            if len(unused_matches) >= MATCHING_RATIO:
-                selected_matches = unused_matches[:MATCHING_RATIO]
-                used_control_mask[selected_matches] = True
+    # Process in batches for memory efficiency
+    batch_size = 1000
+    for start_idx in range(0, len(treatment_df), batch_size):
+        end_idx = min(start_idx + batch_size, len(treatment_df))
+        batch_valid = valid_matches[start_idx:end_idx]
+        
+        for i, (valid_mask, treated_idx) in enumerate(zip(batch_valid, treatment_df.index[start_idx:end_idx])):
+            if not with_replacement:
+                valid_controls = [c for c in indices[start_idx + i][valid_mask] 
+                                if c not in used_controls]
+            else:
+                valid_controls = indices[start_idx + i][valid_mask]
                 
-                treated_record = treatment_df.loc[treatment_indices[i]].copy()
-                treated_record['match_group'] = treatment_indices[i]
+            if len(valid_controls) >= MATCHING_RATIO:
+                matched_controls = valid_controls[:MATCHING_RATIO]
+                if not with_replacement:
+                    used_controls.update(matched_controls)
+                
+                # Add treated unit
+                treated_record = treatment_df.loc[treated_idx].copy()
+                treated_record['match_group'] = treated_idx
                 treated_record['unit_role'] = 'treated'
-                treated_record['original_index'] = treatment_indices[i]
+                treated_record['original_index'] = treated_idx
                 matched_pairs.append(treated_record)
                 
-                matching_map[treatment_indices[i]] = control_indices[selected_matches].tolist()
-                
-                for match in selected_matches:
-                    control_record = control_df.loc[control_indices[match]].copy()
-                    control_record['match_group'] = treatment_indices[i]
+                # Add control units
+                matching_map[treated_idx] = []
+                for control_idx in matched_controls:
+                    control_record = control_df.iloc[control_idx].copy()
+                    control_record['match_group'] = treated_idx
                     control_record['unit_role'] = 'control'
-                    control_record['original_index'] = control_indices[match]
+                    control_record['original_index'] = control_df.index[control_idx]
                     matched_pairs.append(control_record)
-    else:
-        for i in range(n_treated):
-            valid_matches = control_idx_matrix[i][valid_matches_mask[i]]
-            
-            if len(valid_matches) >= MATCHING_RATIO:
-                selected_matches = valid_matches[:MATCHING_RATIO]
-                
-                treated_record = treatment_df.loc[treatment_indices[i]].copy()
-                treated_record['match_group'] = treatment_indices[i]
-                treated_record['unit_role'] = 'treated'
-                treated_record['original_index'] = treatment_indices[i]
-                matched_pairs.append(treated_record)
-                
-                matching_map[treatment_indices[i]] = control_indices[selected_matches].tolist()
-                
-                for match in selected_matches:
-                    control_record = control_df.loc[control_indices[match]].copy()
-                    control_record['match_group'] = treatment_indices[i]
-                    control_record['unit_role'] = 'control'
-                    control_record['original_index'] = control_indices[match]
-                    matched_pairs.append(control_record)
+                    matching_map[treated_idx].append(control_df.index[control_idx])
     
-    unmatched_treated = n_treated - len(matching_map)
+    unmatched_treated = len(treatment_df) - len(matching_map)
     print(f"Find matches time: {time.time() - start_time:.2f} seconds")
     return matched_pairs, unmatched_treated, matching_map
-
 def process_subset_matches(subset_df, global_distances, global_indices, 
                          global_treatment_df, global_control_df, subset_description):
     start_time = time.time()
