@@ -215,3 +215,77 @@ if __name__ == "__main__":
     
     matched_results, matching_maps = psm_function(df, exact_match=['gender_cd', 'hpd_hyp'])
     print(f"\nTotal program execution time: {time.time() - start_time:.2f} seconds")
+
+
+
+
+
+
+
+
+
+
+
+
+
+def find_matches(distances, indices, treatment_df, control_df, caliper, with_replacement=False):
+    start_time = time.time()
+    
+    # Convert to numpy arrays
+    treatment_pscores = treatment_df['pscore'].values
+    control_pscores = control_df['pscore'].values
+    treatment_indices = treatment_df.index.values
+    control_indices = control_df.index.values
+    
+    # Sort by propensity score
+    sort_idx = np.argsort(treatment_pscores)
+    treatment_pscores = treatment_pscores[sort_idx]
+    indices = indices[sort_idx]
+    
+    matched_pairs = []
+    used_control_indices = np.array([], dtype=int)
+    matching_map = {}
+    
+    for idx in range(len(treatment_pscores)):
+        treated_idx = treatment_indices[sort_idx[idx]]
+        current_matches = indices[idx]
+        
+        # Calculate score differences
+        score_diffs = np.abs(control_pscores[current_matches] - treatment_pscores[idx])
+        valid_match_indices = np.where(score_diffs <= caliper)[0]
+        
+        if not with_replacement:
+            # Remove already used controls
+            valid_matches = current_matches[valid_match_indices]
+            valid_matches = np.setdiff1d(valid_matches, used_control_indices)
+            valid_match_indices = valid_match_indices[np.isin(current_matches[valid_match_indices], valid_matches)]
+        
+        if len(valid_match_indices) >= MATCHING_RATIO:
+            selected_matches = valid_match_indices[:MATCHING_RATIO]
+            
+            # Add treated unit
+            treated_record = treatment_df.iloc[sort_idx[idx]].copy()
+            treated_record['match_group'] = treated_idx
+            treated_record['unit_role'] = 'treated'
+            treated_record['original_index'] = treated_idx
+            matched_pairs.append(treated_record)
+            
+            # Add control units
+            control_match_indices = []
+            for match_idx in selected_matches:
+                control_idx = current_matches[match_idx]
+                control_record = control_df.iloc[control_idx].copy()
+                control_record['match_group'] = treated_idx
+                control_record['unit_role'] = 'control'
+                control_record['original_index'] = control_indices[control_idx]
+                matched_pairs.append(control_record)
+                control_match_indices.append(control_indices[control_idx])
+                
+                if not with_replacement:
+                    used_control_indices = np.append(used_control_indices, control_idx)
+            
+            matching_map[treated_idx] = control_match_indices
+    
+    unmatched_treated = len(treatment_pscores) - len(matching_map)
+    print(f"Find matches time: {time.time() - start_time:.2f} seconds")
+    return matched_pairs, unmatched_treated, matching_map
