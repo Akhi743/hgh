@@ -609,60 +609,82 @@ def calculate_global_knn(df_encoded):
 def find_matches(distances, indices, treatment_df, control_df, caliper, with_replacement=False):
     start_time = time.time()
     
-    # Pre-calculate all valid matches using vectorized operations
+    # Convert inputs to numpy arrays for faster operations
     treatment_pscores = treatment_df['pscore'].values
     control_pscores = control_df['pscore'].values
+    treatment_indices = treatment_df.index.values
+    control_indices = control_df.index.values
     
-    # Create matrices for broadcasting
-    treatment_matrix = treatment_pscores[:, np.newaxis]
-    control_matrix = control_pscores[indices]
+    # Sort treatment cases by propensity score
+    sort_idx = np.argsort(treatment_pscores)
+    treatment_pscores = treatment_pscores[sort_idx]
+    treatment_indices = treatment_indices[sort_idx]
+    indices = indices[sort_idx]
     
-    # Calculate all PS differences at once
-    ps_differences = np.abs(treatment_matrix - control_matrix)
-    valid_matches = ps_differences <= caliper
-    
+    n_treated = len(treatment_indices)
     matched_pairs = []
-    used_controls = set()
     matching_map = {}
+    used_control_indices = set()
+    unmatched_treated = 0
     
-    # Process in batches for memory efficiency
-    batch_size = 1000
-    for start_idx in range(0, len(treatment_df), batch_size):
-        end_idx = min(start_idx + batch_size, len(treatment_df))
-        batch_valid = valid_matches[start_idx:end_idx]
+    # Create arrays for control propensity scores corresponding to KNN matches
+    control_idx_matrix = indices  # Shape: (n_treated, n_neighbors)
+    valid_control_mask = control_idx_matrix != -1
+    control_ps_matrix = np.zeros_like(distances)  # Shape: (n_treated, n_neighbors)
+    
+    # Fill control_ps_matrix with actual propensity scores
+    valid_indices = control_idx_matrix[valid_control_mask]
+    control_ps_matrix[valid_control_mask] = control_pscores[valid_indices]
+    
+    # Calculate propensity score differences
+    treated_ps_expanded = treatment_pscores.reshape(-1, 1)  # Shape: (n_treated, 1)
+    ps_differences = np.abs(control_ps_matrix - treated_ps_expanded)
+    
+    # Create valid matches mask
+    valid_matches = (ps_differences <= caliper) & valid_control_mask
+    
+    for i in range(n_treated):
+        valid_control_indices = control_idx_matrix[i][valid_matches[i]]
         
-        for i, (valid_mask, treated_idx) in enumerate(zip(batch_valid, treatment_df.index[start_idx:end_idx])):
-            if not with_replacement:
-                valid_controls = [c for c in indices[start_idx + i][valid_mask] 
-                                if c not in used_controls]
-            else:
-                valid_controls = indices[start_idx + i][valid_mask]
+        if not with_replacement:
+            # Filter out already used control indices
+            valid_control_indices = np.array([idx for idx in valid_control_indices 
+                                           if idx not in used_control_indices])
+        
+        if len(valid_control_indices) >= MATCHING_RATIO:
+            # Select the closest matches up to MATCHING_RATIO
+            ps_diffs = ps_differences[i][valid_matches[i]][:len(valid_control_indices)]
+            closest_indices = np.argsort(ps_diffs)[:MATCHING_RATIO]
+            selected_control_indices = valid_control_indices[closest_indices]
+            
+            # Create treated record
+            treated_record = treatment_df.iloc[sort_idx[i]].copy()
+            treated_record['match_group'] = treatment_indices[i]
+            treated_record['unit_role'] = 'treated'
+            treated_record['original_index'] = treatment_indices[i]
+            matched_pairs.append(treated_record)
+            
+            # Create control records and update matching map
+            control_original_indices = []
+            for control_idx in selected_control_indices:
+                control_record = control_df.iloc[control_idx].copy()
+                control_record['match_group'] = treatment_indices[i]
+                control_record['unit_role'] = 'control'
+                control_record['original_index'] = control_indices[control_idx]
+                matched_pairs.append(control_record)
                 
-            if len(valid_controls) >= MATCHING_RATIO:
-                matched_controls = valid_controls[:MATCHING_RATIO]
                 if not with_replacement:
-                    used_controls.update(matched_controls)
+                    used_control_indices.add(control_idx)
                 
-                # Add treated unit
-                treated_record = treatment_df.loc[treated_idx].copy()
-                treated_record['match_group'] = treated_idx
-                treated_record['unit_role'] = 'treated'
-                treated_record['original_index'] = treated_idx
-                matched_pairs.append(treated_record)
-                
-                # Add control units
-                matching_map[treated_idx] = []
-                for control_idx in matched_controls:
-                    control_record = control_df.iloc[control_idx].copy()
-                    control_record['match_group'] = treated_idx
-                    control_record['unit_role'] = 'control'
-                    control_record['original_index'] = control_df.index[control_idx]
-                    matched_pairs.append(control_record)
-                    matching_map[treated_idx].append(control_df.index[control_idx])
+                control_original_indices.append(control_indices[control_idx])
+            
+            matching_map[treatment_indices[i]] = control_original_indices
+        else:
+            unmatched_treated += 1
     
-    unmatched_treated = len(treatment_df) - len(matching_map)
-    print(f"Find matches time: {time.time() - start_time:.2f} seconds")
+    print(f"Optimized find matches time: {time.time() - start_time:.2f} seconds")
     return matched_pairs, unmatched_treated, matching_map
+
 def process_subset_matches(subset_df, global_distances, global_indices, 
                          global_treatment_df, global_control_df, subset_description):
     start_time = time.time()
@@ -670,6 +692,7 @@ def process_subset_matches(subset_df, global_distances, global_indices,
     subset_treated_indices = subset_df[subset_df[TREATMENT_VAR] == 1].index
     global_treated_indices = global_treatment_df.index
     
+    # Map subset indices to global indices
     subset_to_global = {idx: pos for pos, idx in enumerate(global_treated_indices) 
                        if idx in subset_treated_indices}
     
@@ -696,11 +719,15 @@ def psm_function(df, exact_match=[]):
     N_NEIGHBORS = 25
     CALIPER_SD = 0.25
     
+    # Calculate global propensity scores and KNN once
     print("\nCalculating global scores and KNN...")
     df_encoded, features = calculate_global_propensity_scores(df)
     distances, indices, treatment_df, control_df = calculate_global_knn(df_encoded)
     
+    # Create subsets
     list_data_frame = create_subset(df, exact_match)
+    
+    # Process each subset using global KNN results
     all_results = pd.DataFrame()
     all_matching_maps = {}
     
@@ -721,11 +748,10 @@ def psm_function(df, exact_match=[]):
     print(f"\nTotal PSM function execution time: {time.time() - total_start_time:.2f} seconds")
     return all_results, all_matching_maps
 
-if __name__ == "__main__":
-    start_time = time.time()
-    print("Loading data...")
-    df = pd.read_csv("marketing_test_case.csv")
-    print(f"Data loading time: {time.time() - start_time:.2f} seconds")
+start_time = time.time()
+print("Loading data...")
+df = pd.read_csv("marketing_test_case.csv")
+print(f"Data loading time: {time.time() - start_time:.2f} seconds")
     
-    matched_results, matching_maps = psm_function(df, exact_match=['gender_cd', 'hpd_hyp'])
-    print(f"\nTotal program execution time: {time.time() - start_time:.2f} seconds")
+matched_results, matching_maps = psm_function(df, exact_match=['gender_cd'])
+print(f"\nTotal program execution time: {time.time() - start_time:.2f} seconds")
