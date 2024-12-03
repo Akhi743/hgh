@@ -1,0 +1,55 @@
+def find_matches(distances, indices, treatment_df, control_df, caliper, with_replacement=False):
+    """Find matching pairs within caliper using map and filter"""
+    start_time = time.time()
+    
+    matched_pairs = []
+    used_control_indices = set()
+    unmatched_treated = 0
+    matching_map = {}
+    
+    treatment_idx_by_ps = treatment_df['pscore'].sort_values().index
+    
+    def process_treatment(treated_idx):
+        i = treatment_df.index.get_loc(treated_idx)
+        matches = indices[i]
+        treated_pscore = treatment_df['pscore'].iloc[i]
+        
+        def is_valid_match(control_idx):
+            if control_idx == -1:
+                return False
+            control_pscore = control_df['pscore'].iloc[control_idx]
+            ps_diff = abs(treated_pscore - control_pscore)
+            return ps_diff <= caliper and (with_replacement or control_idx not in used_control_indices)
+        
+        valid_matches = list(filter(is_valid_match, matches))[:MATCHING_RATIO]
+        
+        if len(valid_matches) == MATCHING_RATIO:
+            return (treated_idx, i, valid_matches)
+        return None
+    
+    # Process all treatments using map
+    valid_treatments = filter(None, map(process_treatment, treatment_idx_by_ps))
+    
+    # Create matched pairs from valid treatments
+    for treated_idx, i, valid_matches in valid_treatments:
+        treated_record = treatment_df.iloc[i].copy()
+        treated_record['match_group'] = treated_idx
+        treated_record['unit_role'] = 'treated'
+        treated_record['original_index'] = treated_idx
+        matched_pairs.append(treated_record)
+        
+        control_indices = []
+        for match in valid_matches:
+            control_record = control_df.iloc[match].copy()
+            control_record['match_group'] = treated_idx
+            control_record['unit_role'] = 'control'
+            control_record['original_index'] = control_df.index[match]
+            matched_pairs.append(control_record)
+            used_control_indices.add(match)
+            control_indices.append(control_df.index[match])
+        
+        matching_map[treated_idx] = control_indices
+    
+    unmatched_treated = len(treatment_idx_by_ps) - len(matching_map)
+    print(f"Find matches time: {time.time() - start_time:.2f} seconds")
+    return matched_pairs, unmatched_treated, matching_map
