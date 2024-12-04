@@ -1,0 +1,68 @@
+def find_matches(distances, indices, treatment_df, control_df, caliper, with_replacement=False):
+    """Find matching pairs within caliper using numpy arrays and direct indexing"""
+    start_time = time.time()
+    
+    # Convert to numpy arrays for faster operations
+    treatment_pscores = treatment_df['pscore'].values
+    control_pscores = control_df['pscore'].values
+    treatment_indices = treatment_df.index.values
+    control_indices = control_df.index.values
+    
+    matched_pairs = []
+    matching_map = {}
+    available_controls = set(range(len(control_df)))
+    
+    # Sort treatment indices by propensity score for better matching
+    sorted_treatment_idx = np.argsort(treatment_pscores)
+    
+    for idx in sorted_treatment_idx:
+        treated_idx = treatment_indices[idx]
+        treated_pscore = treatment_pscores[idx]
+        potential_matches = indices[idx]
+        
+        # Filter invalid indices
+        potential_matches = potential_matches[potential_matches != -1]
+        
+        # Calculate distances and find valid matches
+        valid_matches = []
+        for match_idx in potential_matches:
+            if with_replacement or match_idx in available_controls:
+                if abs(treated_pscore - control_pscores[match_idx]) <= caliper:
+                    valid_matches.append(match_idx)
+                    if len(valid_matches) == MATCHING_RATIO:
+                        break
+        
+        if len(valid_matches) >= MATCHING_RATIO:
+            # Store treatment unit
+            treated_record = treatment_df.iloc[idx].to_dict()
+            treated_record.update({
+                'match_group': treated_idx,
+                'unit_role': 'treated',
+                'original_index': treated_idx
+            })
+            matched_pairs.append(treated_record)
+            
+            # Store control units
+            control_match_indices = []
+            for match_idx in valid_matches:
+                control_record = control_df.iloc[match_idx].to_dict()
+                control_record.update({
+                    'match_group': treated_idx,
+                    'unit_role': 'control',
+                    'original_index': control_indices[match_idx]
+                })
+                matched_pairs.append(control_record)
+                control_match_indices.append(control_indices[match_idx])
+                
+                if not with_replacement:
+                    available_controls.remove(match_idx)
+            
+            matching_map[treated_idx] = control_match_indices
+            
+            # Early stopping if no more controls available
+            if not with_replacement and not available_controls:
+                break
+    
+    unmatched_treated = len(treatment_df) - len(matching_map)
+    print(f"Find matches time: {time.time() - start_time:.2f} seconds")
+    return matched_pairs, unmatched_treated, matching_map
