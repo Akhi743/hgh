@@ -1,0 +1,1243 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn import manifold
+import matplotlib
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+from collections import namedtuple, OrderedDict
+from itertools import product
+from datetime import date
+
+# Constants
+class Constants:
+    # DR_Net
+    DRNET_EPOCHS = 100
+    DRNET_SS_EPOCHS = 1
+    DRNET_LR = 1e-4
+    DRNET_LAMBDA = 0.0001
+    DRNET_BATCH_SIZE = 256
+    # Modified for Lalonde dataset features: age, educ, race, married, nodegree, re74, re75
+    DRNET_INPUT_NODES = 7  # Number of features in Lalonde dataset
+    DRNET_SHARED_NODES = 200
+    DRNET_OUTPUT_NODES = 100
+    ALPHA = 1
+    BETA = 1
+    
+    # Adversarial VAE Info GAN
+    Adversarial_epochs = 1000
+    Adversarial_VAE_LR = 1e-3
+    INFO_GAN_G_LR = 1e-4
+    INFO_GAN_D_LR = 5e-4
+    Adversarial_LAMBDA = 1e-5
+    Adversarial_BATCH_SIZE = 256
+    VAE_BETA = 1
+    INFO_GAN_LAMBDA = 1.2
+    INFO_GAN_ALPHA = 1
+    
+    # Encoder architecture
+    Encoder_shared_nodes = 15
+    Encoder_x_nodes = 5
+    Encoder_t_nodes = 1  # Treatment indicator
+    Encoder_yf_nodes = 1  # Factual outcome (observed)
+    Encoder_ycf_nodes = 1  # Counterfactual outcome
+    
+    # Decoder architecture
+    Decoder_in_nodes = Encoder_x_nodes + Encoder_t_nodes + Encoder_yf_nodes + Encoder_ycf_nodes
+    Decoder_shared_nodes = 15
+    Decoder_out_nodes = DRNET_INPUT_NODES
+    
+    # Info GAN architecture 
+    Info_GAN_Gen_in_nodes = 100
+    Info_GAN_Gen_shared_nodes = 30
+    Info_GAN_Gen_out_nodes = 1
+    
+    # Modified for Lalonde dataset: features + potential outcomes (y0, y1)
+    Info_GAN_Dis_in_nodes = DRNET_INPUT_NODES + 2  
+    Info_GAN_Dis_shared_nodes = 30
+    Info_GAN_Dis_out_nodes = 1
+    
+    # Q network architecture
+    Info_GAN_Q_in_nodes = 1
+    Info_GAN_Q_shared_nodes = Decoder_in_nodes
+    Info_GAN_Q_out_nodes = Decoder_in_nodes
+
+# Utility Functions
+class Utils:
+    @staticmethod
+    def convert_df_to_np_arr(data):
+        return data.to_numpy()
+
+    @staticmethod
+    def convert_to_col_vector(np_arr):
+        return np_arr.reshape(np_arr.shape[0], 1)
+
+    @staticmethod
+    def test_train_split(np_train_X, np_train_T, np_train_yf, np_train_ycf, split_size=0.8):
+        from sklearn.model_selection import train_test_split
+        return train_test_split(np_train_X, np_train_T, np_train_yf, np_train_ycf,
+                              train_size=split_size)
+
+    @staticmethod
+    def convert_to_tensor_DR_net(X, T, Y_f, Y_cf, pi, mu):
+        tensor_x = torch.stack([torch.Tensor(i) for i in X])
+        tensor_T = torch.from_numpy(T)
+        tensor_y_f = torch.from_numpy(Y_f)
+        tensor_y_cf = torch.from_numpy(Y_cf)
+        tensor_pi = torch.from_numpy(pi)
+        tensor_mu = torch.from_numpy(mu)
+
+        processed_dataset = torch.utils.data.TensorDataset(tensor_x,
+                                                         tensor_T,
+                                                         tensor_y_f,
+                                                         tensor_y_cf,
+                                                         tensor_pi,
+                                                         tensor_mu)
+        return processed_dataset
+
+    @staticmethod
+    def convert_to_tensor(X, T, Y_f, Y_cf):
+        tensor_x = torch.stack([torch.Tensor(i) for i in X])
+        tensor_T = torch.from_numpy(T)
+        tensor_y_f = torch.from_numpy(Y_f)
+        tensor_y_cf = torch.from_numpy(Y_cf)
+
+        processed_dataset = torch.utils.data.TensorDataset(tensor_x,
+                                                         tensor_T,
+                                                         tensor_y_f,
+                                                         tensor_y_cf)
+        return processed_dataset
+
+    @staticmethod
+    def vae_loss(mu, log_var):
+        return -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+
+    @staticmethod
+    def concat_np_arr(X, Y, axis=1):
+        return np.concatenate((X, Y), axis)
+
+    @staticmethod
+    def get_device():
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    @staticmethod
+    def get_runs(params):
+        """Gets cartesian products of different parameters"""
+        Run = namedtuple("Run", params.keys())
+        runs = []
+        for v in product(*params.values()):
+            runs.append(Run(*v))
+        return runs
+
+    @staticmethod
+    def write_to_csv(file_name, list_to_write):
+        pd.DataFrame.from_dict(
+            list_to_write,
+            orient='columns'
+        ).to_csv(file_name)
+
+# Loss Functions 
+class NormalNLLLoss:
+    """Calculate negative log likelihood of normal distribution"""
+    def __call__(self, noise_z, mu, var):
+        logli = -0.5 * (var.mul(2 * np.pi) + 1e-6).log() - \
+                (noise_z - mu).pow(2).div(var.mul(2.0) + 1e-6)
+        nll = -(logli.sum(1).mean())
+        return nll
+
+# Early Stopping
+class EarlyStopping_DCN:
+    """Early stops training if validation loss doesn't improve"""
+    def __init__(self, patience=7, verbose=False, delta=0,
+                 dr_net_shared_path="Models/dr_net_phi.pth",
+                 dr_net_y1_path="Models/dr_net_y1.pth",
+                 dr_net_y0_path="Models/dr_net_y0.pth",
+                 pi_net_path="Models/pi_net.pth",
+                 mu_net_path="Models/mu_net.pth",
+                 trace_func=print):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+        self.dr_net_shared_path = dr_net_shared_path
+        self.dr_net_y1_path = dr_net_y1_path
+        self.dr_net_y0_path = dr_net_y0_path
+        self.pi_net_path = pi_net_path
+        self.mu_net_path = mu_net_path
+        self.trace_func = trace_func
+
+    def __call__(self, val_loss, dr_net_shared, dr_net_y1_model, dr_net_y0_model,
+                 pi_net_model, mu_net_model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, dr_net_shared, dr_net_y1_model, dr_net_y0_model,
+                               pi_net_model, mu_net_model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, dr_net_shared, dr_net_y1_model, dr_net_y0_model,
+                               pi_net_model, mu_net_model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, dr_net_shared, dr_net_y1_model, dr_net_y0_model,
+                       pi_net_model, mu_net_model):
+        if self.verbose:
+            self.trace_func(
+                f'Validation loss decreased ({self.val_loss_min} --> {val_loss}).  Saving model ...')
+        torch.save(dr_net_shared.state_dict(), self.dr_net_shared_path)
+        torch.save(dr_net_y1_model.state_dict(), self.dr_net_y1_path)
+        torch.save(dr_net_y0_model.state_dict(), self.dr_net_y0_path)
+        torch.save(pi_net_model.state_dict(), self.pi_net_path)
+        torch.save(mu_net_model.state_dict(), self.mu_net_path)
+        self.val_loss_min = val_loss
+
+# Data Loading
+class DataLoader:
+    def load_train_test_lalonde_random(self, csv_path, split_size=0.8):
+        np_covariates_X, np_treatment_T, np_outcomes_Y_f, np_outcomes_Y_cf, no = \
+            self.preprocess_dataset_for_training(csv_path)
+            
+        print("ps_np_covariates_X: {0}".format(np_covariates_X.shape))
+        print("ps_np_treatment_Y: {0}".format(np_treatment_T.shape))
+
+        np_train_X, np_test_X, np_train_T, np_test_T, np_train_yf, np_test_yf, np_train_ycf, np_test_ycf = \
+            Utils.test_train_split(np_covariates_X, np_treatment_T, np_outcomes_Y_f,
+                                 np_outcomes_Y_cf, split_size)
+
+        print("Numpy Train Statistics:")
+        print(np_train_X.shape)
+        print(np_train_T.shape)
+        n_treated = np_train_T[np_train_T == 1].shape[0]
+        n_total = np_train_T.shape[0]
+
+        print("Numpy test Statistics:") 
+        print(np_test_X.shape)
+        print(np_test_T.shape)
+
+        return np_train_X, np_train_T, np_train_yf, np_train_ycf, \
+               np_test_X, np_test_T, np_test_yf, np_test_ycf, n_treated, n_total
+
+    @staticmethod
+    def preprocess_dataset_for_training(csv_path):
+        data_X = np.loadtxt(csv_path, delimiter=",", skiprows=1)
+        
+        # Extract covariates: age, educ, race, married, nodegree, re74, re75
+        # Normalize continuous variables
+        x = np.zeros((data_X.shape[0], 7))
+        
+        # Continuous variables: age, educ, re74, re75  
+        x[:, 0] = (data_X[:, 2] - np.mean(data_X[:, 2])) / np.std(data_X[:, 2])  # age
+        x[:, 1] = (data_X[:, 3] - np.mean(data_X[:, 3])) / np.std(data_X[:, 3])  # educ
+        x[:, 2] = data_X[:, 4]  # race
+        x[:, 3] = data_X[:, 5]  # married
+        x[:, 4] = data_X[:, 6]  # nodegree
+        x[:, 5] = (data_X[:, 7] - np.mean(data_X[:, 7])) / np.std(data_X[:, 7])  # re74
+        x[:, 6] = (data_X[:, 8] - np.mean(data_X[:, 8])) / np.std(data_X[:, 8])  # re75
+        
+        no, dim = x.shape
+        
+        # Get treatment assignment
+        t = data_X[:, 1]
+        t = Utils.convert_to_col_vector(t)
+        
+        # Get observed outcome (re78)
+        y_obs = data_X[:, 9]
+        
+        # Normalize outcome
+        y_obs = (y_obs - np.mean(y_obs)) / np.std(y_obs)
+        
+        # Assign factual outcomes
+        y_f = Utils.convert_to_col_vector(y_obs)
+        
+        # Estimate counterfactual outcomes using treatment effect estimation
+        # Calculate average treatment effect
+        treated_mean = np.mean(y_obs[t.flatten() == 1])
+        control_mean = np.mean(y_obs[t.flatten() == 0])
+        treatment_effect = treated_mean - control_mean
+        
+        # Create counterfactuals based on treatment effect
+        y_cf = np.where(t == 1, 
+                       y_obs - treatment_effect,  # For treated: subtract effect to get control outcome
+                       y_obs + treatment_effect   # For control: add effect to get treated outcome
+                      ).reshape(-1, 1)
+
+        return x, t, y_f, y_cf, no
+
+# Neural Network Models
+class Encoder_shared(nn.Module):
+    def __init__(self, input_nodes=Constants.DRNET_INPUT_NODES,
+                 shared_nodes=Constants.Encoder_shared_nodes):
+        super().__init__()
+        self.shared1 = nn.Linear(input_nodes, shared_nodes)
+        self.shared2 = nn.Linear(shared_nodes, shared_nodes)
+        self.shared3 = nn.Linear(shared_nodes, shared_nodes)
+
+    def forward(self, x):
+        x = F.relu(self.shared1(x))
+        x = F.relu(self.shared2(x))
+        x = F.relu(self.shared3(x))
+        return x
+
+class Encoder_x(nn.Module):
+    def __init__(self, shared_nodes=Constants.Encoder_shared_nodes,
+                 out_nodes=Constants.Encoder_x_nodes):
+        super().__init__()
+        self.out = nn.Linear(shared_nodes, shared_nodes)
+        self.fc_mu = nn.Linear(shared_nodes, out_nodes)
+        self.fc_log_var = nn.Linear(shared_nodes, out_nodes)
+
+    def forward(self, x):
+        x = F.relu(self.out(x))
+        x_mu = self.fc_mu(x)
+        x_log_var = self.fc_log_var(x)
+        return x_mu, x_log_var
+
+class Encoder_t(nn.Module):
+    def __init__(self, shared_nodes=Constants.Encoder_shared_nodes,
+                 out_nodes=Constants.Encoder_t_nodes):
+        super().__init__()
+        self.out = nn.Linear(shared_nodes, shared_nodes)
+        self.fc_mu = nn.Linear(shared_nodes, out_nodes)
+        self.fc_log_var = nn.Linear(shared_nodes, out_nodes)
+
+    def forward(self, x):
+        x = F.relu(self.out(x))
+        x_mu = self.fc_mu(x)
+        x_log_var = self.fc_log_var(x)
+        return x_mu, x_log_var
+
+class Encoder_yf(nn.Module):
+    def __init__(self, shared_nodes=Constants.Encoder_shared_nodes,
+                 out_nodes=Constants.Encoder_yf_nodes):
+        super().__init__()
+        self.out = nn.Linear(shared_nodes, shared_nodes)
+        self.fc_mu = nn.Linear(shared_nodes, out_nodes)
+        self.fc_log_var = nn.Linear(shared_nodes, out_nodes)
+
+    def forward(self, x):
+        x = F.relu(self.out(x))
+        x_mu = self.fc_mu(x)
+        x_log_var = self.fc_log_var(x)
+        return x_mu, x_log_var
+
+class Encoder_ycf(nn.Module):
+    def __init__(self, shared_nodes=Constants.Encoder_shared_nodes,
+                 out_nodes=Constants.Encoder_ycf_nodes):
+        super().__init__()
+        self.out = nn.Linear(shared_nodes, shared_nodes)
+        self.fc_mu = nn.Linear(shared_nodes, out_nodes)
+        self.fc_log_var = nn.Linear(shared_nodes, out_nodes)
+
+    def forward(self, x):
+        x = F.relu(self.out(x))
+        x_mu = self.fc_mu(x)
+        x_log_var = self.fc_log_var(x)
+        return x_mu, x_log_var
+
+class Decoder(nn.Module):
+    def __init__(self, in_nodes=Constants.Decoder_in_nodes,
+                 shared_nodes=Constants.Decoder_shared_nodes,
+                 out_nodes=Constants.Decoder_out_nodes):
+        super().__init__()
+        self.shared1 = nn.Linear(in_nodes, shared_nodes)
+        self.shared2 = nn.Linear(shared_nodes, shared_nodes)
+        self.shared3 = nn.Linear(shared_nodes, shared_nodes)
+        self.out_nodes = nn.Linear(shared_nodes, out_nodes)
+
+    def forward(self, x):
+        x = F.relu(self.shared1(x))
+        x = F.relu(self.shared2(x))
+        x = F.relu(self.shared3(x))
+        x = self.out_nodes(x)
+        return x
+
+class Adversarial_VAE(nn.Module):
+    def __init__(self, encoder_input_nodes=Constants.DRNET_INPUT_NODES,
+                 encoder_shared_nodes=Constants.Encoder_shared_nodes,
+                 encoder_x_out_nodes=Constants.Encoder_x_nodes,
+                 encoder_t_out_nodes=Constants.Encoder_t_nodes,
+                 encoder_yf_out_nodes=Constants.Encoder_yf_nodes,
+                 encoder_ycf_out_nodes=Constants.Encoder_ycf_nodes,
+                 decoder_in_nodes=Constants.Decoder_in_nodes,
+                 decoder_shared_nodes=Constants.Decoder_shared_nodes,
+                 decoder_out_nodes=Constants.Decoder_out_nodes):
+        super().__init__()
+        self.encoder_shared = Encoder_shared(input_nodes=encoder_input_nodes,
+                                           shared_nodes=encoder_shared_nodes)
+        self.encoder_x = Encoder_x(shared_nodes=encoder_shared_nodes,
+                                 out_nodes=encoder_x_out_nodes)
+        self.encoder_t = Encoder_t(shared_nodes=encoder_shared_nodes,
+                                 out_nodes=encoder_t_out_nodes)
+        self.encoder_yf = Encoder_yf(shared_nodes=encoder_shared_nodes,
+                                   out_nodes=encoder_yf_out_nodes)
+        self.encoder_ycf = Encoder_ycf(shared_nodes=encoder_shared_nodes,
+                                     out_nodes=encoder_ycf_out_nodes)
+        self.decoder = Decoder(in_nodes=decoder_in_nodes,
+                             shared_nodes=decoder_shared_nodes,
+                             out_nodes=decoder_out_nodes)
+
+    def re_parametrize(self, mu, log_var):
+        if self.training:
+            std = log_var.mul(0.5).exp_()
+            eps = torch.empty_like(std).normal_()
+            return mu + eps * std
+        else:
+            return mu
+
+    def forward(self, x):
+        latent_mu_x, latent_log_var_x = self.encoder_x(self.encoder_shared(x))
+        latent_mu_t, latent_log_var_t = self.encoder_t(self.encoder_shared(x))
+        latent_mu_yf, latent_log_var_yf = self.encoder_yf(self.encoder_shared(x))
+        latent_mu_ycf, latent_log_var_ycf = self.encoder_ycf(self.encoder_shared(x))
+
+        latent_z_x = self.re_parametrize(latent_mu_x, latent_log_var_x)
+        latent_z_t = self.re_parametrize(latent_mu_t, latent_log_var_t)
+        latent_z_yf = self.re_parametrize(latent_mu_yf, latent_log_var_yf)
+        latent_z_ycf = self.re_parametrize(latent_mu_ycf, latent_log_var_ycf)
+
+        latent_z = torch.cat((latent_z_x, latent_z_t, latent_z_yf, latent_z_ycf), 1)
+        x_hat = self.decoder(latent_z)
+
+        return x_hat, latent_z, \
+               latent_mu_x, latent_log_var_x, \
+               latent_mu_t, latent_log_var_t, \
+               latent_mu_yf, latent_log_var_yf, \
+               latent_mu_ycf, latent_log_var_ycf
+
+class Generator(nn.Module):
+    def __init__(self, in_nodes=Constants.Info_GAN_Gen_in_nodes,
+                 shared_nodes=Constants.Info_GAN_Gen_shared_nodes,
+                 out_nodes=Constants.Info_GAN_Gen_out_nodes):
+        super().__init__()
+        self.shared1 = nn.Linear(in_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.shared1.weight)
+        torch.nn.init.zeros_(self.shared1.bias)
+
+        self.shared2 = nn.Linear(shared_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.shared2.weight)
+        torch.nn.init.zeros_(self.shared2.bias)
+
+        self.hidden_y0 = nn.Linear(shared_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.hidden_y0.weight)
+        torch.nn.init.zeros_(self.hidden_y0.bias)
+
+        self.out_y0 = nn.Linear(shared_nodes, out_nodes)
+        torch.nn.init.xavier_normal_(self.out_y0.weight)
+        torch.nn.init.zeros_(self.out_y0.bias)
+
+        self.hidden_y1 = nn.Linear(shared_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.hidden_y1.weight)
+        torch.nn.init.zeros_(self.hidden_y1.bias)
+
+        self.out_y1 = nn.Linear(shared_nodes, out_nodes)
+        torch.nn.init.xavier_normal_(self.out_y1.weight)
+        torch.nn.init.zeros_(self.out_y1.bias)
+
+    def forward(self, y):
+        y = F.relu(self.shared1(y))
+        y = F.relu(self.shared2(y))
+
+        y0 = F.relu(self.hidden_y0(y))
+        y0 = self.out_y0(y0)
+
+        y1 = F.relu(self.hidden_y1(y))
+        y1 = self.out_y1(y1)
+
+        return y0, y1
+
+class Discriminator(nn.Module):
+    def __init__(self, in_nodes=Constants.Info_GAN_Dis_in_nodes,
+                 shared_nodes=Constants.Info_GAN_Dis_shared_nodes,
+                 out_nodes=Constants.Info_GAN_Dis_out_nodes):
+        super().__init__()
+        self.hidden1 = nn.Linear(in_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.hidden1.weight)
+        torch.nn.init.zeros_(self.hidden1.bias)
+
+        self.hidden2 = nn.Linear(shared_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.hidden2.weight)
+        torch.nn.init.zeros_(self.hidden2.bias)
+
+        self.out = nn.Linear(shared_nodes, out_nodes)
+        torch.nn.init.xavier_normal_(self.out.weight)
+        torch.nn.init.zeros_(self.out.bias)
+
+    def forward(self, x, y0, y1):
+        x_t = torch.cat((x, y0, y1), 1)
+        x_t = F.relu(self.hidden1(x_t))
+        x_t = F.relu(self.hidden2(x_t))
+        x_t = torch.sigmoid(self.out(x_t))
+        return x_t
+
+class QHead_y0(nn.Module):
+    def __init__(self, in_nodes=Constants.Info_GAN_Q_in_nodes,
+                 shared_nodes=Constants.Info_GAN_Q_shared_nodes,
+                 out_nodes=Constants.Info_GAN_Q_out_nodes):
+        super().__init__()
+        self.hidden1 = nn.Linear(in_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.hidden1.weight)
+        torch.nn.init.zeros_(self.hidden1.bias)
+
+        self.hidden2 = nn.Linear(shared_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.hidden2.weight)
+        torch.nn.init.zeros_(self.hidden2.bias)
+
+        self.out_mu0 = nn.Linear(shared_nodes, out_nodes)
+        torch.nn.init.xavier_normal_(self.out_mu0.weight)
+        torch.nn.init.zeros_(self.out_mu0.bias)
+
+        self.out_var0 = nn.Linear(shared_nodes, out_nodes)
+        torch.nn.init.xavier_normal_(self.out_var0.weight)
+        torch.nn.init.zeros_(self.out_var0.bias)
+
+    def forward(self, x):
+        x = F.relu(self.hidden1(x))
+        x = F.relu(self.hidden2(x))
+        mu0 = self.out_mu0(x).squeeze()
+        var0 = torch.exp(self.out_var0(x).squeeze())
+        return mu0, var0
+
+class QHead_y1(nn.Module):
+    def __init__(self, in_nodes=Constants.Info_GAN_Q_in_nodes,
+                 shared_nodes=Constants.Info_GAN_Q_shared_nodes,
+                 out_nodes=Constants.Info_GAN_Q_out_nodes):
+        super().__init__()
+        self.hidden1 = nn.Linear(in_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.hidden1.weight)
+        torch.nn.init.zeros_(self.hidden1.bias)
+
+        self.hidden2 = nn.Linear(shared_nodes, shared_nodes)
+        torch.nn.init.xavier_normal_(self.hidden2.weight)
+        torch.nn.init.zeros_(self.hidden2.bias)
+
+        self.out_mu1 = nn.Linear(shared_nodes, out_nodes)
+        torch.nn.init.xavier_normal_(self.out_mu1.weight)
+        torch.nn.init.zeros_(self.out_mu1.bias)
+
+        self.out_var1 = nn.Linear(shared_nodes, out_nodes)
+        torch.nn.init.xavier_normal_(self.out_var1.weight)
+        torch.nn.init.zeros_(self.out_var1.bias)
+
+    def forward(self, x):
+        x = F.relu(self.hidden1(x))
+        x = F.relu(self.hidden2(x))
+        mu1 = self.out_mu1(x).squeeze()
+        var1 = torch.exp(self.out_var1(x).squeeze())
+        return mu1, var1
+
+class DRNetPhi(nn.Module):
+    def __init__(self, input_nodes=7, shared_nodes=200):  # Changed input_nodes to 7 for Lalonde features
+        super().__init__()
+        self.shared1 = nn.Linear(input_nodes, shared_nodes)
+        self.shared2 = nn.Linear(shared_nodes, shared_nodes)
+        self.shared3 = nn.Linear(shared_nodes, shared_nodes)
+
+    def forward(self, x):
+        if torch.cuda.is_available():
+            x = x.float().cuda()
+        else:
+            x = x.float()
+        x = F.elu(self.shared1(x))
+        x = F.elu(self.shared2(x))
+        x = F.elu(self.shared3(x))
+        return x
+
+class DRNetH_Y1(nn.Module):
+    def __init__(self, input_nodes=200, outcome_nodes=100):
+        super().__init__()
+        self.hidden1_Y1 = nn.Linear(input_nodes, outcome_nodes)
+        self.hidden2_Y1 = nn.Linear(outcome_nodes, outcome_nodes)
+        self.out_Y1 = nn.Linear(outcome_nodes, 1)
+
+    def forward(self, x):
+        if torch.cuda.is_available():
+            x = x.float().cuda()
+        else:
+            x = x.float()
+        y1 = F.elu(self.hidden1_Y1(x))
+        y1 = F.elu(self.hidden2_Y1(y1))
+        y1 = torch.sigmoid(self.out_Y1(y1))
+        return y1
+
+class DRNetH_Y0(nn.Module):
+    def __init__(self, input_nodes=200, outcome_nodes=100):
+        super().__init__()
+        self.hidden1_Y0 = nn.Linear(input_nodes, outcome_nodes)
+        self.hidden2_Y0 = nn.Linear(outcome_nodes, outcome_nodes)
+        self.out_Y0 = nn.Linear(outcome_nodes, 1)
+
+    def forward(self, x):
+        if torch.cuda.is_available():
+            x = x.float().cuda()
+        else:
+            x = x.float()
+        y0 = F.elu(self.hidden1_Y0(x))
+        y0 = F.elu(self.hidden2_Y0(y0))
+        y0 = torch.sigmoid(self.out_Y0(y0))
+        return y0
+
+class pi_net(nn.Module):
+    def __init__(self, input_nodes=7, outcome_nodes=200):  # Changed input_nodes to 7 for Lalonde features
+        super().__init__()
+        self.hidden1_pi = nn.Linear(input_nodes, outcome_nodes)
+        self.hidden2_pi = nn.Linear(outcome_nodes, outcome_nodes)
+        self.out_pi = nn.Linear(outcome_nodes, 1)
+
+    def forward(self, x):
+        if torch.cuda.is_available():
+            x = x.float().cuda()
+        else:
+            x = x.float()
+        pi = F.elu(self.hidden1_pi(x))
+        pi = F.elu(self.hidden2_pi(pi))
+        pi = torch.sigmoid(self.out_pi(pi))
+        return pi
+
+class mu_net(nn.Module):
+    def __init__(self, input_nodes=7, shared_nodes=200, outcome_nodes=100):  # Changed input_nodes to 7 for Lalonde features
+        super().__init__()
+        self.hidden1_mu = nn.Linear(input_nodes + 1, shared_nodes)  # +1 for treatment
+        self.hidden2_mu = nn.Linear(shared_nodes, outcome_nodes)
+        self.out_mu = nn.Linear(outcome_nodes, 1)
+
+    def forward(self, x, t):
+        if torch.cuda.is_available():
+            x = x.float().cuda()
+        else:
+            x = x.float()
+        x_t = torch.cat((x, t.float()), 1)
+        mu = F.elu(self.hidden1_mu(x_t))
+        mu = F.elu(self.hidden2_mu(mu))
+        mu = torch.sigmoid(self.out_mu(mu))
+        return mu
+
+# Model Managers
+class Adversarial_Manager:
+    def __init__(self, encoder_input_nodes=7,  # Changed for Lalonde features
+                 encoder_shared_nodes=Constants.Encoder_shared_nodes,
+                 encoder_x_out_nodes=Constants.Encoder_x_nodes,
+                 encoder_t_out_nodes=Constants.Encoder_t_nodes,
+                 encoder_yf_out_nodes=Constants.Encoder_yf_nodes,
+                 encoder_ycf_out_nodes=Constants.Encoder_ycf_nodes,
+                 decoder_in_nodes=Constants.Decoder_in_nodes,
+                 decoder_shared_nodes=Constants.Decoder_shared_nodes,
+                 decoder_out_nodes=7,  # Changed for Lalonde features
+                 gen_in_nodes=Constants.Info_GAN_Gen_in_nodes,
+                 gen_shared_nodes=Constants.Info_GAN_Gen_shared_nodes,
+                 gen_out_nodes=Constants.Info_GAN_Gen_out_nodes,
+                 dis_in_nodes=9,  # 7 features + 2 outcomes
+                 dis_shared_nodes=Constants.Info_GAN_Dis_shared_nodes,
+                 dis_out_nodes=Constants.Info_GAN_Dis_out_nodes,
+                 Q_in_nodes=Constants.Info_GAN_Q_in_nodes,
+                 Q_shared_nodes=Constants.Info_GAN_Q_shared_nodes,
+                 Q_out_nodes=Constants.Info_GAN_Q_out_nodes,
+                 device=None):
+        
+        self.adversarial_vae = Adversarial_VAE(encoder_input_nodes=encoder_input_nodes,
+                                             encoder_shared_nodes=encoder_shared_nodes,
+                                             encoder_x_out_nodes=encoder_x_out_nodes,
+                                             encoder_t_out_nodes=encoder_t_out_nodes,
+                                             encoder_yf_out_nodes=encoder_yf_out_nodes,
+                                             encoder_ycf_out_nodes=encoder_ycf_out_nodes,
+                                             decoder_in_nodes=decoder_in_nodes,
+                                             decoder_shared_nodes=decoder_shared_nodes,
+                                             decoder_out_nodes=decoder_out_nodes).to(device)
+
+        self.netG = Generator(in_nodes=gen_in_nodes,
+                            shared_nodes=gen_shared_nodes,
+                            out_nodes=gen_out_nodes).to(device)
+
+        self.netD = Discriminator(in_nodes=dis_in_nodes,
+                                shared_nodes=dis_shared_nodes,
+                                out_nodes=dis_out_nodes).to(device)
+
+        self.netQ0 = QHead_y0(in_nodes=Q_in_nodes,
+                            shared_nodes=Q_shared_nodes,
+                            out_nodes=Q_out_nodes).to(device)
+
+        self.netQ1 = QHead_y1(in_nodes=Q_in_nodes,
+                            shared_nodes=Q_shared_nodes,
+                            out_nodes=Q_out_nodes).to(device)
+
+    def train_adversarial_model(self, train_parameters, device):
+        epochs = train_parameters["epochs"]
+        batch_size = train_parameters["batch_size"]
+        vae_lr = train_parameters["vae_lr"]
+        gan_G_lr = train_parameters["gan_G_lr"]
+        gan_D_lr = train_parameters["gan_D_lr"]
+        weight_decay = train_parameters["lambda"]
+        shuffle = train_parameters["shuffle"]
+        train_dataset = train_parameters["train_dataset"]
+        VAE_BETA = train_parameters["VAE_BETA"]
+        INFO_GAN_LAMBDA = train_parameters["INFO_GAN_LAMBDA"]
+        INFO_GAN_ALPHA = train_parameters["INFO_GAN_ALPHA"]
+
+        train_data_loader = torch.utils.data.DataLoader(train_dataset,
+                                                      batch_size=batch_size,
+                                                      shuffle=shuffle)
+
+        adv_vae_optimizer = optim.Adam(params=self.adversarial_vae.parameters(),
+                                     lr=vae_lr, weight_decay=weight_decay)
+        D_optimizer = optim.Adam(params=self.netD.parameters(),
+                               lr=gan_G_lr,
+                               betas=(0.5, 0.999))
+        G_optimizer = optim.Adam(
+            [
+                {'params': self.netG.parameters()},
+                {'params': self.netQ0.parameters()},
+                {'params': self.netQ1.parameters()}
+            ],
+            lr=gan_D_lr,
+            betas=(0.5, 0.999))
+
+        loss_VAE_recons_MSE = nn.MSELoss()
+        loss_Q_con = NormalNLLLoss()
+        loss_D = nn.BCELoss()
+        loss_G_F = nn.MSELoss()
+
+        for epoch in range(epochs):
+            epoch += 1
+            total_loss_train = 0
+            
+            with tqdm(total=len(train_data_loader)) as t:
+                self.adversarial_vae.train()
+                
+                for batch in train_data_loader:
+                    covariates_X, T, y_f, y_cf = batch
+                    batch_n = covariates_X.size(0)
+                    covariates_X = covariates_X.to(device)
+                    T = T.to(device)
+                    T_float = T.float().to(device)
+
+                    # VAE reconstruction
+                    [covariates_X_hat, latent_z_code,
+                     latent_mu_x, latent_log_var_x,
+                     latent_mu_t, latent_log_var_t,
+                     latent_mu_yf, latent_log_var_yf,
+                     latent_mu_ycf, latent_log_var_ycf] = self.adversarial_vae(covariates_X)
+
+                    if torch.cuda.is_available():
+                        loss_recons = loss_VAE_recons_MSE(covariates_X_hat.float().cuda(),
+                                                        covariates_X.float().cuda()).to(device)
+                    else:
+                        loss_recons = loss_VAE_recons_MSE(covariates_X_hat.float(),
+                                                        covariates_X.float()).to(device)
+
+                    loss_KL_X = Utils.vae_loss(latent_mu_x, latent_log_var_x)
+                    loss_KL_T = Utils.vae_loss(latent_mu_t, latent_log_var_t)
+                    loss_KL_yf = Utils.vae_loss(latent_mu_yf, latent_log_var_yf)
+                    loss_KL_ycf = Utils.vae_loss(latent_mu_ycf, latent_log_var_ycf)
+
+                    loss_VAE = loss_recons + VAE_BETA * (loss_KL_X + loss_KL_T + loss_KL_yf + loss_KL_ycf)
+
+                    adv_vae_optimizer.zero_grad()
+                    loss_VAE.backward()
+                    adv_vae_optimizer.step()
+
+                    # GAN training
+                    self.netG.train()
+                    self.netD.train()
+                    self.netQ0.train()
+                    self.netQ1.train()
+                    
+                    latent_z_code = latent_z_code.detach()
+                    noise_z_size = (Constants.Info_GAN_Gen_in_nodes - Constants.Decoder_in_nodes)
+                    noise_z = torch.randn(batch_n, noise_z_size)
+                    noise_netG_input = torch.cat((latent_z_code, noise_z), dim=1)
+
+                    y0, y1 = self.netG(noise_netG_input)
+                    y_f_hat = T * y1 + (1 - T) * y0
+
+                    y0_sigmoid = torch.sigmoid(y0)
+                    y1_sigmoid = torch.sigmoid(y1)
+                    netD_y0 = ((1 - T) * y_f + T * y0_sigmoid).type(torch.FloatTensor)  # if t = 0
+                    netD_y1 = (T * y_f + (1 - T) * y1_sigmoid).type(torch.FloatTensor)  # if t = 1
+
+                    # Discriminator loss and gradients
+                    d_logit = self.netD(covariates_X,
+                                      netD_y0.to(device),
+                                      netD_y1.to(device))
+                    loss_Discriminator = loss_D(d_logit, T_float).to(device)
+                    D_optimizer.zero_grad()
+                    loss_Discriminator.backward(retain_graph=True)
+                    D_optimizer.step()
+
+                    if torch.cuda.is_available():
+                        loss_Generator_F = loss_G_F(y_f_hat.float().cuda(),
+                                                  y_f.float().cuda()).to(device)
+                    else:
+                        loss_Generator_F = loss_G_F(y_f_hat.float(),
+                                                  y_f.float()).to(device)
+
+                    # Generator Training
+                    d_logit = self.netD(covariates_X,
+                                      netD_y0.to(device),
+                                      netD_y1.to(device))
+                                      
+                    # Q training
+                    q_mu0, q_var0 = self.netQ0(y0)
+                    q_mu1, q_var1 = self.netQ1(y1)
+                    con_loss0 = loss_Q_con(latent_z_code, q_mu0, q_var0) * 0.1
+                    con_loss1 = loss_Q_con(latent_z_code, q_mu1, q_var1) * 0.1
+
+                    # Generator and Q losses and gradients
+                    loss_Generator = -loss_D(d_logit, T_float).to(device)
+                    loss_Info = INFO_GAN_LAMBDA * (con_loss0 + con_loss1)
+                    loss_Generator_total = loss_Generator + INFO_GAN_ALPHA * loss_Generator_F + loss_Info
+
+                    G_optimizer.zero_grad()
+                    loss_Generator_total.backward()
+                    G_optimizer.step()
+
+                    total_loss_train += loss_VAE.item() + loss_Discriminator.item() + loss_Generator_total.item()
+                    t.set_postfix(epoch='{0}'.format(epoch),
+                                loss_VAE='{:05.3f}'.format(loss_VAE.item()),
+                                loss_Discriminator='{:05.3f}'.format(loss_Discriminator.item()),
+                                loss_Generator_total='{:05.3f}'.format(loss_Generator_total.item()),
+                                loss_train='{:05.3f}'.format(total_loss_train))
+                    t.update()
+
+        torch.save(self.adversarial_vae.state_dict(), "Models/adversarial_vae.pth")
+        torch.save(self.netG.state_dict(), "Models/netG.pth")
+        torch.save(self.netD.state_dict(), "Models/netD.pth")
+        torch.save(self.netQ0.state_dict(), "Models/netQ0.pth")
+        torch.save(self.netQ1.state_dict(), "Models/netQ1.pth")
+
+    def test_adversarial_model(self, train_parameters, device):
+        eval_set = train_parameters["tensor_dataset"]
+        _data_loader = torch.utils.data.DataLoader(eval_set,
+                                                 shuffle=False)
+
+        self.adversarial_vae.eval()
+        self.netG.eval()
+        self.netD.eval()
+        self.netQ0.eval()
+        self.netQ1.eval()
+
+        ycf_list = []
+        for batch in _data_loader:
+            covariates_X, T, y_f, _ = batch
+            batch_n = covariates_X.size(0)
+            covariates_X = covariates_X.to(device)
+
+            [_, latent_z_code, _, _, _, _, _, _, _, _] = self.adversarial_vae(covariates_X)
+            latent_z_code = latent_z_code.detach()
+            
+            noise_z_size = (Constants.Info_GAN_Gen_in_nodes - Constants.Decoder_in_nodes)
+            noise_z = torch.randn(batch_n, noise_z_size)
+            noise_netG_input = torch.cat((latent_z_code, noise_z), dim=1)
+
+            y0, y1 = self.netG(noise_netG_input)
+            y0_sigmoid = torch.sigmoid(y0)
+            y1_sigmoid = torch.sigmoid(y1)
+            y_cf = T * y0 + (1 - T) * y1
+
+            ycf_list.append(y_cf.item())
+
+        return Utils.convert_to_col_vector(np.array(ycf_list))
+
+class DRNet_Manager:
+    def __init__(self, input_nodes=7,  # Changed for Lalonde's 7 features
+                 shared_nodes=200,
+                 outcome_nodes=100,
+                 device=None):
+        self.dr_net_phi = DRNetPhi(input_nodes=input_nodes,
+                                  shared_nodes=shared_nodes).to(device)
+        self.dr_net_h_y1 = DRNetH_Y1(input_nodes=shared_nodes,
+                                    outcome_nodes=outcome_nodes).to(device)
+        self.dr_net_h_y0 = DRNetH_Y0(input_nodes=shared_nodes,
+                                    outcome_nodes=outcome_nodes).to(device)
+        self.pi_net = pi_net(input_nodes=input_nodes,
+                            outcome_nodes=outcome_nodes).to(device)
+        self.mu_net = mu_net(input_nodes=input_nodes,
+                            shared_nodes=shared_nodes,
+                            outcome_nodes=outcome_nodes).to(device)
+
+    def train_DR_NET(self, train_parameters, device):
+        epochs = train_parameters["epochs"]
+        batch_size = train_parameters["batch_size"]
+        lr = train_parameters["lr"]
+        weight_decay = train_parameters["lambda"]
+        shuffle = train_parameters["shuffle"]
+        train_dataset = train_parameters["train_dataset"]
+        ALPHA = train_parameters["ALPHA"]
+        BETA = train_parameters["BETA"]
+
+        train_data_loader = torch.utils.data.DataLoader(train_dataset,
+                                                      batch_size=batch_size,
+                                                      shuffle=shuffle)
+
+        optimizer_W = optim.Adam(self.dr_net_phi.parameters(), lr=lr)
+        optimizer_V1 = optim.Adam(self.dr_net_h_y1.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer_V0 = optim.Adam(self.dr_net_h_y0.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer_pi = optim.Adam(self.pi_net.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer_mu = optim.Adam(self.mu_net.parameters(), lr=lr, weight_decay=weight_decay)
+
+        loss_F_BCE = nn.BCELoss()
+        loss_CF_BCE = nn.BCELoss()
+        loss_DR_F_MSE = nn.MSELoss()
+        loss_DR_CF_MSE = nn.MSELoss()
+        lossBCE = nn.BCELoss()
+
+        for epoch in range(epochs):
+            epoch += 1
+            total_loss_train = 0
+            
+            with tqdm(total=len(train_data_loader)) as t:
+                self.dr_net_phi.train()
+                self.dr_net_h_y0.train()
+                self.dr_net_h_y1.train()
+                self.pi_net.train()
+                self.mu_net.train()
+                
+                for batch in train_data_loader:
+                    covariates_X, T, y_f, y_cf = batch
+                    covariates_X = covariates_X.to(device)
+                    T = T.to(device)
+
+                    idx = (T == 1).squeeze()
+                    covariates_X_treated = covariates_X[idx]
+                    covariates_X_control = covariates_X[~idx]
+
+                    treated_size = covariates_X_treated.size(0)
+                    control_size = covariates_X_control.size(0)
+
+                    optimizer_W.zero_grad()
+                    optimizer_V1.zero_grad()
+                    optimizer_V0.zero_grad()
+                    optimizer_pi.zero_grad()
+                    optimizer_mu.zero_grad()
+
+                    pi = self.pi_net(covariates_X)
+                    mu = self.mu_net(covariates_X, T)
+
+                    y1_hat = self.dr_net_h_y1(self.dr_net_phi(covariates_X))
+                    y0_hat = self.dr_net_h_y0(self.dr_net_phi(covariates_X))
+
+                    T_float = T.float()
+
+                    y_f_hat = y1_hat * T_float + y0_hat * (1 - T_float)
+                    y_cf_hat = y1_hat * (1 - T_float) + y0_hat * T_float
+
+                    y_f_dr = T_float * ((T_float * y1_hat - (T_float - pi) * mu) / pi) + \
+                            (1 - T_float) * (((1 - T_float) * y0_hat - (T_float - pi) * mu) / (1 - pi))
+
+                    y_cf_dr = (1 - T_float) * (((1 - T_float) * y1_hat - (T_float - pi) * mu) / pi) + \
+                             T_float * ((T_float * y0_hat - (T_float - pi) * mu) / (1 - pi))
+
+                    loss_pi = lossBCE(pi, T_float).to(device)
+                    
+                    if torch.cuda.is_available():
+                        loss_F = loss_F_BCE(y_f_hat.float().cuda(),
+                                          y_f.float().cuda()).to(device)
+                        loss_CF = loss_CF_BCE(y_cf_hat.float().cuda(),
+                                            y_cf.float().cuda()).to(device)
+                        loss_DR_F = loss_DR_F_MSE(y_f_dr.float().cuda(),
+                                                y_f.float().cuda()).to(device)
+                        loss_DR_CF = loss_DR_CF_MSE(y_cf_dr.float().cuda(),
+                                                  y_cf.float().cuda()).to(device)
+                    else:
+                        loss_F = loss_F_BCE(y_f_hat.float(),
+                                          y_f.float()).to(device)
+                        loss_CF = loss_CF_BCE(y_cf_hat.float(),
+                                            y_cf.float()).to(device)
+                        loss_DR_F = loss_DR_F_MSE(y_f_dr.float(),
+                                                y_f.float()).to(device)
+                        loss_DR_CF = loss_DR_CF_MSE(y_cf_dr.float(),
+                                                  y_cf.float()).to(device)
+
+                    loss = loss_F + loss_CF + ALPHA * loss_pi + BETA * (loss_DR_F + loss_DR_CF)
+                    loss.backward()
+                    total_loss_train += loss_F.item() + loss_CF.item() + loss_DR_F.item() + \
+                                      loss_DR_CF.item() + loss_pi.item()
+
+                    optimizer_pi.step()
+                    optimizer_mu.step()
+                    optimizer_W.step()
+                    optimizer_V1.step()
+                    optimizer_V0.step()
+
+                    t.set_postfix(epoch='{0}'.format(epoch), loss='{:05.3f}'.format(total_loss_train))
+                    t.update()
+
+    def test_DR_NET(self, test_parameters, device):
+        eval_set = test_parameters["tensor_dataset"]
+        self.dr_net_phi.eval()
+        self.dr_net_h_y0.eval()
+        self.dr_net_h_y1.eval()
+        self.pi_net.eval()
+        self.mu_net.eval()
+
+        _data_loader = torch.utils.data.DataLoader(eval_set,
+                                                 shuffle=False)
+
+        y1_hat_list = []
+        y0_hat_list = []
+        y1_true_list = []
+        y0_true_list = []
+
+        for batch in _data_loader:
+            covariates_X, T, yf, ycf = batch
+            covariates_X = covariates_X.to(device)
+
+            y1_hat = self.dr_net_h_y1(self.dr_net_phi(covariates_X))
+            y0_hat = self.dr_net_h_y0(self.dr_net_phi(covariates_X))
+
+            y1_hat_list.append(y1_hat.item())
+            y0_hat_list.append(y0_hat.item())
+
+            y1_true = T * yf + (1 - T) * ycf
+            y0_true = (1 - T) * yf + T * ycf
+
+            y1_true_list.append(y1_true.item())
+            y0_true_list.append(y0_true.item())
+
+        return {
+            "y1_hat_list": np.array(y1_hat_list),
+            "y0_hat_list": np.array(y0_hat_list),
+            "y1_true_list": np.array(y1_true_list),
+            "y0_true_list": np.array(y0_true_list)
+        }
+
+# Metrics
+class Metrics:
+    @staticmethod
+    def PEHE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np):
+        """Calculate Precision in Estimation of Heterogeneous Effect"""
+        PEHE_val = np.sqrt(np.mean(np.square(
+            (Utils.convert_to_col_vector(y1_true_np) - Utils.convert_to_col_vector(y0_true_np)) - 
+            (Utils.convert_to_col_vector(y1_hat_np) - Utils.convert_to_col_vector(y0_hat_np)))))
+        return PEHE_val
+
+    @staticmethod
+    def ATE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np):
+        """Calculate Average Treatment Effect error"""
+        ATE_val = np.abs(np.mean(y1_true_np - y0_true_np) - np.mean(y1_hat_np - y0_hat_np))
+        return ATE_val
+
+# Main Experiment Runner
+class Experiments:
+    def __init__(self, running_mode):
+        self.dL = DataLoader()
+        self.running_mode = running_mode
+
+    def run_all_experiments(self, iterations):
+        split_size = 0.8
+        csv_path = "lalonde.csv"  # Lalonde dataset path
+        print("iterations: ", iterations)
+        print("split_size: ", split_size)
+        
+        device = Utils.get_device()
+        print(device)
+        
+        results_list = []
+        run_parameters = self.__get_run_parameters()
+        print(str(run_parameters["summary_file_name"]))
+        
+        file1 = open(run_parameters["summary_file_name"], "w")
+
+        for iter_id in range(iterations):
+            print("--" * 20)
+            print("iter_id: {0}".format(iter_id))
+            print("--" * 20)
+
+            np_train_X, np_train_T, np_train_yf, np_train_ycf, \
+            np_test_X, np_test_T, np_test_yf, np_test_ycf, n_treated, n_total = \
+                self.dL.load_train_test_lalonde_random(csv_path, split_size)
+
+            print("-----------> !! Supervised Training(DR_NET Models) !!<-----------")
+
+            tensor_train = Utils.convert_to_tensor(np_train_X, np_train_T, np_train_yf, np_train_ycf)
+
+            adv_manager = Adversarial_Manager(encoder_input_nodes=Constants.DRNET_INPUT_NODES,
+                                            encoder_shared_nodes=Constants.Encoder_shared_nodes,
+                                            encoder_x_out_nodes=Constants.Encoder_x_nodes,
+                                            encoder_t_out_nodes=Constants.Encoder_t_nodes,
+                                            encoder_yf_out_nodes=Constants.Encoder_yf_nodes,
+                                            encoder_ycf_out_nodes=Constants.Encoder_ycf_nodes,
+                                            decoder_in_nodes=Constants.Decoder_in_nodes,
+                                            decoder_shared_nodes=Constants.Decoder_shared_nodes,
+                                            decoder_out_nodes=Constants.Decoder_out_nodes,
+                                            gen_in_nodes=Constants.Info_GAN_Gen_in_nodes,
+                                            gen_shared_nodes=Constants.Info_GAN_Gen_shared_nodes,
+                                            gen_out_nodes=Constants.Info_GAN_Gen_out_nodes,
+                                            dis_in_nodes=Constants.Info_GAN_Dis_in_nodes,
+                                            dis_shared_nodes=Constants.Info_GAN_Dis_shared_nodes,
+                                            dis_out_nodes=Constants.Info_GAN_Dis_out_nodes,
+                                            Q_in_nodes=Constants.Info_GAN_Q_in_nodes,
+                                            Q_shared_nodes=Constants.Info_GAN_Q_shared_nodes,
+                                            Q_out_nodes=Constants.Info_GAN_Q_out_nodes,
+                                            device=device)
+
+            _train_parameters = {
+                "epochs": Constants.Adversarial_epochs,
+                "vae_lr": Constants.Adversarial_VAE_LR,
+                "gan_G_lr": Constants.INFO_GAN_G_LR,
+                "gan_D_lr": Constants.INFO_GAN_D_LR,
+                "lambda": Constants.Adversarial_LAMBDA,
+                "batch_size": Constants.Adversarial_BATCH_SIZE,
+                "INFO_GAN_LAMBDA": Constants.INFO_GAN_LAMBDA,
+                "INFO_GAN_ALPHA": Constants.INFO_GAN_ALPHA,
+                "shuffle": True,
+                "VAE_BETA": Constants.VAE_BETA,
+                "train_dataset": tensor_train
+            }
+
+            print("Adversarial Model Training started....")
+            adv_manager.train_adversarial_model(_train_parameters, device)
+            np_y_cf = adv_manager.test_adversarial_model({"tensor_dataset": tensor_train}, device)
+            print("Adversarial Model Training ended....")
+
+            tensor_train_dr = Utils.convert_to_tensor(np_train_X, np_train_T, np_train_yf, np_y_cf)
+            tensor_test = Utils.convert_to_tensor(np_test_X, np_test_T, np_test_yf, np_test_ycf)
+
+            _dr_train_parameters = {
+                "epochs": Constants.DRNET_EPOCHS,
+                "lr": Constants.DRNET_LR,
+                "lambda": Constants.DRNET_LAMBDA,
+                "batch_size": Constants.DRNET_BATCH_SIZE,
+                "shuffle": True,
+                "ALPHA": Constants.ALPHA,
+                "BETA": Constants.BETA,
+                "train_dataset": tensor_train_dr
+            }
+
+            drnet_manager = DRNet_Manager(input_nodes=Constants.DRNET_INPUT_NODES,
+                                        shared_nodes=Constants.DRNET_SHARED_NODES,
+                                        outcome_nodes=Constants.DRNET_OUTPUT_NODES,
+                                        device=device)
+
+            drnet_manager.train_DR_NET(_dr_train_parameters, device)
+            
+            dr_eval_out = drnet_manager.test_DR_NET({"tensor_dataset": tensor_test}, device)
+            print("---" * 20)
+            print("--> Model : DRNet Supervised Training Evaluation, Iter_id: {0}".format(iter_id))
+            drnet_PEHE_out, drnet_ATE_metric_out = \
+                self.__process_evaluated_metric(
+                    dr_eval_out["y1_hat_list"],
+                    dr_eval_out["y0_hat_list"],
+                    dr_eval_out["y1_true_list"],
+                    dr_eval_out["y0_true_list"])
+            print("drnet_PEHE_out: ", drnet_PEHE_out)
+            print("drnet_ATE_metric_out: ", drnet_ATE_metric_out)
+
+            dr_eval_in = drnet_manager.test_DR_NET({"tensor_dataset": tensor_train}, device)
+            print("---" * 20)
+            drnet_PEHE_in, drnet_ATE_metric_in = \
+                self.__process_evaluated_metric(
+                    dr_eval_in["y1_hat_list"],
+                    dr_eval_in["y0_hat_list"],
+                    dr_eval_in["y1_true_list"],
+                    dr_eval_in["y0_true_list"])
+            print("drnet_PEHE_in: ", drnet_PEHE_in)
+            print("drnet_ATE_metric_in: ", drnet_ATE_metric_in)
+
+            print("---" * 20)
+
+            result_dict = OrderedDict()
+            result_dict["iter_id"] = iter_id
+            result_dict["drnet_PEHE_out"] = drnet_PEHE_out
+            result_dict["drnet_ATE_metric_out"] = drnet_ATE_metric_out
+            result_dict["drnet_PEHE_in"] = drnet_PEHE_in
+            result_dict["drnet_ATE_metric_in"] = drnet_ATE_metric_in
+
+            file1.write("\nToday's date: {0}\n".format(date.today()))
+            file1.write("Iter: {0}, PEHE_DR_NET_out: {1}, ATE_DR_NET_out: {2}, "
+                       "PEHE_DR_NET_in: {3}, ATE_DR_NET_in: {4}, \n"
+                       .format(iter_id, drnet_PEHE_out,
+                               drnet_ATE_metric_out,
+                               drnet_PEHE_in,
+                               drnet_ATE_metric_in))
+            results_list.append(result_dict)
+
+        PEHE_set_drnet_out = []
+        ATE_Metric_set_drnet_out = []
+        PEHE_set_drnet_in = []
+        ATE_Metric_set_drnet_in = []
+
+        for result in results_list:
+            PEHE_set_drnet_out.append(result["drnet_PEHE_out"])
+            ATE_Metric_set_drnet_out.append(result["drnet_ATE_metric_out"])
+            PEHE_set_drnet_in.append(result["drnet_PEHE_in"])
+            ATE_Metric_set_drnet_in.append(result["drnet_ATE_metric_in"])
+
+        PEHE_set_drnet_mean_out = np.mean(np.array(PEHE_set_drnet_out))
+        PEHE_set_drnet_std_out = np.std(PEHE_set_drnet_out)
+        ATE_Metric_set_drnet_mean_out = np.mean(np.array(ATE_Metric_set_drnet_out))
+        ATE_Metric_set_drnet_std_out = np.std(ATE_Metric_set_drnet_out)
+
+        PEHE_set_drnet_mean_in = np.mean(np.array(PEHE_set_drnet_in))
+        PEHE_set_drnet_std_in = np.std(PEHE_set_drnet_in)
+        ATE_Metric_set_drnet_mean_in = np.mean(np.array(ATE_Metric_set_drnet_in))
+        ATE_Metric_set_drnet_std_in = np.std(ATE_Metric_set_drnet_in)
+
+        print("----------------- !!DR_Net Models(Results) !! ------------------------")
+        print("--" * 20)
+        print("DR_NET, PEHE_out: {0}, SD: {1}"
+              .format(PEHE_set_drnet_mean_out, PEHE_set_drnet_std_out))
+        print("DR_NET, ATE Metric_out: {0}, SD: {1}"
+              .format(ATE_Metric_set_drnet_mean_out, ATE_Metric_set_drnet_std_out))
+        print("--" * 20)
+        print("DR_NET, PEHE_in: {0}, SD: {1}"
+              .format(PEHE_set_drnet_mean_in, PEHE_set_drnet_std_in))
+        print("DR_NET, ATE Metric_in: {0}, SD: {1}"
+              .format(ATE_Metric_set_drnet_mean_in, ATE_Metric_set_drnet_std_in))
+        print("--" * 20)
+
+        file1.write("\n#####################")
+        file1.write("\n---------------------")
+        file1.write("\nDR_NET, PEHE_out: {0}, SD: {1}"
+                    .format(PEHE_set_drnet_mean_out, PEHE_set_drnet_std_out))
+        file1.write("\nDR_NET, ATE Metric_out: {0}, SD: {1}"
+                    .format(ATE_Metric_set_drnet_mean_out,
+                            ATE_Metric_set_drnet_std_out))
+        file1.write("\nDR_NET, PEHE_in: {0}, SD: {1}"
+                    .format(PEHE_set_drnet_mean_in, PEHE_set_drnet_std_in))
+        file1.write("\nDR_NET, ATE Metric_in: {0}, SD: {1}"
+                    .format(ATE_Metric_set_drnet_mean_in,
+                            ATE_Metric_set_drnet_std_in))
+
+        Utils.write_to_csv(run_parameters["consolidated_file_path"], results_list)
+
+    def __get_run_parameters(self):
+        run_parameters = {}
+        if self.running_mode == "original_data":
+            run_parameters["input_nodes"] = 7  # Changed for Lalonde dataset
+            run_parameters["consolidated_file_path"] = "Results/Results_consolidated.csv"
+            run_parameters["summary_file_name"] = "Results/Lalonde_Stats.txt"
+            run_parameters["is_synthetic"] = False
+        elif self.running_mode == "synthetic_data":
+            run_parameters["input_nodes"] = 75
+            run_parameters["is_synthetic"] = True
+        return run_parameters
+
+    @staticmethod
+    def __process_evaluated_metric(y1_hat, y0_hat, y1_true, y0_true):
+        y1_true_np = np.array(y1_true)
+        y0_true_np = np.array(y0_true)
+        y1_hat_np = np.array(y1_hat)
+        y0_hat_np = np.array(y0_hat)
+
+        PEHE = Metrics.PEHE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np)
+        ATE = Metrics.ATE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np)
+        print("PEHE: {0}".format(PEHE))
+        print("ATE: {0}".format(ATE))
+        return PEHE, ATE
+
+# Main execution
+if __name__ == '__main__':
+    print("Using Lalonde dataset")
+    running_mode = "original_data"
+    original_exp = Experiments(running_mode)
+    original_exp.run_all_experiments(iterations=1)
