@@ -111,3 +111,21 @@
                             shared_nodes=Q_shared_nodes,
                             out_nodes=Q_out_nodes).to(device)
 
+
+
+
+
+
+
+
+
+
+
+means_X = np.empty((len(np_test_X), Constants.Encoder_x_nodes))
+means_yf = np.empty((len(np_test_X), 1))
+means_ycf = np.empty((len(np_test_X), 1))
+means_T = np.empty((len(np_test_X), 1))
+
+labels_yf = np.empty((len(np_test_X), 1))
+labels_T = np.empty((len(np_test_X), 1))
+labels_ycf = np.empty((len(np_test_X), 1))
