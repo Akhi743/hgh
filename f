@@ -46,3 +46,68 @@
         # print(y_f[1])
         # print(y_cf[1])
         return x, t, y_f, y_cf, no
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        class Adversarial_Manager:
+    def __init__(self, encoder_input_nodes=7,  # Changed for Lalonde features
+                 encoder_shared_nodes=Constants.Encoder_shared_nodes,
+                 encoder_x_out_nodes=Constants.Encoder_x_nodes,
+                 encoder_t_out_nodes=Constants.Encoder_t_nodes,
+                 encoder_yf_out_nodes=Constants.Encoder_yf_nodes,
+                 encoder_ycf_out_nodes=Constants.Encoder_ycf_nodes,
+                 decoder_in_nodes=Constants.Decoder_in_nodes,
+                 decoder_shared_nodes=Constants.Decoder_shared_nodes,
+                 decoder_out_nodes=7,  # Changed for Lalonde features
+                 gen_in_nodes=Constants.Info_GAN_Gen_in_nodes,
+                 gen_shared_nodes=Constants.Info_GAN_Gen_shared_nodes,
+                 gen_out_nodes=Constants.Info_GAN_Gen_out_nodes,
+                 dis_in_nodes=9,  # 7 features + 2 outcomes
+                 dis_shared_nodes=Constants.Info_GAN_Dis_shared_nodes,
+                 dis_out_nodes=Constants.Info_GAN_Dis_out_nodes,
+                 Q_in_nodes=Constants.Info_GAN_Q_in_nodes,
+                 Q_shared_nodes=Constants.Info_GAN_Q_shared_nodes,
+                 Q_out_nodes=Constants.Info_GAN_Q_out_nodes,
+                 device=None):
+        self.adversarial_vae = Adversarial_VAE(encoder_input_nodes=encoder_input_nodes,
+                                             encoder_shared_nodes=encoder_shared_nodes,
+                                             encoder_x_out_nodes=encoder_x_out_nodes,
+                                             encoder_t_out_nodes=encoder_t_out_nodes,
+                                             encoder_yf_out_nodes=encoder_yf_out_nodes,
+                                             encoder_ycf_out_nodes=encoder_ycf_out_nodes,
+                                             decoder_in_nodes=decoder_in_nodes,
+                                             decoder_shared_nodes=decoder_shared_nodes,
+                                             decoder_out_nodes=decoder_out_nodes).to(device)
+
+        self.netG = Generator(in_nodes=gen_in_nodes,
+                            shared_nodes=gen_shared_nodes,
+                            out_nodes=gen_out_nodes).to(device)
+
+        self.netD = Discriminator(in_nodes=dis_in_nodes,
+                                shared_nodes=dis_shared_nodes,
+                                out_nodes=dis_out_nodes).to(device)
+
+        self.netQ0 = QHead_y0(in_nodes=Q_in_nodes,
+                            shared_nodes=Q_shared_nodes,
+                            out_nodes=Q_out_nodes).to(device)
+
+        self.netQ1 = QHead_y1(in_nodes=Q_in_nodes,
+                            shared_nodes=Q_shared_nodes,
+                            out_nodes=Q_out_nodes).to(device)
+
