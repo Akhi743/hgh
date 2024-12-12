@@ -582,9 +582,10 @@ class DRNetH_Y1(nn.Module):
             x = x.float()
         y1 = F.elu(self.hidden1_Y1(x))
         y1 = F.elu(self.hidden2_Y1(y1))
-        y1 = torch.sigmoid(self.out_Y1(y1))
+        y1 = self.out_Y1(y1)  # Remove sigmoid activation
         return y1
 
+# Update DRNetH_Y0 class to remove sigmoid activation
 class DRNetH_Y0(nn.Module):
     def __init__(self, input_nodes=200, outcome_nodes=100):
         super().__init__()
@@ -599,7 +600,7 @@ class DRNetH_Y0(nn.Module):
             x = x.float()
         y0 = F.elu(self.hidden1_Y0(x))
         y0 = F.elu(self.hidden2_Y0(y0))
-        y0 = torch.sigmoid(self.out_Y0(y0))
+        y0 = self.out_Y0(y0)  # Remove sigmoid activation
         return y0
 
 class pi_net(nn.Module):
@@ -899,23 +900,24 @@ class DRNet_Manager:
         optimizer_pi = optim.Adam(self.pi_net.parameters(), lr=lr, weight_decay=weight_decay)
         optimizer_mu = optim.Adam(self.mu_net.parameters(), lr=lr, weight_decay=weight_decay)
 
-        loss_F_BCE = nn.BCELoss()
-        loss_CF_BCE = nn.BCELoss()
+    # Change loss functions to MSE
+        loss_F_MSE = nn.MSELoss()
+        loss_CF_MSE = nn.MSELoss()
         loss_DR_F_MSE = nn.MSELoss()
         loss_DR_CF_MSE = nn.MSELoss()
-        lossBCE = nn.BCELoss()
+        lossBCE = nn.BCELoss()  # Keep BCE only for propensity scores
 
         for epoch in range(epochs):
             epoch += 1
             total_loss_train = 0
-            
+        
             with tqdm(total=len(train_data_loader)) as t:
                 self.dr_net_phi.train()
                 self.dr_net_h_y0.train()
                 self.dr_net_h_y1.train()
                 self.pi_net.train()
                 self.mu_net.train()
-                
+            
                 for batch in train_data_loader:
                     covariates_X, T, y_f, y_cf = batch
                     covariates_X = covariates_X.to(device)
@@ -952,25 +954,17 @@ class DRNet_Manager:
                              T_float * ((T_float * y0_hat - (T_float - pi) * mu) / (1 - pi))
 
                     loss_pi = lossBCE(pi, T_float).to(device)
-                    
+
                     if torch.cuda.is_available():
-                        loss_F = loss_F_BCE(y_f_hat.float().cuda(),
-                                          y_f.float().cuda()).to(device)
-                        loss_CF = loss_CF_BCE(y_cf_hat.float().cuda(),
-                                            y_cf.float().cuda()).to(device)
-                        loss_DR_F = loss_DR_F_MSE(y_f_dr.float().cuda(),
-                                                y_f.float().cuda()).to(device)
-                        loss_DR_CF = loss_DR_CF_MSE(y_cf_dr.float().cuda(),
-                                                  y_cf.float().cuda()).to(device)
+                        loss_F = loss_F_MSE(y_f_hat.float().cuda(), y_f.float().cuda()).to(device)
+                        loss_CF = loss_CF_MSE(y_cf_hat.float().cuda(), y_cf.float().cuda()).to(device)
+                        loss_DR_F = loss_DR_F_MSE(y_f_dr.float().cuda(), y_f.float().cuda()).to(device)
+                        loss_DR_CF = loss_DR_CF_MSE(y_cf_dr.float().cuda(), y_cf.float().cuda()).to(device)
                     else:
-                        loss_F = loss_F_BCE(y_f_hat.float(),
-                                          y_f.float()).to(device)
-                        loss_CF = loss_CF_BCE(y_cf_hat.float(),
-                                            y_cf.float()).to(device)
-                        loss_DR_F = loss_DR_F_MSE(y_f_dr.float(),
-                                                y_f.float()).to(device)
-                        loss_DR_CF = loss_DR_CF_MSE(y_cf_dr.float(),
-                                                  y_cf.float()).to(device)
+                        loss_F = loss_F_MSE(y_f_hat.float(), y_f.float()).to(device)
+                        loss_CF = loss_CF_MSE(y_cf_hat.float(), y_cf.float()).to(device)
+                        loss_DR_F = loss_DR_F_MSE(y_f_dr.float(), y_f.float()).to(device)
+                        loss_DR_CF = loss_DR_CF_MSE(y_cf_dr.float(), y_cf.float()).to(device)
 
                     loss = loss_F + loss_CF + ALPHA * loss_pi + BETA * (loss_DR_F + loss_DR_CF)
                     loss.backward()
