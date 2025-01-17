@@ -1,0 +1,1 @@
+python main_ganite.py --data_name lalonde --train_rate 0.8 --h_dim 30 --iteration 10000 --batch_size 256 --alpha 1
