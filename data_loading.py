@@ -16,6 +16,7 @@ Note: Load real-world individualized treatment effects estimation datasets
 import numpy as np
 import pandas as pd
 from scipy.special import expit
+from sklearn.preprocessing import StandardScaler
 
 def data_loading_lalonde(train_rate = 0.8):
     """Load LaLonde data.
@@ -34,38 +35,33 @@ def data_loading_lalonde(train_rate = 0.8):
     
     # Load original data
     try:
-        data = pd.read_csv("Dataset/lalonde.csv")
-    except Exception as e:
-        raise ValueError(f"Error loading Dataset/lalonde.csv: {str(e)}")
+        ori_data = pd.read_csv("Dataset/lalonde.csv")
+        print("Available columns:", ori_data.columns.tolist())
+    except:
+        raise ValueError("Cannot find Dataset/lalonde.csv")
     
-    # Drop the unnamed index column
-    if 'Unnamed: 0' in data.columns:
-        data = data.drop('Unnamed: 0', axis=1)
+    # Create feature matrix
+    feature_columns = ['age', 'educ', 'race', 'married', 'nodegree', 're74', 're75']
+    data = ori_data[feature_columns].copy()
     
-    # Create dummy variables for race
-    race_dummies = pd.get_dummies(data['race'], prefix='race')
+    # Create dummy variables for categorical variables
+    data = pd.get_dummies(data, columns=['race'], prefix=['race'])
     
-    # Drop original race column and join with dummy variables
-    data = data.drop('race', axis=1)
-    data = pd.concat([data, race_dummies], axis=1)
+    # Define continuous and binary features
+    continuous_features = ['age', 'educ', 're74', 're75']
+    binary_features = ['married', 'nodegree'] + [col for col in data.columns if col.startswith('race_')]
     
-    # Define features (excluding treatment and outcome)
-    feature_columns = ['age', 'educ', 'married', 'nodegree', 're74', 're75'] + list(race_dummies.columns)
+    # Apply StandardScaler to continuous features
+    scaler = StandardScaler()
+    data[continuous_features] = scaler.fit_transform(data[continuous_features])
     
-    # Extract features
-    x = data[feature_columns].values
+    # Convert to numpy array
+    x = data.values
     no, dim = x.shape
     
-    # Normalize continuous features (age, educ, re74, re75)
-    continuous_features = [0, 1, 4, 5]  # indices of continuous features
-    for i in continuous_features:
-        mean_val = np.mean(x[:, i])
-        std_val = np.std(x[:, i])
-        x[:, i] = (x[:, i] - mean_val) / (std_val + 1e-8)
-    
     # Get treatment and outcome
-    t = data['treat'].values
-    y = data['re78'].values
+    t = ori_data['treat'].values
+    y = ori_data['re78'].values
     
     # Create potential outcomes
     potential_y = np.zeros((no, 2))
@@ -109,9 +105,8 @@ def data_loading_lalonde(train_rate = 0.8):
     test_x = x[test_idx, :]
     test_potential_y = potential_y[test_idx, :]
     
-    # Print shape information for debugging
+    # Print shapes for debugging
     print(f"Features shape: {x.shape}")
-    print(f"Feature columns: {feature_columns}")
-    print(f"Created {len(race_dummies.columns)} race dummy variables")
+    print(f"Feature columns: {list(data.columns)}")
     
     return train_x, train_t, train_y, train_potential_y, test_x, test_potential_y
