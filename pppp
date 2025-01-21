@@ -61,11 +61,11 @@ def data_loading_lalonde(train_rate = 0.8):
     
     # Get treatment and outcome
     t = ori_data['treat'].values
-    y = ori_data['re78'].values.reshape(-1, 1)
+    y = ori_data['re78'].values
     
     # Apply MinMaxScaler to outcomes
     minmax_scaler = MinMaxScaler(feature_range=(0, 1))
-    y_scaled = minmax_scaler.fit_transform(y)
+    y_scaled = minmax_scaler.fit_transform(y.reshape(-1, 1)).flatten()
     
     # Create potential outcomes
     potential_y = np.zeros((no, 2))
@@ -74,13 +74,8 @@ def data_loading_lalonde(train_rate = 0.8):
     treated_idx = t == 1
     control_idx = t == 0
     
-    potential_y[treated_idx, 1] = y[treated_idx]  # Observed treated outcomes
-    potential_y[control_idx, 0] = y[control_idx]  # Observed control outcomes
-    
-    # Scale potential outcomes
-    potential_y_reshaped = potential_y.reshape(-1, 1)
-    potential_y_scaled = minmax_scaler.transform(potential_y_reshaped)
-    potential_y = potential_y_scaled.reshape(-1, 2)
+    potential_y[treated_idx, 1] = y_scaled[treated_idx]  # Observed treated outcomes
+    potential_y[control_idx, 0] = y_scaled[control_idx]  # Observed control outcomes
     
     # Estimate counterfactuals (using scaled values)
     treated_mean = np.mean(y_scaled[treated_idx])
@@ -97,9 +92,8 @@ def data_loading_lalonde(train_rate = 0.8):
     # Ensure scaled values stay in [0,1] range
     potential_y = np.clip(potential_y, 0, 1)
     
-    # Reshape treatment and flatten scaled outcomes
+    # Reshape treatment
     t = t.reshape(-1)
-    y = y_scaled.reshape(-1)
     
     # Train/test division
     idx = np.random.permutation(no)
@@ -108,7 +102,7 @@ def data_loading_lalonde(train_rate = 0.8):
     
     train_x = x[train_idx, :]
     train_t = t[train_idx]
-    train_y = y[train_idx]
+    train_y = y_scaled[train_idx]
     train_potential_y = potential_y[train_idx, :]
     
     test_x = x[test_idx, :]
