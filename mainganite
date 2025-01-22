@@ -1,0 +1,105 @@
+"""GANITE Codebase.
+
+main_ganite.py"""
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import argparse
+import numpy as np
+import warnings
+warnings.filterwarnings("ignore")
+
+from ganite import ganite
+from data_loading import data_loading_lalonde
+from metrics import PEHE, ATE
+
+def inverse_scale_outcomes(y_scaled, scaler_dict):
+    """Convert scaled outcomes back to original scale."""
+    y_min = scaler_dict['y_min']
+    y_max = scaler_dict['y_max']
+    return y_scaled * (y_max - y_min) + y_min
+
+def main(args):
+    """Main function for GANITE experiments."""
+    ## Data loading
+    train_x, train_t, train_y, train_potential_y, test_x, test_potential_y, scaler_dict = \
+    data_loading_lalonde(args.train_rate)
+    
+    print(args.data_name + ' dataset is ready.')
+    
+    ## Potential outcome estimations by GANITE
+    parameters = dict()    
+    parameters['h_dim'] = args.h_dim
+    parameters['iteration'] = args.iteration
+    parameters['batch_size'] = args.batch_size
+    parameters['alpha'] = args.alpha
+    
+    test_y_hat = ganite(train_x, train_t, train_y, test_x, parameters)
+    print('Finish GANITE training and potential outcome estimations')
+    
+    ## Convert predictions back to original scale
+    test_y_hat_original = inverse_scale_outcomes(test_y_hat, scaler_dict)
+    test_potential_y_original = inverse_scale_outcomes(test_potential_y, scaler_dict)
+    
+    ## Performance metrics
+    # Compute metrics on normalized scale
+    metric_results = dict()
+    metric_results['PEHE_normalized'] = np.round(PEHE(test_potential_y, test_y_hat), 4)
+    metric_results['ATE_normalized'] = np.round(ATE(test_potential_y, test_y_hat), 4)
+    
+    # Compute metrics on original scale
+    metric_results['PEHE_original'] = np.round(np.sqrt(np.mean(np.square(
+        (test_potential_y_original[:,1] - test_potential_y_original[:,0]) - 
+        (test_y_hat_original[:,1] - test_y_hat_original[:,0])))), 4)
+    
+    metric_results['ATE_original'] = np.round(np.abs(
+        np.mean(test_potential_y_original[:,1] - test_potential_y_original[:,0]) - 
+        np.mean(test_y_hat_original[:,1] - test_y_hat_original[:,0])), 4)
+    
+    # Print sample predictions for verification
+    print("\nSample Predictions (Original Scale):")
+    print("First 5 control outcomes (0):", test_y_hat_original[:5,0])
+    print("First 5 treated outcomes (1):", test_y_hat_original[:5,1])
+    print("\nMetrics:")
+    for metric, value in metric_results.items():
+        print(f"{metric}: {value}")
+    
+    return test_y_hat_original, metric_results
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--data_name',
+        choices=['lalonde'],
+        default='lalonde',
+        type=str)
+    parser.add_argument(
+        '--train_rate',
+        help='the ratio of training data',
+        default=0.8,
+        type=float)
+    parser.add_argument(
+        '--h_dim',
+        help='hidden state dimensions (should be optimized)',
+        default=30,
+        type=int)
+    parser.add_argument(
+        '--iteration',
+        help='Training iterations (should be optimized)',
+        default=10000,
+        type=int)
+    parser.add_argument(
+        '--batch_size',
+        help='the number of samples in mini-batch (should be optimized)',
+        default=256,
+        type=int)
+    parser.add_argument(
+        '--alpha',
+        help='hyper-parameter to adjust the loss importance (should be optimized)',
+        default=1,
+        type=int)
+    
+    args = parser.parse_args()
+    test_y_hat, metrics = main(args)
