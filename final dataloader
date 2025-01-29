@@ -8,6 +8,7 @@ from Utils import Utils
 class DataLoader:
     def __init__(self):
         self.outcome_scaler = StandardScaler()
+        self.feature_scaler = StandardScaler()
         
     def load_train_test_lalonde_random(self, csv_path, split_size=0.8):
         # Data preprocessing
@@ -16,10 +17,6 @@ class DataLoader:
             
         print("ps_np_covariates_X: {0}".format(np_covariates_X.shape))
         print("ps_np_treatment_Y: {0}".format(np_treatment_T.shape))
-
-        idx = np.random.permutation(no)
-        train_idx = idx[:int(split_size * no)]
-        test_idx = idx[int(split_size * no):]
 
         np_train_X, np_test_X, np_train_T, np_test_T, np_train_yf, np_test_yf, np_train_ycf, np_test_ycf = \
             Utils.test_train_split(np_covariates_X, np_treatment_T, np_outcomes_Y_f,
@@ -51,9 +48,8 @@ class DataLoader:
         feature_cols = ['age', 'married', 'educ', 'nodegree', 're74', 're75'] + [col for col in df.columns if col.startswith('race_')]
         
         # Standardize continuous variables
-        scaler = StandardScaler()
         continuous_cols = ['age', 'educ', 're74', 're75']
-        df[continuous_cols] = scaler.fit_transform(df[continuous_cols])
+        df[continuous_cols] = self.feature_scaler.fit_transform(df[continuous_cols])
         
         # Prepare X, T, Y
         x = df[feature_cols].values
@@ -66,13 +62,11 @@ class DataLoader:
         
         # Observed outcome (re78)
         y_f = df['re78'].values.reshape(-1, 1)
-        # Store original scale information
-        self.outcome_scaler.fit(y_f)
         # Standardize outcome
-        y_f = self.outcome_scaler.transform(y_f)
+        y_f = self.outcome_scaler.fit_transform(y_f)
         y_f = y_f.astype(np.float32)
         
-        # Generate synthetic counterfactuals
+        # Generate synthetic counterfactuals using a simple linear model
         coef = np.random.uniform(-0.01, 0.01, size=[dim, 1]).astype(np.float32)
         z = np.matmul(x, coef)
         noise = np.random.normal(0, 0.01, size=[no, 1]).astype(np.float32)
@@ -91,6 +85,6 @@ class DataLoader:
         
         return x, t, y_f, y_cf, no
 
-    def inverse_transform_outcomes(self, outcomes):
-        """Transform standardized outcomes back to original scale"""
-        return self.outcome_scaler.inverse_transform(outcomes.reshape(-1, 1)).flatten()
+    def inverse_transform_outcomes(self, y):
+        """Rescale predictions back to original scale"""
+        return self.outcome_scaler.inverse_transform(y.reshape(-1, 1))
