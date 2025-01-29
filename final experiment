@@ -10,7 +10,6 @@ from Metrics import Metrics
 from Utils import Utils
 from dataloader import DataLoader
 
-
 class Experiments:
     def __init__(self, running_mode):
         self.dL = DataLoader()
@@ -29,20 +28,164 @@ class Experiments:
         run_parameters = self.__get_run_parameters()
         print(str(run_parameters["summary_file_name"]))
         file1 = open(run_parameters["summary_file_name"], "w")
+        
+        for iter_id in range(iterations):
+            print("--" * 20)
+            print("iter_id: {0}".format(iter_id))
+            print("--" * 20)
 
-        # ... [previous code remains the same until the results collection]
+            np_train_X, np_train_T, np_train_yf, np_train_ycf, \
+            np_test_X, np_test_T, np_test_yf, np_test_ycf, n_treated, n_total = \
+                self.dL.load_train_test_lalonde_random(csv_path,
+                                                     split_size)
+
+            print("-----------> !! Supervised Training(DR_NET Models) !!<-----------")
+
+            tensor_train = Utils.convert_to_tensor(np_train_X, np_train_T, np_train_yf, np_train_ycf)
+
+            adv_manager = Adversarial_Manager(encoder_input_nodes=Constants.DRNET_INPUT_NODES,
+                                              encoder_shared_nodes=Constants.Encoder_shared_nodes,
+                                              encoder_x_out_nodes=Constants.Encoder_x_nodes,
+                                              encoder_t_out_nodes=Constants.Encoder_t_nodes,
+                                              encoder_yf_out_nodes=Constants.Encoder_yf_nodes,
+                                              encoder_ycf_out_nodes=Constants.Encoder_ycf_nodes,
+                                              decoder_in_nodes=Constants.Decoder_in_nodes,
+                                              decoder_shared_nodes=Constants.Decoder_shared_nodes,
+                                              decoder_out_nodes=Constants.Decoder_out_nodes,
+                                              gen_in_nodes=Constants.Info_GAN_Gen_in_nodes,
+                                              gen_shared_nodes=Constants.Info_GAN_Gen_shared_nodes,
+                                              gen_out_nodes=Constants.Info_GAN_Gen_out_nodes,
+                                              dis_in_nodes=Constants.Info_GAN_Dis_in_nodes,
+                                              dis_shared_nodes=Constants.Info_GAN_Dis_shared_nodes,
+                                              dis_out_nodes=Constants.Info_GAN_Dis_out_nodes,
+                                              Q_in_nodes=Constants.Info_GAN_Q_in_nodes,
+                                              Q_shared_nodes=Constants.Info_GAN_Q_shared_nodes,
+                                              Q_out_nodes=Constants.Info_GAN_Q_out_nodes,
+                                              device=device)
+
+            _train_parameters = {
+                "epochs": Constants.Adversarial_epochs,
+                "vae_lr": Constants.Adversarial_VAE_LR,
+                "gan_G_lr": Constants.INFO_GAN_G_LR,
+                "gan_D_lr": Constants.INFO_GAN_D_LR,
+                "lambda": Constants.Adversarial_LAMBDA,
+                "batch_size": Constants.Adversarial_BATCH_SIZE,
+                "INFO_GAN_LAMBDA": Constants.INFO_GAN_LAMBDA,
+                "INFO_GAN_ALPHA": Constants.INFO_GAN_ALPHA,
+                "shuffle": True,
+                "VAE_BETA": Constants.VAE_BETA,
+                "train_dataset": tensor_train
+            }
+
+            print("Adversarial Model Training started....")
+            adv_manager.train_adversarial_model(_train_parameters, device)
+            np_y_cf = adv_manager.test_adversarial_model({"tensor_dataset": tensor_train}, device)
+            print("Adversarial Model Training ended....")
+
+            tensor_train_dr = Utils.convert_to_tensor(np_train_X, np_train_T, np_train_yf, np_y_cf)
+            tensor_test = Utils.convert_to_tensor(np_test_X, np_test_T, np_test_yf, np_test_ycf)
+            
+            _dr_train_parameters = {
+                "epochs": Constants.DRNET_EPOCHS,
+                "lr": Constants.DRNET_LR,
+                "lambda": Constants.DRNET_LAMBDA,
+                "batch_size": Constants.DRNET_BATCH_SIZE,
+                "shuffle": True,
+                "ALPHA": Constants.ALPHA,
+                "BETA": Constants.BETA,
+                "train_dataset": tensor_train_dr
+            }
+            
+            drnet_manager = DRNet_Manager(input_nodes=Constants.DRNET_INPUT_NODES,
+                                          shared_nodes=Constants.DRNET_SHARED_NODES,
+                                          outcome_nodes=Constants.DRNET_OUTPUT_NODES,
+                                          device=device)
+                                          
+            drnet_manager.train_DR_NET(_dr_train_parameters, device)
+            dr_eval_out = drnet_manager.test_DR_NET({"tensor_dataset": tensor_test}, device)
+            
+            # Rescale predictions and true values back to original scale
+            y1_hat_rescaled = self.dL.inverse_transform_outcomes(dr_eval_out["y1_hat_list"])
+            y0_hat_rescaled = self.dL.inverse_transform_outcomes(dr_eval_out["y0_hat_list"])
+            y1_true_rescaled = self.dL.inverse_transform_outcomes(dr_eval_out["y1_true_list"])
+            y0_true_rescaled = self.dL.inverse_transform_outcomes(dr_eval_out["y0_true_list"])
+            
+            print("---" * 20)
+            print("--> Model : DRNet Supervised Training Evaluation, Iter_id: {0}".format(iter_id))
+            
+            # Calculate metrics using rescaled values
+            drnet_PEHE_out, drnet_ATE_metric_out = \
+                self.__process_evaluated_metric(
+                    y1_hat_rescaled,
+                    y0_hat_rescaled,
+                    y1_true_rescaled,
+                    y0_true_rescaled)
+                    
+            print("drnet_PEHE_out: ", drnet_PEHE_out)
+            print("drnet_ATE_metric_out: ", drnet_ATE_metric_out)
+
+            # Evaluate on training set
+            dr_eval_in = drnet_manager.test_DR_NET({"tensor_dataset": tensor_train}, device)
+            
+            # Rescale training set predictions and true values
+            y1_hat_rescaled_in = self.dL.inverse_transform_outcomes(dr_eval_in["y1_hat_list"])
+            y0_hat_rescaled_in = self.dL.inverse_transform_outcomes(dr_eval_in["y0_hat_list"])
+            y1_true_rescaled_in = self.dL.inverse_transform_outcomes(dr_eval_in["y1_true_list"])
+            y0_true_rescaled_in = self.dL.inverse_transform_outcomes(dr_eval_in["y0_true_list"])
+            
+            print("---" * 20)
+            drnet_PEHE_in, drnet_ATE_metric_in = \
+                self.__process_evaluated_metric(
+                    y1_hat_rescaled_in,
+                    y0_hat_rescaled_in,
+                    y1_true_rescaled_in,
+                    y0_true_rescaled_in)
+                    
+            print("drnet_PEHE_in: ", drnet_PEHE_in)
+            print("drnet_ATE_metric_in: ", drnet_ATE_metric_in)
+
+            # Save results
+            result_dict = OrderedDict()
+            result_dict["iter_id"] = iter_id
+            result_dict["drnet_PEHE_out"] = drnet_PEHE_out
+            result_dict["drnet_ATE_metric_out"] = drnet_ATE_metric_out
+            result_dict["drnet_PEHE_in"] = drnet_PEHE_in
+            result_dict["drnet_ATE_metric_in"] = drnet_ATE_metric_in
+
+            # Calculate average treatment effects in dollars
+            ate_predicted = np.mean(y1_hat_rescaled - y0_hat_rescaled)
+            ate_true = np.mean(y1_true_rescaled - y0_true_rescaled)
+            
+            result_dict["ate_predicted"] = ate_predicted
+            result_dict["ate_true"] = ate_true
+
+            file1.write("\nToday's date: {0}\n".format(date.today()))
+            file1.write("Iter: {0}, PEHE_DR_NET_out: {1:.2f}, ATE_DR_NET_out: {2:.2f}, "
+                        "PEHE_DR_NET_in: {3:.2f}, ATE_DR_NET_in: {4:.2f}, "
+                        "ATE_predicted: ${5:.2f}, ATE_true: ${6:.2f}\n"
+                        .format(iter_id, drnet_PEHE_out,
+                                drnet_ATE_metric_out,
+                                drnet_PEHE_in,
+                                drnet_ATE_metric_in,
+                                ate_predicted,
+                                ate_true))
+            results_list.append(result_dict)
 
         # Calculate and print final statistics
         PEHE_set_drnet_out = []
         ATE_Metric_set_drnet_out = []
         PEHE_set_drnet_in = []
         ATE_Metric_set_drnet_in = []
+        ATE_predicted_list = []
+        ATE_true_list = []
 
         for result in results_list:
             PEHE_set_drnet_out.append(result["drnet_PEHE_out"])
             ATE_Metric_set_drnet_out.append(result["drnet_ATE_metric_out"])
             PEHE_set_drnet_in.append(result["drnet_PEHE_in"])
             ATE_Metric_set_drnet_in.append(result["drnet_ATE_metric_in"])
+            ATE_predicted_list.append(result["ate_predicted"])
+            ATE_true_list.append(result["ate_true"])
 
         PEHE_set_drnet_mean_out = np.mean(np.array(PEHE_set_drnet_out))
         PEHE_set_drnet_std_out = np.std(PEHE_set_drnet_out)
@@ -54,29 +197,42 @@ class Experiments:
         ATE_Metric_set_drnet_mean_in = np.mean(np.array(ATE_Metric_set_drnet_in))
         ATE_Metric_set_drnet_std_in = np.std(ATE_Metric_set_drnet_in)
 
+        ATE_predicted_mean = np.mean(np.array(ATE_predicted_list))
+        ATE_predicted_std = np.std(ATE_predicted_list)
+        ATE_true_mean = np.mean(np.array(ATE_true_list))
+        ATE_true_std = np.std(ATE_true_list)
+
         print("----------------- !!DR_Net Models(Results) !! ------------------------")
         print("--" * 20)
-        print("DR_NET, PEHE_out: ${:.2f}, SD: ${:.2f}"
+        print("DR_NET, PEHE_out: {0:.2f}, SD: {1:.2f}"
               .format(PEHE_set_drnet_mean_out, PEHE_set_drnet_std_out))
-        print("DR_NET, ATE Metric_out: ${:.2f}, SD: ${:.2f}"
+        print("DR_NET, ATE Metric_out: {0:.2f}, SD: {1:.2f}"
               .format(ATE_Metric_set_drnet_mean_out, ATE_Metric_set_drnet_std_out))
+        print("Predicted ATE: ${0:.2f}, SD: ${1:.2f}"
+              .format(ATE_predicted_mean, ATE_predicted_std))
+        print("True ATE: ${0:.2f}, SD: ${1:.2f}"
+              .format(ATE_true_mean, ATE_true_std))
         print("--" * 20)
-        print("DR_NET, PEHE_in: ${:.2f}, SD: ${:.2f}"
+        print("DR_NET, PEHE_in: {0:.2f}, SD: {1:.2f}"
               .format(PEHE_set_drnet_mean_in, PEHE_set_drnet_std_in))
-        print("DR_NET, ATE Metric_in: ${:.2f}, SD: ${:.2f}"
+        print("DR_NET, ATE Metric_in: {0:.2f}, SD: {1:.2f}"
               .format(ATE_Metric_set_drnet_mean_in, ATE_Metric_set_drnet_std_in))
         print("--" * 20)
 
         file1.write("\n----------------- !!DR_Net Models(Results) !! ------------------------")
         file1.write("\n--" * 20)
-        file1.write("\nDR_NET, PEHE_out: ${:.2f}, SD: ${:.2f}"
+        file1.write("\nDR_NET, PEHE_out: {0:.2f}, SD: {1:.2f}"
                     .format(PEHE_set_drnet_mean_out, PEHE_set_drnet_std_out))
-        file1.write("\nDR_NET, ATE Metric_out: ${:.2f}, SD: ${:.2f}"
+        file1.write("\nDR_NET, ATE Metric_out: {0:.2f}, SD: {1:.2f}"
                     .format(ATE_Metric_set_drnet_mean_out, ATE_Metric_set_drnet_std_out))
+        file1.write("\nPredicted ATE: ${0:.2f}, SD: ${1:.2f}"
+                    .format(ATE_predicted_mean, ATE_predicted_std))
+        file1.write("\nTrue ATE: ${0:.2f}, SD: ${1:.2f}"
+                    .format(ATE_true_mean, ATE_true_std))
         file1.write("\n--" * 20)
-        file1.write("\nDR_NET, PEHE_in: ${:.2f}, SD: ${:.2f}"
+        file1.write("\nDR_NET, PEHE_in: {0:.2f}, SD: {1:.2f}"
                     .format(PEHE_set_drnet_mean_in, PEHE_set_drnet_std_in))
-        file1.write("\nDR_NET, ATE Metric_in: ${:.2f}, SD: ${:.2f}"
+        file1.write("\nDR_NET, ATE Metric_in: {0:.2f}, SD: {1:.2f}"
                     .format(ATE_Metric_set_drnet_mean_in, ATE_Metric_set_drnet_std_in))
         file1.write("\n--" * 20)
 
@@ -97,6 +253,9 @@ class Experiments:
 
     @staticmethod
     def __process_evaluated_metric(y1_hat, y0_hat, y1_true, y0_true):
+        """
+        Process and evaluate metrics with rescaled values
+        """
         y1_true_np = np.array(y1_true)
         y0_true_np = np.array(y0_true)
         y1_hat_np = np.array(y1_hat)
@@ -104,7 +263,9 @@ class Experiments:
 
         PEHE = Metrics.PEHE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np)
         ATE = Metrics.ATE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np)
-        print("PEHE: ${:.2f}".format(PEHE))
-        print("ATE: ${:.2f}".format(ATE))
+        
+        # Print additional interpretable metrics
+        print("Average Predicted Treatment Effect: ${:.2f}".format(np.mean(y1_hat_np - y0_hat_np)))
+        print("Average True Treatment Effect: ${:.2f}".format(np.mean(y1_true_np - y0_true_np)))
 
         return PEHE, ATE
