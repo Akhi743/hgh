@@ -1,59 +1,58 @@
-"""GANITE Codebase.
+"""Metrics for evaluation.
 
-metrics.py
-
-Note: Metric functions for GANITE.
-Reference: Jennifer L Hill, "Bayesian nonparametric modeling for causal inference", 
-Journal of Computational and Graphical Statistics, 2011.
-
-(1) PEHE: Precision in Estimation of Heterogeneous Effect
+(1) PEHE: Precision in Estimation of Heterogeneous Effect 
 (2) ATE: Average Treatment Effect
 """
 
-# Necessary packages
 import numpy as np
 
-def normalize_outcomes(y):
-    """Normalize outcomes to [0,1] range.
-    """
-    y_min = np.min(y)
-    y_max = np.max(y)
-    return (y - y_min) / (y_max - y_min + 1e-8)
-
-def PEHE(y, y_hat):
-    """Compute normalized Precision in Estimation of Heterogeneous Effect.
+def PEHE(y, y_hat, scalers=None):
+    """Compute Precision in Estimation of Heterogeneous Effect.
     
     Args:
         - y: potential outcomes
         - y_hat: estimated potential outcomes
+        - scalers: dictionary containing fitted scalers
         
     Returns:
-        - PEHE_val: computed PEHE
+        - PEHE_val: computed PEHE in original scale (dollars for LaLonde)
     """
-    # Normalize true outcomes
-    y_norm = normalize_outcomes(y)
-    # Normalize predicted outcomes
-    y_hat_norm = normalize_outcomes(y_hat)
+    # If scalers provided, transform back to original scale
+    if scalers is not None:
+        y = scalers['outcome'].inverse_transform(y)
+        y_hat = scalers['outcome'].inverse_transform(y_hat)
     
-    # Calculate PEHE on normalized values
-    PEHE_val = np.mean(np.square((y_norm[:,1] - y_norm[:,0]) - (y_hat_norm[:,1] - y_hat_norm[:,0])))
+    # Calculate PEHE
+    PEHE_val = np.mean(np.square((y[:,1] - y[:,0]) - (y_hat[:,1] - y_hat[:,0])))
     return np.sqrt(PEHE_val)
 
-def ATE(y, y_hat):
-    """Compute normalized Average Treatment Effect.
+def ATE(y, y_hat, scalers=None):
+    """Compute Average Treatment Effect.
     
     Args:
         - y: potential outcomes
         - y_hat: estimated potential outcomes
+        - scalers: dictionary containing fitted scalers
         
     Returns:
-        - ATE_val: computed ATE
+        - ATE_val: computed ATE in original scale (dollars for LaLonde)
     """
-    # Normalize true outcomes
-    y_norm = normalize_outcomes(y)
-    # Normalize predicted outcomes
-    y_hat_norm = normalize_outcomes(y_hat)
+    # If scalers provided, transform back to original scale
+    if scalers is not None:
+        y = scalers['outcome'].inverse_transform(y)
+        y_hat = scalers['outcome'].inverse_transform(y_hat)
     
-    # Calculate ATE on normalized values
-    ATE_val = np.abs(np.mean(y_norm[:,1] - y_norm[:,0]) - np.mean(y_hat_norm[:,1] - y_hat_norm[:,0]))
+    # Calculate true and estimated effects
+    true_effect = np.mean(y[:,1] - y[:,0])
+    estimated_effect = np.mean(y_hat[:,1] - y_hat[:,0])
+    
+    # Calculate absolute difference in ATEs
+    ATE_val = np.abs(true_effect - estimated_effect)
+    
+    # Print detailed information
+    print(f"\nDetailed ATE Analysis:")
+    print(f"True Effect: ${true_effect:.2f}")
+    print(f"Estimated Effect: ${estimated_effect:.2f}")
+    print(f"ATE Difference: ${ATE_val:.2f}")
+    
     return ATE_val
