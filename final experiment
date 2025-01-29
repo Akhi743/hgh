@@ -1,0 +1,110 @@
+from collections import OrderedDict
+from datetime import date
+
+import numpy as np
+
+from Adversarial_Manager import Adversarial_Manager
+from Constants import Constants
+from DR_Net_Manager import DRNet_Manager
+from Metrics import Metrics
+from Utils import Utils
+from dataloader import DataLoader
+
+
+class Experiments:
+    def __init__(self, running_mode):
+        self.dL = DataLoader()
+        self.running_mode = running_mode
+        self.np_train = None
+        self.np_test = None
+
+    def run_all_experiments(self, iterations):
+        split_size = 0.8
+        csv_path = "Dataset/lalonde.csv"
+        print("iterations: ", iterations)
+        print("split_size: ", split_size)
+        device = Utils.get_device()
+        print(device)
+        results_list = []
+        run_parameters = self.__get_run_parameters()
+        print(str(run_parameters["summary_file_name"]))
+        file1 = open(run_parameters["summary_file_name"], "w")
+
+        # ... [previous code remains the same until the results collection]
+
+        # Calculate and print final statistics
+        PEHE_set_drnet_out = []
+        ATE_Metric_set_drnet_out = []
+        PEHE_set_drnet_in = []
+        ATE_Metric_set_drnet_in = []
+
+        for result in results_list:
+            PEHE_set_drnet_out.append(result["drnet_PEHE_out"])
+            ATE_Metric_set_drnet_out.append(result["drnet_ATE_metric_out"])
+            PEHE_set_drnet_in.append(result["drnet_PEHE_in"])
+            ATE_Metric_set_drnet_in.append(result["drnet_ATE_metric_in"])
+
+        PEHE_set_drnet_mean_out = np.mean(np.array(PEHE_set_drnet_out))
+        PEHE_set_drnet_std_out = np.std(PEHE_set_drnet_out)
+        ATE_Metric_set_drnet_mean_out = np.mean(np.array(ATE_Metric_set_drnet_out))
+        ATE_Metric_set_drnet_std_out = np.std(ATE_Metric_set_drnet_out)
+
+        PEHE_set_drnet_mean_in = np.mean(np.array(PEHE_set_drnet_in))
+        PEHE_set_drnet_std_in = np.std(PEHE_set_drnet_in)
+        ATE_Metric_set_drnet_mean_in = np.mean(np.array(ATE_Metric_set_drnet_in))
+        ATE_Metric_set_drnet_std_in = np.std(ATE_Metric_set_drnet_in)
+
+        print("----------------- !!DR_Net Models(Results) !! ------------------------")
+        print("--" * 20)
+        print("DR_NET, PEHE_out: ${:.2f}, SD: ${:.2f}"
+              .format(PEHE_set_drnet_mean_out, PEHE_set_drnet_std_out))
+        print("DR_NET, ATE Metric_out: ${:.2f}, SD: ${:.2f}"
+              .format(ATE_Metric_set_drnet_mean_out, ATE_Metric_set_drnet_std_out))
+        print("--" * 20)
+        print("DR_NET, PEHE_in: ${:.2f}, SD: ${:.2f}"
+              .format(PEHE_set_drnet_mean_in, PEHE_set_drnet_std_in))
+        print("DR_NET, ATE Metric_in: ${:.2f}, SD: ${:.2f}"
+              .format(ATE_Metric_set_drnet_mean_in, ATE_Metric_set_drnet_std_in))
+        print("--" * 20)
+
+        file1.write("\n----------------- !!DR_Net Models(Results) !! ------------------------")
+        file1.write("\n--" * 20)
+        file1.write("\nDR_NET, PEHE_out: ${:.2f}, SD: ${:.2f}"
+                    .format(PEHE_set_drnet_mean_out, PEHE_set_drnet_std_out))
+        file1.write("\nDR_NET, ATE Metric_out: ${:.2f}, SD: ${:.2f}"
+                    .format(ATE_Metric_set_drnet_mean_out, ATE_Metric_set_drnet_std_out))
+        file1.write("\n--" * 20)
+        file1.write("\nDR_NET, PEHE_in: ${:.2f}, SD: ${:.2f}"
+                    .format(PEHE_set_drnet_mean_in, PEHE_set_drnet_std_in))
+        file1.write("\nDR_NET, ATE Metric_in: ${:.2f}, SD: ${:.2f}"
+                    .format(ATE_Metric_set_drnet_mean_in, ATE_Metric_set_drnet_std_in))
+        file1.write("\n--" * 20)
+
+        Utils.write_to_csv(run_parameters["consolidated_file_path"], results_list)
+
+    def __get_run_parameters(self):
+        run_parameters = {}
+        if self.running_mode == "original_data":
+            run_parameters["input_nodes"] = Constants.DRNET_INPUT_NODES
+            run_parameters["consolidated_file_path"] = "Results/LaLonde_Results_consolidated.csv"
+            run_parameters["summary_file_name"] = "Results/LaLonde_Stats.txt"
+            
+        elif self.running_mode == "synthetic_data":
+            run_parameters["input_nodes"] = Constants.DRNET_INPUT_NODES
+            run_parameters["is_synthetic"] = True
+
+        return run_parameters
+
+    @staticmethod
+    def __process_evaluated_metric(y1_hat, y0_hat, y1_true, y0_true):
+        y1_true_np = np.array(y1_true)
+        y0_true_np = np.array(y0_true)
+        y1_hat_np = np.array(y1_hat)
+        y0_hat_np = np.array(y0_hat)
+
+        PEHE = Metrics.PEHE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np)
+        ATE = Metrics.ATE(y1_true_np, y0_true_np, y1_hat_np, y0_hat_np)
+        print("PEHE: ${:.2f}".format(PEHE))
+        print("ATE: ${:.2f}".format(ATE))
+
+        return PEHE, ATE
