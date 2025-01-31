@@ -1,12 +1,6 @@
-from dataloader import DataLoader
-
-# Calculate input dimensions based on the actual data
-data_loader = DataLoader()
-INPUT_DIMENSIONS = data_loader.get_feature_dimensions("subset_500_rows.csv")
-
 class Constants:
-    # Input dimensions (5 numerical features + one-hot encoded gender)
-    DRNET_INPUT_NODES = INPUT_DIMENSIONS
+    # Input dimensions (5 numerical features + 2 gender categories)
+    DRNET_INPUT_NODES = 7  # age, hpd_hyp, hpd_hyc, hpd_ast, hpd_dia, gender_F, gender_M
     DRNET_SHARED_NODES = 100
     DRNET_OUTPUT_NODES = 50
     
