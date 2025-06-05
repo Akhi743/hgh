@@ -1,0 +1,162 @@
+import os
+import PyPDF2
+import pandas as pd
+import re
+import json
+
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+
+class RateScheduleFinder:
+    def __init__(self):
+        self.use_ai = OLLAMA_AVAILABLE
+        self.model_name = "llama3.2:3b"
+        
+        if self.use_ai:
+            try:
+                ollama.list()  # Test connection
+                print("✅ Using Llama AI")
+            except:
+                print("❌ Ollama not running, using rules")
+                self.use_ai = False
+        else:
+            print("📋 Using rule-based classification")
+    
+    def extract_pdf_text(self, pdf_path):
+        try:
+            with open(pdf_path, 'rb') as file:
+                pdf = PyPDF2.PdfReader(file)
+                text = ""
+                for page in range(min(3, len(pdf.pages))):
+                    text += pdf.pages[page].extract_text()
+            return text
+        except:
+            return ""
+    
+    def analyze_with_ai(self, text_sample):
+        prompt = f"""
+        Is this a healthcare Rate Schedule document? It must have these elements:
+        1. Facility name
+        2. Charge Master Limit/Increase  
+        3. Rate Adjustment Date
+        4. Service Category
+        5. Current Rate
+        6. Adjusted New Rate
+        
+        Document: {text_sample[:1500]}
+        
+        Answer in JSON:
+        {{"is_rate_schedule": true/false, "confidence": 0-100, "reason": "brief explanation"}}
+        """
+        
+        try:
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            response_text = response['message']['content']
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            
+            if json_start != -1:
+                result = json.loads(response_text[json_start:json_end])
+                return result
+            else:
+                return self.rule_analysis(text_sample)
+        except:
+            return self.rule_analysis(text_sample)
+    
+    def rule_analysis(self, text_sample):
+        text_lower = text_sample.lower()
+        score = 0
+        
+        # Check for key elements
+        if re.search(r'facility[:\s]|hospital|medical center', text_lower):
+            score += 20
+        if re.search(r'charge master', text_lower):
+            score += 25
+        if re.search(r'current rate|adjusted.*rate', text_lower):
+            score += 30
+        if re.search(r'service category|inpatient|outpatient', text_lower):
+            score += 15
+        if re.search(r'rate adjustment date|effective.*date', text_lower):
+            score += 10
+        
+        is_rate_schedule = score >= 60
+        return {
+            "is_rate_schedule": is_rate_schedule,
+            "confidence": min(score, 100),
+            "reason": f"Score: {score}/100"
+        }
+    
+    def analyze_document(self, pdf_path):
+        text = self.extract_pdf_text(pdf_path)
+        if not text:
+            return {"is_rate_schedule": False, "confidence": 0, "reason": "No text"}
+        
+        if self.use_ai:
+            return self.analyze_with_ai(text)
+        else:
+            return self.rule_analysis(text)
+    
+    def scan_folder(self, folder_path):
+        print(f"🔍 Scanning: {folder_path}")
+        
+        rate_schedules = []
+        total_pdfs = 0
+        
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                if file.lower().endswith('.pdf'):
+                    total_pdfs += 1
+                    file_path = os.path.join(root, file)
+                    
+                    print(f"Checking: {file}")
+                    
+                    result = self.analyze_document(file_path)
+                    
+                    if result["is_rate_schedule"]:
+                        rate_schedules.append({
+                            'filename': file,
+                            'path': file_path,
+                            'folder': os.path.relpath(root, folder_path),
+                            'confidence': result['confidence'],
+                            'reason': result['reason']
+                        })
+                        print(f"  ✅ FOUND! ({result['confidence']}%)")
+                    else:
+                        print(f"  ❌ No ({result['confidence']}%)")
+        
+        return rate_schedules, total_pdfs
+    
+    def create_report(self, rate_schedules, total_pdfs):
+        print(f"\n📊 RESULTS:")
+        print(f"Total PDFs: {total_pdfs}")
+        print(f"Rate Schedules: {len(rate_schedules)}")
+        
+        if rate_schedules:
+            print(f"\n🎯 FOUND DOCUMENTS:")
+            for i, doc in enumerate(rate_schedules, 1):
+                print(f"{i}. {doc['filename']} ({doc['confidence']}%)")
+            
+            # Save to Excel
+            df = pd.DataFrame(rate_schedules)
+            df.to_excel('rate_schedules.xlsx', index=False)
+            print(f"\n💾 Saved to: rate_schedules.xlsx")
+        
+        return rate_schedules
+
+# USAGE
+if __name__ == "__main__":
+    finder = RateScheduleFinder()
+    
+    # Set your network path
+    network_path = r"\\midp-sfs-007\midamreprc\AGREEMENTS-NON STANDARD"
+    
+    # Run scan
+    rate_schedules, total = finder.scan_folder(network_path)
+    finder.create_report(rate_schedules, total)
