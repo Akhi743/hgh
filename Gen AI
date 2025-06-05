@@ -96,7 +96,8 @@ Confidence: 0-100"""
                     }
                 ],
                 max_tokens=100,
-                temperature=0
+                temperature=0,
+                timeout=30  # 30 second timeout
             )
             
             result = response.choices[0].message.content.lower()
@@ -110,11 +111,28 @@ Confidence: 0-100"""
             return is_rate, confidence
             
         except Exception as e:
-            if "gpt-4o-mini" in str(e).lower():
-                print(f"GPT-4o-mini not available, trying GPT-3.5")
+            error_msg = str(e).lower()
+            
+            # Handle specific connection errors
+            if "connection" in error_msg or "timeout" in error_msg:
+                print("Connection error - retrying with rules")
+                import time
+                time.sleep(1)
+                return self.analyze_with_rules(text)
+            elif "rate limit" in error_msg:
+                print("Rate limit - waiting and using rules")
+                import time
+                time.sleep(2)
+                return self.analyze_with_rules(text)
+            elif "authentication" in error_msg or "api key" in error_msg:
+                print("API key error - switching to rules mode")
+                self.use_openai = False  # Disable OpenAI for rest of scan
+                return self.analyze_with_rules(text)
+            elif "gpt-4o-mini" in error_msg:
+                print("Model not available - trying GPT-3.5")
                 return self.analyze_with_gpt35(text)
             else:
-                print(f"OpenAI error: {e}")
+                print(f"OpenAI error: {e} - using rules")
                 return self.analyze_with_rules(text)
     
     def analyze_with_gpt35(self, text):
@@ -126,7 +144,8 @@ Confidence: 0-100"""
                     "content": f"Is this a healthcare rate schedule? Answer YES/NO and confidence 0-100.\n\nText: {text[:1500]}"
                 }],
                 max_tokens=50,
-                temperature=0
+                temperature=0,
+                timeout=30  # 30 second timeout
             )
             
             result = response.choices[0].message.content.lower()
@@ -139,7 +158,7 @@ Confidence: 0-100"""
             
             return is_rate, confidence
         except Exception as e:
-            print(f"GPT-3.5 error: {e}")
+            print(f"GPT-3.5 also failed: {e} - using rules")
             return self.analyze_with_rules(text)
     
     def analyze_with_rules(self, text):
@@ -257,9 +276,17 @@ def main():
     
     if not OPENAI_API_KEY or OPENAI_API_KEY.lower() == 'none':
         OPENAI_API_KEY = None
-        print("Using rules mode")
+        print("Using rules mode - no internet connection required")
     
     finder = RateScheduleFinder(OPENAI_API_KEY)
+    
+    # Test connection if using OpenAI
+    if finder.use_openai:
+        print("Testing OpenAI connection...")
+        test_result = finder.analyze_with_openai("Test document with facility and current rate information.")
+        if not finder.use_openai:  # If it was disabled due to error
+            print("OpenAI connection failed - continuing with rules mode")
+    
     rate_schedules = finder.scan_folder(NETWORK_PATH)
     finder.save_results(rate_schedules)
     
