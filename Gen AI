@@ -2,161 +2,219 @@ import os
 import PyPDF2
 import pandas as pd
 import re
-import json
 
 try:
-    import ollama
-    OLLAMA_AVAILABLE = True
+    import openai
+    OPENAI_AVAILABLE = True
 except ImportError:
-    OLLAMA_AVAILABLE = False
+    OPENAI_AVAILABLE = False
 
-class RateScheduleFinder:
-    def __init__(self):
-        self.use_ai = OLLAMA_AVAILABLE
-        self.model_name = "llama3.2:3b"
+class FastRateScheduleFinder:
+    def __init__(self, openai_api_key=None):
+        self.use_openai = openai_api_key and OPENAI_AVAILABLE
         
-        if self.use_ai:
-            try:
-                ollama.list()  # Test connection
-                print("✅ Using Llama AI")
-            except:
-                print("❌ Ollama not running, using rules")
-                self.use_ai = False
+        if self.use_openai:
+            openai.api_key = openai_api_key
+            print("🤖 Using OpenAI GPT-4o")
         else:
-            print("📋 Using rule-based classification")
+            print("📋 Using fast rules")
     
-    def extract_pdf_text(self, pdf_path):
+    def extract_text(self, pdf_path):
+        """Fast text extraction - all pages but optimized"""
         try:
             with open(pdf_path, 'rb') as file:
                 pdf = PyPDF2.PdfReader(file)
-                text = ""
-                for page in range(min(3, len(pdf.pages))):
-                    text += pdf.pages[page].extract_text()
-            return text
+                text_parts = []
+                
+                # Read all pages but limit total text for speed
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    text_parts.append(page_text)
+                    
+                    # Stop if we have enough text (5000 chars is plenty)
+                    if len(''.join(text_parts)) > 5000:
+                        break
+                
+                return ''.join(text_parts)[:5000]  # Limit for speed
         except:
             return ""
     
-    def analyze_with_ai(self, text_sample):
-        prompt = f"""
-        Is this a healthcare Rate Schedule document? It must have these elements:
-        1. Facility name
-        2. Charge Master Limit/Increase  
-        3. Rate Adjustment Date
-        4. Service Category
-        5. Current Rate
-        6. Adjusted New Rate
-        
-        Document: {text_sample[:1500]}
-        
-        Answer in JSON:
-        {{"is_rate_schedule": true/false, "confidence": 0-100, "reason": "brief explanation"}}
-        """
-        
+    def analyze_with_openai(self, text):
+        """GPT-4o analysis - better accuracy for healthcare documents"""
         try:
-            response = ollama.chat(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}]
+            response = openai.ChatCompletion.create(
+                model="gpt-4o",  # Latest GPT-4o model
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": "You are an expert at analyzing healthcare contract documents. Focus on identifying rate schedule documents that contain pricing tables with current rates, adjusted rates, charge master information, and facility details."
+                    },
+                    {
+                        "role": "user", 
+                        "content": f"""Analyze this healthcare document and determine if it's a Rate Schedule document.
+
+A Rate Schedule document contains:
+- Facility/Hospital name
+- Charge Master Limit/Increase percentages  
+- Current rates and Adjusted/New rates
+- Service categories (Inpatient/Outpatient)
+- Rate adjustment dates
+
+Document text:
+{text[:2000]}
+
+Respond with:
+CLASSIFICATION: YES or NO
+CONFIDENCE: 0-100
+ELEMENTS: List key elements found (facility, rates, dates, etc.)"""
+                    }
+                ],
+                max_tokens=150,
+                temperature=0.1  # Low temperature for consistent results
             )
             
-            response_text = response['message']['content']
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
+            result = response.choices[0].message.content
             
-            if json_start != -1:
-                result = json.loads(response_text[json_start:json_end])
-                return result
-            else:
-                return self.rule_analysis(text_sample)
-        except:
-            return self.rule_analysis(text_sample)
+            # Parse GPT-4o response
+            is_rate = "yes" in result.lower().split("classification:")[1].split("\n")[0] if "classification:" in result.lower() else False
+            
+            # Extract confidence
+            confidence = 85 if is_rate else 25
+            if "confidence:" in result.lower():
+                try:
+                    conf_line = result.lower().split("confidence:")[1].split("\n")[0]
+                    numbers = re.findall(r'\d+', conf_line)
+                    if numbers:
+                        confidence = min(int(numbers[0]), 100)
+                except:
+                    pass
+            
+            # Extract elements found
+            elements = ""
+            if "elements:" in result.lower():
+                elements = result.lower().split("elements:")[1].split("\n")[0][:100]
+            
+            print(f"     GPT-4o: {elements[:50]}...")
+            return is_rate, confidence
+            
+        except Exception as e:
+            print(f"     GPT-4o failed: {e}")
+            return self.analyze_with_rules(text)
     
-    def rule_analysis(self, text_sample):
-        text_lower = text_sample.lower()
+    def analyze_with_rules(self, text):
+        """Fast rule-based analysis"""
+        if not text:
+            return False, 0
+        
+        text_lower = text.lower()
         score = 0
         
-        # Check for key elements
-        if re.search(r'facility[:\s]|hospital|medical center', text_lower):
-            score += 20
-        if re.search(r'charge master', text_lower):
-            score += 25
-        if re.search(r'current rate|adjusted.*rate', text_lower):
+        # Key indicators (weighted for speed)
+        if "charge master" in text_lower:
+            score += 40
+        if "current rate" in text_lower:
             score += 30
-        if re.search(r'service category|inpatient|outpatient', text_lower):
+        if "adjusted rate" in text_lower or "new rate" in text_lower:
+            score += 25
+        if "facility" in text_lower or "hospital" in text_lower:
             score += 15
-        if re.search(r'rate adjustment date|effective.*date', text_lower):
+        if "service category" in text_lower:
             score += 10
         
-        is_rate_schedule = score >= 60
-        return {
-            "is_rate_schedule": is_rate_schedule,
-            "confidence": min(score, 100),
-            "reason": f"Score: {score}/100"
-        }
+        return score >= 70, score
     
     def analyze_document(self, pdf_path):
-        text = self.extract_pdf_text(pdf_path)
-        if not text:
-            return {"is_rate_schedule": False, "confidence": 0, "reason": "No text"}
+        """Main analysis function"""
+        text = self.extract_text(pdf_path)
         
-        if self.use_ai:
-            return self.analyze_with_ai(text)
+        if self.use_openai:
+            return self.analyze_with_openai(text)
         else:
-            return self.rule_analysis(text)
+            return self.analyze_with_rules(text)
     
     def scan_folder(self, folder_path):
+        """Fast folder scanning"""
         print(f"🔍 Scanning: {folder_path}")
         
-        rate_schedules = []
-        total_pdfs = 0
+        if not os.path.exists(folder_path):
+            print(f"❌ Path not found: {folder_path}")
+            return []
         
+        rate_schedules = []
+        
+        # Quick PDF count
+        pdf_files = []
         for root, dirs, files in os.walk(folder_path):
             for file in files:
                 if file.lower().endswith('.pdf'):
-                    total_pdfs += 1
-                    file_path = os.path.join(root, file)
-                    
-                    print(f"Checking: {file}")
-                    
-                    result = self.analyze_document(file_path)
-                    
-                    if result["is_rate_schedule"]:
-                        rate_schedules.append({
-                            'filename': file,
-                            'path': file_path,
-                            'folder': os.path.relpath(root, folder_path),
-                            'confidence': result['confidence'],
-                            'reason': result['reason']
-                        })
-                        print(f"  ✅ FOUND! ({result['confidence']}%)")
-                    else:
-                        print(f"  ❌ No ({result['confidence']}%)")
+                    pdf_files.append((root, file))
         
-        return rate_schedules, total_pdfs
-    
-    def create_report(self, rate_schedules, total_pdfs):
-        print(f"\n📊 RESULTS:")
-        print(f"Total PDFs: {total_pdfs}")
-        print(f"Rate Schedules: {len(rate_schedules)}")
+        print(f"📁 Found {len(pdf_files)} PDFs to check\n")
         
-        if rate_schedules:
-            print(f"\n🎯 FOUND DOCUMENTS:")
-            for i, doc in enumerate(rate_schedules, 1):
-                print(f"{i}. {doc['filename']} ({doc['confidence']}%)")
+        # Process files
+        for i, (root, file) in enumerate(pdf_files, 1):
+            file_path = os.path.join(root, file)
+            print(f"[{i}/{len(pdf_files)}] {file}")
             
-            # Save to Excel
-            df = pd.DataFrame(rate_schedules)
-            df.to_excel('rate_schedules.xlsx', index=False)
-            print(f"\n💾 Saved to: rate_schedules.xlsx")
+            try:
+                is_rate, confidence = self.analyze_document(file_path)
+                
+                if is_rate:
+                    rate_schedules.append({
+                        'filename': file,
+                        'path': file_path,
+                        'folder': os.path.relpath(root, folder_path),
+                        'confidence': confidence
+                    })
+                    print(f"  ✅ RATE SCHEDULE ({confidence}%)")
+                else:
+                    print(f"  ❌ Not rate schedule ({confidence}%)")
+            
+            except Exception as e:
+                print(f"  ⚠️  Error: {e}")
         
         return rate_schedules
+    
+    def save_results(self, rate_schedules):
+        """Save results to Excel"""
+        if not rate_schedules:
+            print("\n❌ No rate schedules found!")
+            return
+        
+        print(f"\n🎯 Found {len(rate_schedules)} rate schedule documents:")
+        
+        # Sort by confidence
+        rate_schedules.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        for i, doc in enumerate(rate_schedules, 1):
+            print(f"{i:2d}. {doc['filename']} ({doc['confidence']}%)")
+        
+        # Save to Excel
+        df = pd.DataFrame(rate_schedules)
+        df.to_excel('rate_schedules.xlsx', index=False)
+        print(f"\n💾 Saved to: rate_schedules.xlsx")
 
-# USAGE
+def main():
+    """Main function - Edit these settings"""
+    
+    # CONFIGURATION - EDIT THESE
+    OPENAI_API_KEY = input("Enter your OpenAI API key: ").strip()  # User enters key
+    NETWORK_PATH = r"\\midp-sfs-007\midamreprc\AGREEMENTS-NON STANDARD"  # Your path
+    
+    if not OPENAI_API_KEY or OPENAI_API_KEY.lower() == 'none':
+        OPENAI_API_KEY = None
+        print("No API key provided - using rules mode")
+    
+    # Initialize
+    finder = FastRateScheduleFinder(OPENAI_API_KEY)
+    
+    # Scan
+    rate_schedules = finder.scan_folder(NETWORK_PATH)
+    
+    # Save results
+    finder.save_results(rate_schedules)
+    
+    print("\n✅ Done!")
+
 if __name__ == "__main__":
-    finder = RateScheduleFinder()
-    
-    # Set your network path
-    network_path = r"\\midp-sfs-007\midamreprc\AGREEMENTS-NON STANDARD"
-    
-    # Run scan
-    rate_schedules, total = finder.scan_folder(network_path)
-    finder.create_report(rate_schedules, total)
+    main()
