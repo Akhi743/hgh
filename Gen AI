@@ -2,114 +2,153 @@ import os
 import PyPDF2
 import pandas as pd
 import re
+from datetime import datetime
 
 try:
-    import openai
+    from openai import OpenAI
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
 
-class FastRateScheduleFinder:
+class RateScheduleFinder:
     def __init__(self, openai_api_key=None):
         self.use_openai = openai_api_key and OPENAI_AVAILABLE
+        self.client = None
         
         if self.use_openai:
-            openai.api_key = openai_api_key
-            print("🤖 Using OpenAI GPT-4o")
+            try:
+                self.client = OpenAI(api_key=openai_api_key)
+                print("Using OpenAI GPT")
+            except Exception as e:
+                print(f"OpenAI setup failed: {e}")
+                self.use_openai = False
         else:
-            print("📋 Using fast rules")
+            print("Using rule-based analysis")
     
     def extract_text(self, pdf_path):
-        """Fast text extraction - all pages but optimized"""
         try:
             with open(pdf_path, 'rb') as file:
                 pdf = PyPDF2.PdfReader(file)
                 text_parts = []
                 
-                # Read all pages but limit total text for speed
                 for page in pdf.pages:
                     page_text = page.extract_text()
                     text_parts.append(page_text)
                     
-                    # Stop if we have enough text (5000 chars is plenty)
                     if len(''.join(text_parts)) > 5000:
                         break
                 
-                return ''.join(text_parts)[:5000]  # Limit for speed
+                return ''.join(text_parts)[:5000]
         except:
             return ""
     
+    def extract_rate_date(self, text):
+        date_patterns = [
+            r'effective[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
+            r'rate adjustment date[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
+            r'adjustment date[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
+            r'effective date[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
+            r'(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
+        ]
+        
+        text_lower = text.lower()
+        
+        for pattern in date_patterns:
+            matches = re.findall(pattern, text_lower)
+            for match in matches:
+                try:
+                    for date_format in ['%m/%d/%Y', '%m-%d-%Y', '%d/%m/%Y', '%d-%m-%Y']:
+                        try:
+                            date_obj = datetime.strptime(match, date_format)
+                            return date_obj, match
+                        except ValueError:
+                            continue
+                except:
+                    continue
+        
+        return None, None
+    
+    def is_date_after_cutoff(self, date_obj):
+        cutoff_date = datetime(2024, 7, 1)
+        return date_obj >= cutoff_date if date_obj else False
+    
     def analyze_with_openai(self, text):
-        """GPT-4o analysis - better accuracy for healthcare documents"""
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",  # Latest GPT-4o model
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
                 messages=[
                     {
                         "role": "system", 
-                        "content": "You are an expert at analyzing healthcare contract documents. Focus on identifying rate schedule documents that contain pricing tables with current rates, adjusted rates, charge master information, and facility details."
+                        "content": "You are an expert at analyzing healthcare documents. Identify rate schedule documents with pricing tables."
                     },
                     {
                         "role": "user", 
-                        "content": f"""Analyze this healthcare document and determine if it's a Rate Schedule document.
+                        "content": f"""Is this a healthcare rate schedule document?
 
-A Rate Schedule document contains:
-- Facility/Hospital name
-- Charge Master Limit/Increase percentages  
-- Current rates and Adjusted/New rates
-- Service categories (Inpatient/Outpatient)
-- Rate adjustment dates
+Look for: facility name, charge master, current rates, adjusted rates, service categories.
 
 Document text:
-{text[:2000]}
+{text[:1800]}
 
-Respond with:
-CLASSIFICATION: YES or NO
-CONFIDENCE: 0-100
-ELEMENTS: List key elements found (facility, rates, dates, etc.)"""
+Answer format:
+YES or NO
+Confidence: 0-100"""
                     }
                 ],
-                max_tokens=150,
-                temperature=0.1  # Low temperature for consistent results
+                max_tokens=100,
+                temperature=0
             )
             
-            result = response.choices[0].message.content
+            result = response.choices[0].message.content.lower()
+            is_rate = "yes" in result
             
-            # Parse GPT-4o response
-            is_rate = "yes" in result.lower().split("classification:")[1].split("\n")[0] if "classification:" in result.lower() else False
+            confidence = 80 if is_rate else 30
+            numbers = re.findall(r'\d+', result)
+            if numbers:
+                confidence = min(int(numbers[0]), 100)
             
-            # Extract confidence
-            confidence = 85 if is_rate else 25
-            if "confidence:" in result.lower():
-                try:
-                    conf_line = result.lower().split("confidence:")[1].split("\n")[0]
-                    numbers = re.findall(r'\d+', conf_line)
-                    if numbers:
-                        confidence = min(int(numbers[0]), 100)
-                except:
-                    pass
-            
-            # Extract elements found
-            elements = ""
-            if "elements:" in result.lower():
-                elements = result.lower().split("elements:")[1].split("\n")[0][:100]
-            
-            print(f"     GPT-4o: {elements[:50]}...")
             return is_rate, confidence
             
         except Exception as e:
-            print(f"     GPT-4o failed: {e}")
+            if "gpt-4o-mini" in str(e).lower():
+                print(f"GPT-4o-mini not available, trying GPT-3.5")
+                return self.analyze_with_gpt35(text)
+            else:
+                print(f"OpenAI error: {e}")
+                return self.analyze_with_rules(text)
+    
+    def analyze_with_gpt35(self, text):
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{
+                    "role": "user", 
+                    "content": f"Is this a healthcare rate schedule? Answer YES/NO and confidence 0-100.\n\nText: {text[:1500]}"
+                }],
+                max_tokens=50,
+                temperature=0
+            )
+            
+            result = response.choices[0].message.content.lower()
+            is_rate = "yes" in result
+            confidence = 70 if is_rate else 30
+            
+            numbers = re.findall(r'\d+', result)
+            if numbers:
+                confidence = min(int(numbers[0]), 100)
+            
+            return is_rate, confidence
+        except Exception as e:
+            print(f"GPT-3.5 error: {e}")
             return self.analyze_with_rules(text)
     
     def analyze_with_rules(self, text):
-        """Fast rule-based analysis"""
         if not text:
             return False, 0
         
         text_lower = text.lower()
         score = 0
         
-        # Key indicators (weighted for speed)
         if "charge master" in text_lower:
             score += 40
         if "current rate" in text_lower:
@@ -124,97 +163,107 @@ ELEMENTS: List key elements found (facility, rates, dates, etc.)"""
         return score >= 70, score
     
     def analyze_document(self, pdf_path):
-        """Main analysis function"""
         text = self.extract_text(pdf_path)
         
         if self.use_openai:
-            return self.analyze_with_openai(text)
+            is_rate, confidence = self.analyze_with_openai(text)
         else:
-            return self.analyze_with_rules(text)
+            is_rate, confidence = self.analyze_with_rules(text)
+        
+        if not is_rate:
+            return False, confidence, None, "Not a rate schedule"
+        
+        date_obj, date_str = self.extract_rate_date(text)
+        
+        if date_obj is None:
+            return True, confidence, "Date not found", "Rate schedule but no clear date"
+        
+        if self.is_date_after_cutoff(date_obj):
+            return True, confidence, date_str, f"Valid date: {date_str}"
+        else:
+            return False, confidence, date_str, f"Date too old: {date_str}"
     
     def scan_folder(self, folder_path):
-        """Fast folder scanning"""
-        print(f"🔍 Scanning: {folder_path}")
+        print(f"Scanning: {folder_path}")
         
         if not os.path.exists(folder_path):
-            print(f"❌ Path not found: {folder_path}")
+            print(f"Error: Cannot access path: {folder_path}")
             return []
         
         rate_schedules = []
         
-        # Quick PDF count
         pdf_files = []
         for root, dirs, files in os.walk(folder_path):
             for file in files:
                 if file.lower().endswith('.pdf'):
                     pdf_files.append((root, file))
         
-        print(f"📁 Found {len(pdf_files)} PDFs to check\n")
+        print(f"Found {len(pdf_files)} PDFs to check")
         
-        # Process files
         for i, (root, file) in enumerate(pdf_files, 1):
             file_path = os.path.join(root, file)
             print(f"[{i}/{len(pdf_files)}] {file}")
             
             try:
-                is_rate, confidence = self.analyze_document(file_path)
+                is_rate, confidence, date_found, reason = self.analyze_document(file_path)
                 
                 if is_rate:
                     rate_schedules.append({
                         'filename': file,
-                        'path': file_path,
-                        'folder': os.path.relpath(root, folder_path),
+                        'date_found': date_found,
                         'confidence': confidence
                     })
-                    print(f"  ✅ RATE SCHEDULE ({confidence}%)")
+                    print(f"  VALID ({confidence}%) - Date: {date_found}")
                 else:
-                    print(f"  ❌ Not rate schedule ({confidence}%)")
+                    print(f"  REJECTED - {reason}")
             
             except Exception as e:
-                print(f"  ⚠️  Error: {e}")
+                print(f"  ERROR: {e}")
         
         return rate_schedules
     
     def save_results(self, rate_schedules):
-        """Save results to Excel"""
         if not rate_schedules:
-            print("\n❌ No rate schedules found!")
+            print("No valid rate schedules found")
+            print("No documents found with rate adjustment dates after 07/01/2024")
             return
         
-        print(f"\n🎯 Found {len(rate_schedules)} rate schedule documents:")
+        print(f"Found {len(rate_schedules)} valid rate schedule documents:")
         
-        # Sort by confidence
         rate_schedules.sort(key=lambda x: x['confidence'], reverse=True)
         
+        simple_data = []
         for i, doc in enumerate(rate_schedules, 1):
-            print(f"{i:2d}. {doc['filename']} ({doc['confidence']}%)")
+            simple_data.append({
+                'filename': doc['filename'],
+                'date_found': doc['date_found'],
+                'confidence': doc['confidence']
+            })
+            print(f"{i}. {doc['filename']} (Date: {doc['date_found']})")
         
-        # Save to Excel
-        df = pd.DataFrame(rate_schedules)
-        df.to_excel('rate_schedules.xlsx', index=False)
-        print(f"\n💾 Saved to: rate_schedules.xlsx")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        output_file = os.path.join(desktop_path, f'valid_rate_schedules_{timestamp}.csv')
+        
+        df = pd.DataFrame(simple_data)
+        df.to_csv(output_file, index=False)
+        
+        print(f"Saved to Desktop: valid_rate_schedules_{timestamp}.csv")
+        print(f"Contains: filename, date_found, confidence")
 
 def main():
-    """Main function - Edit these settings"""
-    
-    # CONFIGURATION - EDIT THESE
-    OPENAI_API_KEY = input("Enter your OpenAI API key: ").strip()  # User enters key
-    NETWORK_PATH = r"\\midp-sfs-007\midamreprc\AGREEMENTS-NON STANDARD"  # Your path
+    OPENAI_API_KEY = input("Enter your OpenAI API key (or press Enter for rules only): ").strip()
+    NETWORK_PATH = r"\\midp-sfs-007\midamreprc\AGREEMENTS-NON STANDARD"
     
     if not OPENAI_API_KEY or OPENAI_API_KEY.lower() == 'none':
         OPENAI_API_KEY = None
-        print("No API key provided - using rules mode")
+        print("Using rules mode")
     
-    # Initialize
-    finder = FastRateScheduleFinder(OPENAI_API_KEY)
-    
-    # Scan
+    finder = RateScheduleFinder(OPENAI_API_KEY)
     rate_schedules = finder.scan_folder(NETWORK_PATH)
-    
-    # Save results
     finder.save_results(rate_schedules)
     
-    print("\n✅ Done!")
+    print("Scan complete")
 
 if __name__ == "__main__":
     main()
