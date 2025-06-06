@@ -1,0 +1,78 @@
+import re
+from datetime import datetime
+from paddleocr import PaddleOCR
+import fitz  # PyMuPDF
+
+# Load PaddleOCR
+ocr = PaddleOCR(use_angle_cls=True, lang='en')
+
+REQUIRED_FIELDS = [
+    "Facility", "Charge Master Limit", "Charge Master Increase",
+    "Rate Adjustment Date", "Business", "Service Category",
+    "Current Rate", "Adjusted New Rate"
+]
+
+def extract_text_with_ocr(pdf_path):
+    all_text = []
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            pix = page.get_pixmap(dpi=300)
+            img_bytes = pix.tobytes("png")
+            result = ocr.ocr(img_bytes, cls=True)
+            for line in result[0]:
+                all_text.append(line[1][0])
+    except Exception as e:
+        print(f"[ERROR] OCR extraction failed: {e}")
+        return ""
+    return "\n".join(all_text)
+
+def find_valid_date(text):
+    # Look for potential date strings in the context of the correct labels
+    date_pattern = r'\b(\d{2}[/-]\d{2}[/-]\d{4})\b'
+    matches = re.findall(date_pattern, text)
+    for match in matches:
+        date_line = match
+        # Ensure it's near the labels
+        if "rate adjustment date" in text.lower() or "effective date" in text.lower():
+            try:
+                dt = datetime.strptime(match.replace("-", "/"), "%m/%d/%Y")
+                print(f"[INFO] Found date: {dt.strftime('%m/%d/%Y')}")
+                return dt
+            except Exception as e:
+                print(f"[WARN] Failed to parse date '{match}': {e}")
+                continue
+    print("[INFO] No valid Rate Adjustment Date or Effective Date found.")
+    return None
+
+def has_all_required_fields(text):
+    print("[INFO] Checking for required fields...")
+    all_present = True
+    for field in REQUIRED_FIELDS:
+        found = field.lower() in text.lower()
+        print(f" - {field}: {'✅' if found else '❌'}")
+        if not found:
+            all_present = False
+    return all_present
+
+def classify_pdf(pdf_path):
+    print(f"[RUNNING] Analyzing PDF: {pdf_path}")
+    text = extract_text_with_ocr(pdf_path)
+    
+    # Step 1: Check Rate Adjustment Date or Effective Date
+    date = find_valid_date(text)
+    if not date or date <= datetime(2024, 7, 1):
+        print("[RESULT] ❌ Skipped: No valid date or date is before 07/01/2024\n")
+        return False
+
+    # Step 2: Check all required fields
+    if not has_all_required_fields(text):
+        print("[RESULT] ❌ Skipped: Missing required fields\n")
+        return False
+
+    print("[RESULT] ✅ Valid contract\n")
+    return True
+
+if __name__ == "__main__":
+    pdf_path = "path/to/your/testfile.pdf"  # ⬅️ Replace with your actual file path
+    classify_pdf(pdf_path)
