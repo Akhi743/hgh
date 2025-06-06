@@ -1,296 +1,142 @@
 import os
-import PyPDF2
-import pandas as pd
+import csv
 import re
 from datetime import datetime
+from PyPDF2 import PdfReader
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage
 
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
+# 🔑 Your OpenAI API key
+openai_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-class RateScheduleFinder:
-    def __init__(self, openai_api_key=None):
-        self.use_openai = openai_api_key and OPENAI_AVAILABLE
-        self.client = None
-        
-        if self.use_openai:
-            try:
-                self.client = OpenAI(api_key=openai_api_key)
-                print("Using OpenAI GPT")
-            except Exception as e:
-                print(f"OpenAI setup failed: {e}")
-                self.use_openai = False
-        else:
-            print("Using rule-based analysis")
-    
-    def extract_text(self, pdf_path):
-        try:
-            with open(pdf_path, 'rb') as file:
-                pdf = PyPDF2.PdfReader(file)
-                text_parts = []
-                
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    text_parts.append(page_text)
-                    
-                    if len(''.join(text_parts)) > 5000:
-                        break
-                
-                return ''.join(text_parts)[:5000]
-        except:
-            return ""
-    
-    def extract_rate_date(self, text):
-        date_patterns = [
-            r'effective[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
-            r'rate adjustment date[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
-            r'adjustment date[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
-            r'effective date[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
-            r'(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
-        ]
-        
-        text_lower = text.lower()
-        
-        for pattern in date_patterns:
-            matches = re.findall(pattern, text_lower)
-            for match in matches:
-                try:
-                    for date_format in ['%m/%d/%Y', '%m-%d-%Y', '%d/%m/%Y', '%d-%m-%Y']:
-                        try:
-                            date_obj = datetime.strptime(match, date_format)
-                            return date_obj, match
-                        except ValueError:
-                            continue
-                except:
-                    continue
-        
-        return None, None
-    
-    def is_date_after_cutoff(self, date_obj):
-        cutoff_date = datetime(2024, 7, 1)
-        return date_obj >= cutoff_date if date_obj else False
-    
-    def analyze_with_openai(self, text):
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": "You are an expert at analyzing healthcare documents. Identify rate schedule documents with pricing tables."
-                    },
-                    {
-                        "role": "user", 
-                        "content": f"""Is this a healthcare rate schedule document?
+llm = ChatOpenAI(model="gpt-4", temperature=0, openai_api_key=openai_key)
 
-Look for: facility name, charge master, current rates, adjusted rates, service categories.
+VALID_STATES = [
+    "ILLINOIS", "INDIANA", "IOWA", "KANSAS", "KENTUCKY", "MICHIGAN", "MISSOURI",
+    "NEBRASKA", "NORTH DAKOTA", "OHIO", "OKLAHOMA", "SOUTH DAKOTA", "WISCONSIN"
+]
 
-Document text:
-{text[:1800]}
+REQUIRED_FIELDS = [
+    "Facility", "Charge Master Limit", "Charge Master Increase",
+    "Rate Adjustment Date", "Business", "Service Category",
+    "Current Rate", "Adjusted New Rate"
+]
 
-Answer format:
-YES or NO
-Confidence: 0-100"""
-                    }
-                ],
-                max_tokens=100,
-                temperature=0,
-                timeout=30  # 30 second timeout
-            )
-            
-            result = response.choices[0].message.content.lower()
-            is_rate = "yes" in result
-            
-            confidence = 80 if is_rate else 30
-            numbers = re.findall(r'\d+', result)
-            if numbers:
-                confidence = min(int(numbers[0]), 100)
-            
-            return is_rate, confidence
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            # Handle specific connection errors
-            if "connection" in error_msg or "timeout" in error_msg:
-                print("Connection error - retrying with rules")
-                import time
-                time.sleep(1)
-                return self.analyze_with_rules(text)
-            elif "rate limit" in error_msg:
-                print("Rate limit - waiting and using rules")
-                import time
-                time.sleep(2)
-                return self.analyze_with_rules(text)
-            elif "authentication" in error_msg or "api key" in error_msg:
-                print("API key error - switching to rules mode")
-                self.use_openai = False  # Disable OpenAI for rest of scan
-                return self.analyze_with_rules(text)
-            elif "gpt-4o-mini" in error_msg:
-                print("Model not available - trying GPT-3.5")
-                return self.analyze_with_gpt35(text)
-            else:
-                print(f"OpenAI error: {e} - using rules")
-                return self.analyze_with_rules(text)
-    
-    def analyze_with_gpt35(self, text):
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{
-                    "role": "user", 
-                    "content": f"Is this a healthcare rate schedule? Answer YES/NO and confidence 0-100.\n\nText: {text[:1500]}"
-                }],
-                max_tokens=50,
-                temperature=0,
-                timeout=30  # 30 second timeout
-            )
-            
-            result = response.choices[0].message.content.lower()
-            is_rate = "yes" in result
-            confidence = 70 if is_rate else 30
-            
-            numbers = re.findall(r'\d+', result)
-            if numbers:
-                confidence = min(int(numbers[0]), 100)
-            
-            return is_rate, confidence
-        except Exception as e:
-            print(f"GPT-3.5 also failed: {e} - using rules")
-            return self.analyze_with_rules(text)
-    
-    def analyze_with_rules(self, text):
-        if not text:
-            return False, 0
-        
-        text_lower = text.lower()
-        score = 0
-        
-        if "charge master" in text_lower:
-            score += 40
-        if "current rate" in text_lower:
-            score += 30
-        if "adjusted rate" in text_lower or "new rate" in text_lower:
-            score += 25
-        if "facility" in text_lower or "hospital" in text_lower:
-            score += 15
-        if "service category" in text_lower:
-            score += 10
-        
-        return score >= 70, score
-    
-    def analyze_document(self, pdf_path):
-        text = self.extract_text(pdf_path)
-        
-        if self.use_openai:
-            is_rate, confidence = self.analyze_with_openai(text)
-        else:
-            is_rate, confidence = self.analyze_with_rules(text)
-        
-        if not is_rate:
-            return False, confidence, None, "Not a rate schedule"
-        
-        date_obj, date_str = self.extract_rate_date(text)
-        
-        if date_obj is None:
-            return True, confidence, "Date not found", "Rate schedule but no clear date"
-        
-        if self.is_date_after_cutoff(date_obj):
-            return True, confidence, date_str, f"Valid date: {date_str}"
-        else:
-            return False, confidence, date_str, f"Date too old: {date_str}"
-    
-    def scan_folder(self, folder_path):
-        print(f"Scanning: {folder_path}")
-        
-        if not os.path.exists(folder_path):
-            print(f"Error: Cannot access path: {folder_path}")
-            return []
-        
-        rate_schedules = []
-        
-        pdf_files = []
-        for root, dirs, files in os.walk(folder_path):
-            for file in files:
-                if file.lower().endswith('.pdf'):
-                    pdf_files.append((root, file))
-        
-        print(f"Found {len(pdf_files)} PDFs to check")
-        
-        for i, (root, file) in enumerate(pdf_files, 1):
-            file_path = os.path.join(root, file)
-            print(f"[{i}/{len(pdf_files)}] {file}")
-            
-            try:
-                is_rate, confidence, date_found, reason = self.analyze_document(file_path)
-                
-                if is_rate:
-                    rate_schedules.append({
-                        'filename': file,
-                        'date_found': date_found,
-                        'confidence': confidence
-                    })
-                    print(f"  VALID ({confidence}%) - Date: {date_found}")
-                else:
-                    print(f"  REJECTED - {reason}")
-            
-            except Exception as e:
-                print(f"  ERROR: {e}")
-        
-        return rate_schedules
-    
-    def save_results(self, rate_schedules):
-        if not rate_schedules:
-            print("No valid rate schedules found")
-            print("No documents found with rate adjustment dates after 07/01/2024")
-            return
-        
-        print(f"Found {len(rate_schedules)} valid rate schedule documents:")
-        
-        rate_schedules.sort(key=lambda x: x['confidence'], reverse=True)
-        
-        simple_data = []
-        for i, doc in enumerate(rate_schedules, 1):
-            simple_data.append({
-                'filename': doc['filename'],
-                'date_found': doc['date_found'],
-                'confidence': doc['confidence']
-            })
-            print(f"{i}. {doc['filename']} (Date: {doc['date_found']})")
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-        output_file = os.path.join(desktop_path, f'valid_rate_schedules_{timestamp}.csv')
-        
-        df = pd.DataFrame(simple_data)
-        df.to_csv(output_file, index=False)
-        
-        print(f"Saved to Desktop: valid_rate_schedules_{timestamp}.csv")
-        print(f"Contains: filename, date_found, confidence")
+def extract_text(pdf_path):
+    try:
+        reader = PdfReader(pdf_path)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    except:
+        return ""
 
-def main():
-    OPENAI_API_KEY = input("Enter your OpenAI API key (or press Enter for rules only): ").strip()
-    NETWORK_PATH = r"\\midp-sfs-007\midamreprc\AGREEMENTS-NON STANDARD"
-    
-    if not OPENAI_API_KEY or OPENAI_API_KEY.lower() == 'none':
-        OPENAI_API_KEY = None
-        print("Using rules mode - no internet connection required")
-    
-    finder = RateScheduleFinder(OPENAI_API_KEY)
-    
-    # Test connection if using OpenAI
-    if finder.use_openai:
-        print("Testing OpenAI connection...")
-        test_result = finder.analyze_with_openai("Test document with facility and current rate information.")
-        if not finder.use_openai:  # If it was disabled due to error
-            print("OpenAI connection failed - continuing with rules mode")
-    
-    rate_schedules = finder.scan_folder(NETWORK_PATH)
-    finder.save_results(rate_schedules)
-    
-    print("Scan complete")
+def extract_relevant_sections(text, keywords):
+    lines = text.splitlines()
+    relevant = [line.strip() for line in lines if any(k.lower() in line.lower() for k in keywords)]
+    return "\n".join(relevant)
+
+def extract_effective_date(text):
+    relevant_text = extract_relevant_sections(text, ["Rate Adjustment Date", "Effective Date"])
+    if not relevant_text.strip():
+        return None
+
+    prompt = [
+        SystemMessage(content="You are an expert in hospital contract analysis."),
+        HumanMessage(content=f"""
+Extract the latest date value found from either 'Rate Adjustment Date' or 'Effective Date'.
+Return JSON in this format:
+{{ "date": "MM/DD/YYYY" }} if a date is found,
+or {{ "date": null }} if no date found.
+
+Text:
+{relevant_text}
+""")
+    ]
+    try:
+        response = llm(prompt).content.strip()
+        match = re.search(r'"date":\s*"(\d{2}/\d{2}/\d{4})"', response)
+        if not match:
+            return None
+        return datetime.strptime(match.group(1), "%m/%d/%Y")
+    except:
+        return None
+
+def check_required_fields(text):
+    relevant_text = extract_relevant_sections(text, REQUIRED_FIELDS)
+    if not relevant_text.strip():
+        return False
+
+    prompt = [
+        SystemMessage(content="You are an expert in hospital contract analysis."),
+        HumanMessage(content=f"""
+Check if ALL the following fields are mentioned in the text below:
+- Facility
+- Charge Master Limit
+- Charge Master Increase
+- Rate Adjustment Date
+- Business
+- Service Category
+- Current Rate
+- Adjusted New Rate
+
+Respond ONLY with JSON: {{ "valid": true }} or {{ "valid": false }}
+
+Text:
+{relevant_text}
+""")
+    ]
+    try:
+        response = llm(prompt).content.strip()
+        return '"valid": true' in response.lower()
+    except:
+        return False
+
+def is_valid_contract(text):
+    date = extract_effective_date(text)
+    if not date or date <= datetime(2024, 7, 1):
+        return False
+    return check_required_fields(text)
+
+def get_state_folders(base):
+    return [
+        os.path.join(base, d) for d in os.listdir(base)
+        if os.path.isdir(os.path.join(base, d)) and any(state in d.upper() for state in VALID_STATES)
+    ]
+
+def find_pdfs(folder):
+    pdfs = []
+    for root, _, files in os.walk(folder):
+        if "hospitals" in root.lower():
+            for f in files:
+                if f.lower().endswith(".pdf"):
+                    pdfs.append(os.path.join(root, f))
+    return pdfs
+
+def classify_single(pdf_path):
+    text = extract_text(pdf_path)
+    return (pdf_path, is_valid_contract(text))
+
+def classify_pdfs_parallel(base, max_workers=4):
+    pdf_paths = []
+    for folder in get_state_folders(base):
+        pdf_paths.extend(find_pdfs(folder))
+
+    valid, skipped = [], []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(classify_single, pdf): pdf for pdf in pdf_paths}
+        for future in as_completed(futures):
+            pdf_path, is_valid = future.result()
+            (valid if is_valid else skipped).append(pdf_path)
+    return valid, skipped
+
+def save_csv(valid, skipped, out_dir="classification_results"):
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "valid_contracts.csv"), "w", newline='', encoding="utf-8") as f:
+        csv.writer(f).writerows([["Valid PDF Files"]] + [[v] for v in valid])
+    with open(os.path.join(out_dir, "skipped_contracts.csv"), "w", newline='', encoding="utf-8") as f:
+        csv.writer(f).writerows([["Skipped PDF Files"]] + [[s] for s in skipped])
 
 if __name__ == "__main__":
-    main()
+    base_path = "./midamreprc/AGREEMENTS-NON STANDARD"
+    valid, skipped = classify_pdfs_parallel(base_path, max_workers=4)
+    save_csv(valid, skipped)
