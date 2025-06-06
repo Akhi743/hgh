@@ -32,49 +32,52 @@ def extract_text(pdf_path):
         reader = PdfReader(pdf_path)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
     except Exception as e:
-        print(f"Error reading PDF: {e}")
+        print(f"❌ Error reading PDF: {e}")
         return ""
 
-def extract_relevant_sections(text, keywords):
-    lines = text.splitlines()
-    return "\n".join([line.strip() for line in lines if any(k.lower() in line.lower() for k in keywords)])
-
 def extract_effective_date(text):
-    relevant_text = extract_relevant_sections(text, ["Rate Adjustment Date", "Effective Date"])
-    if not relevant_text.strip():
-        return None
-
     prompt = [
         SystemMessage(content="You are an expert in hospital contract analysis."),
         HumanMessage(content=f"""
-Extract the latest date value found from either 'Rate Adjustment Date' or 'Effective Date'.
-Return JSON in this format:
-{{ "date": "MM/DD/YYYY" }} if a date is found,
+Scan the following hospital contract text and extract the most recent date associated with either:
+- "Effective Date"
+- "Rate Adjustment Date"
+
+Respond ONLY with JSON in this format:
+{{ "date": "MM/DD/YYYY" }} if a valid date exists,
 or {{ "date": null }} if no date found.
 
 Text:
-{relevant_text}
+{text[:8000]}  # Limit to avoid token overload
 """)
     ]
     try:
         response = llm(prompt).content.strip()
-        parsed = json.loads(response)
-        if parsed["date"]:
+        print("🔍 LLM raw date response:", response)
+
+        try:
+            parsed = json.loads(response)
+        except:
+            # Fallback: extract with regex if not valid JSON
+            match = re.search(r'"date"\s*:\s*"(\d{1,2}/\d{1,2}/\d{4})"', response)
+            if match:
+                parsed = {"date": match.group(1)}
+            else:
+                print("⚠️ No valid date format in response.")
+                return None
+
+        if parsed.get("date"):
             return datetime.strptime(parsed["date"], "%m/%d/%Y")
         return None
     except Exception as e:
-        print(f"Date extraction error: {e}")
+        print(f"❌ Date extraction error: {e}")
         return None
 
 def check_required_fields(text):
-    relevant_text = extract_relevant_sections(text, REQUIRED_FIELDS)
-    if not relevant_text.strip():
-        return False
-
     prompt = [
         SystemMessage(content="You are an expert in hospital contract analysis."),
         HumanMessage(content=f"""
-Check if ALL the following fields are mentioned in the text below:
+Check if ALL of these fields are present somewhere in the contract:
 - Facility
 - Charge Master Limit
 - Charge Master Increase
@@ -87,33 +90,34 @@ Check if ALL the following fields are mentioned in the text below:
 Respond ONLY with JSON: {{ "valid": true }} or {{ "valid": false }}
 
 Text:
-{relevant_text}
+{text[:8000]}
 """)
     ]
     try:
         response = llm(prompt).content.strip()
+        print("✅ LLM field check response:", response)
         parsed = json.loads(response)
         return parsed.get("valid", False)
     except Exception as e:
-        print(f"Field check error: {e}")
+        print(f"❌ Field check error: {e}")
         return False
 
 def is_valid_contract(text):
     date = extract_effective_date(text)
-    print(f"Extracted Effective Date: {date}")
+    print(f"📅 Extracted Effective Date: {date}")
     if not date or date < datetime(2024, 7, 1):
-        print("Date check failed.")
+        print("⛔ Skipped: No valid or recent effective date")
         return False
     valid = check_required_fields(text)
-    print("Required fields present:", valid)
+    print("📌 Required fields present:", valid)
     return valid
 
-# ---- RUN SINGLE PDF ----
+# ---- MAIN: RUN SINGLE PDF ----
 if __name__ == "__main__":
-    pdf_path = "./test_contract.pdf"  # 🔄 Replace with your actual test PDF path
+    pdf_path = "./test_contract.pdf"  # 🔁 Replace with your actual test PDF file
     text = extract_text(pdf_path)
     if not text:
-        print("No text extracted.")
+        print("❗ No text extracted from PDF.")
     else:
-        is_valid = is_valid_contract(text)
-        print(f"\nResult: {'VALID CONTRACT' if is_valid else 'SKIPPED / INVALID'}")
+        result = is_valid_contract(text)
+        print(f"\n✅ FINAL RESULT: {'VALID CONTRACT ✅' if result else 'SKIPPED ❌'}")
