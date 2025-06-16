@@ -1,44 +1,66 @@
-# Install required packages (run once)
-!pip install contextgem pdfplumber PyMuPDF pandas openpyxl
+# Install any missing packages (run once)
+!pip install PyPDF2 contextgem PyMuPDF pytesseract pdf2image pandas openpyxl
 
 # === Imports ===
-import os
-import re
-import pdfplumber
-import fitz                  # PyMuPDF
+import os, re
 import pandas as pd
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional
+
+# PDF text extractors
+from PyPDF2 import PdfReader
+import fitz                       # PyMuPDF
+import pytesseract
+from pdf2image import convert_from_path
+from PIL import Image
+
+# ContextGem
 from contextgem import Document, DocumentLLM, JsonObjectConcept
 
-# === CONFIGURATION ===
-os.environ["CONTEXTGEM_OPENAI_API_KEY"] = "sk-..."  
-PDF_PATH      = "your_contract.pdf"            
-OUTPUT_EXCEL  = "contract_rates_output.xlsx"    
+# === CONFIG ===
+PDF_PATH     = r"C:\path\to\your_contract.pdf"      # ← your PDF
+OUTPUT_XLSX  = r"C:\path\to\contract_rates.xlsx"    # ← output file
+MODEL_NAME   = "openai/gpt-4o-mini"                 # or your Azure deployment
+os.environ["CONTEXTGEM_OPENAI_API_KEY"] = "sk-..."  # ← your key
 
-# === STEP 1: Extract text from PDF with fallback ===
+# === STEP 1: Try PyPDF2 ===
 pages = []
-with pdfplumber.open(PDF_PATH) as pdf:
-    for i, page in enumerate(pdf.pages, start=1):
-        txt = page.extract_text() or ""
-        print(f"[PDFPlumber] Page {i} length: {len(txt)}")
-        pages.append(txt)
+reader = PdfReader(PDF_PATH)
+for i, page in enumerate(reader.pages, 1):
+    txt = page.extract_text() or ""
+    print(f"[PyPDF2] Page {i} length: {len(txt)}")
+    pages.append(txt)
 
 contract_text = "\n".join(pages).strip()
+
+# === STEP 2: Fallback to PyMuPDF if empty ===
 if not contract_text:
-    print("[Fallback] pdfplumber found no text, trying PyMuPDF...")
-    doc_fitz = fitz.open(PDF_PATH)
+    print("\nPyPDF2 failed; trying PyMuPDF...")
     pages = []
-    for i, page in enumerate(doc_fitz, start=1):
-        txt = page.get_text("text") or ""
+    doc = fitz.open(PDF_PATH)
+    for i, p in enumerate(doc, 1):
+        txt = p.get_text("text") or ""
         print(f"[PyMuPDF] Page {i} length: {len(txt)}")
         pages.append(txt)
     contract_text = "\n".join(pages).strip()
 
+# === STEP 3: Fallback to OCR if still empty ===
 if not contract_text:
-    raise RuntimeError("No text extracted from PDF! Check that it truly contains selectable text.")
+    print("\nPyMuPDF failed; falling back to Tesseract OCR...")
+    pages = []
+    images = convert_from_path(PDF_PATH, dpi=200)
+    for i, img in enumerate(images, 1):
+        txt = pytesseract.image_to_string(img)
+        print(f"[OCR] Page {i} length: {len(txt)}")
+        pages.append(txt)
+    contract_text = "\n".join(pages).strip()
 
-# === STEP 2: Define Pydantic schema with validation & fallback ===
+if not contract_text:
+    raise RuntimeError("All extraction methods failed—no text found in PDF.")
+
+print(f"\n✅ Extracted {len(contract_text)} total characters. Proceeding…")
+
+# === STEP 4: Define Pydantic schema with validators ===
 class HospitalRateEntry(BaseModel):
     hospital: str = Field(..., description="Facility name")
     lob: str = Field(..., description="Line of business")
@@ -52,85 +74,79 @@ class HospitalRateEntry(BaseModel):
     effective_date: str
 
     @field_validator("rate")
-    def validate_rate(cls, v):
-        if not re.match(r"^\$?\d{1,3}(,\d{3})*(\.\d{2})?$|^\d{1,3}%$", v.strip()):
-            raise ValueError(f"Invalid rate format: {v}")
-        return v.strip()
+    def _check_rate(cls, v):
+        v = v.strip()
+        if not re.match(r"^\$?\d{1,3}(,\d{3})*(\.\d{2})?$|^\d{1,3}%$", v):
+            raise ValueError(f"Bad rate format: {v}")
+        return v
 
     @field_validator("billing_code")
-    def validate_billing_code(cls, v):
-        if not re.match(r"^[A-Za-z0-9\-, ]+$", v.strip()):
-            raise ValueError(f"Invalid billing code: {v}")
-        return v.strip()
+    def _check_code(cls, v):
+        v = v.strip()
+        if not re.match(r"^[A-Za-z0-9\-, ]+$", v):
+            raise ValueError(f"Bad billing code: {v}")
+        return v
 
     @model_validator(mode="after")
-    def fill_missing_fields(self):
+    def _fill_na(self):
         for f in self.__fields__:
             val = getattr(self, f)
             if val is None or (isinstance(val, str) and not val.strip()):
                 setattr(self, f, "N/A")
         return self
 
-# === STEP 3: Build Document and attach concept ===
+# === STEP 5: Build ContextGem Document & extract ===
 doc = Document(raw_text=contract_text)
-doc.add_concepts([
-    JsonObjectConcept(
-        name="HospitalRateEntry",
-        description="One row per billing code with full context",
-        schema=HospitalRateEntry,
-        many=True
-    )
-])
+doc.add_concepts([ JsonObjectConcept(
+    name="HospitalRateEntry",
+    description="Extract one billing code per row with context & rates",
+    schema=HospitalRateEntry,
+    many=True
+)])
 
-# === STEP 4: Extract entries with ContextGem LLM and print them ===
-llm = DocumentLLM(
-    model="openai/gpt-4o-mini",
-    api_key=os.environ["CONTEXTGEM_OPENAI_API_KEY"]
-)
+llm = DocumentLLM(model=MODEL_NAME, api_key=os.environ["CONTEXTGEM_OPENAI_API_KEY"])
 doc = llm.extract_all(doc)
 entries = doc.get_concept_by_name("HospitalRateEntry").extracted_items
 
-print("\n— Raw extracted entries from LLM —")
-for idx, entry in enumerate(entries, 1):
-    print(f"{idx:2d}.", entry.model_dump())
+# Log raw extractions
+print("\n— Raw LLM output —")
+for i, e in enumerate(entries, 1):
+    print(f"{i:2d}:", e.model_dump())
 
-# === STEP 5: Expand billing code ranges ===
-def expand_billing_codes(entry):
-    parts = re.split(r',\s*', entry.billing_code)
+# === STEP 6: Expand any code ranges ===
+def expand_codes(e):
+    parts = re.split(r',\s*', e.billing_code)
     out = []
-    for part in parts:
-        if '-' in part:
-            nums = re.findall(r'\d+', part)
-            if len(nums) == 2:
-                a, b = map(int, nums)
-                for code in range(a, b+1):
-                    e = entry.model_copy()
-                    e.billing_code = str(code)
-                    out.append(e)
-            else:
-                out.append(entry)
+    for p in parts:
+        if '-' in p:
+            a,b = map(int, re.findall(r'\d+', p))
+            for n in range(a, b+1):
+                ne = e.model_copy()
+                ne.billing_code = str(n)
+                out.append(ne)
         else:
-            e = entry.model_copy()
-            e.billing_code = part.strip()
-            out.append(e)
+            ne = e.model_copy()
+            ne.billing_code = p.strip()
+            out.append(ne)
     return out
 
-final_entries = []
-print("\n— Expanding billing codes —")
-for entry in entries:
-    expanded = expand_billing_codes(entry)
-    print(f"Code '{entry.billing_code}' → {[e.billing_code for e in expanded]}")
-    final_entries.extend(expanded)
+final = []
+print("\n— Range expansions —")
+for e in entries:
+    ex = expand_codes(e)
+    print(f"  {e.billing_code} → {[ee.billing_code for ee in ex]}")
+    final.extend(ex)
 
-# === STEP 6: Convert to DataFrame, reorder, fill N/A, export ===
-df = pd.DataFrame([e.model_dump() for e in final_entries])
-df = df[[
-    "hospital","lob","place_of_service","service_category",
-    "billing_code_type","billing_code","rate","negotiated_type",
-    "additional_information","effective_date"
-]]
-df.fillna("N/A", inplace=True)
-df.to_excel(OUTPUT_EXCEL, index=False)
+# === STEP 7: To DataFrame, reorder, fill N/A, export ===
+df = pd.DataFrame([ee.model_dump() for ee in final])
+cols = [
+  "hospital","lob","place_of_service","service_category",
+  "billing_code_type","billing_code","rate","negotiated_type",
+  "additional_information","effective_date"
+]
+df = df[cols].fillna("N/A")
+df.to_excel(OUTPUT_XLSX, index=False)
+print(f"\n✅ Written {len(df)} rows to {OUTPUT_XLSX}")
 
-print(f"\n✅ Done! {len(df)} rows written to {OUTPUT_EXCEL}")
+# Show first few rows
 df.head()
