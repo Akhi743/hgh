@@ -1,56 +1,66 @@
+# Install required packages (run once)
+!pip install contextgem pdfplumber PyMuPDF pandas openpyxl
+
+# === Imports ===
 import os
 import re
 import pdfplumber
+import fitz                  # PyMuPDF
 import pandas as pd
-import google.auth
-from google.auth.transport.requests import Request
-from openai import OpenAI
-import instructor
-from contextgem import Document, DocumentLLM, JsonObjectConcept
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional
+from contextgem import Document, DocumentLLM, JsonObjectConcept
 
 # === CONFIGURATION ===
-BASE_URL = "https://YOUR_RESOURCE_NAME.openai.azure.com/"            # Replace with your Azure OpenAI base URL
-MODEL_NAME = "YOUR_MODEL_DEPLOYMENT_NAME"                            # Replace with your deployment/model name
-PDF_PATH = "your_contract.pdf"                                       # Replace with your PDF file path
-OUTPUT_EXCEL = "contract_rates_output.xlsx"                          # Desired output Excel file name
+os.environ["CONTEXTGEM_OPENAI_API_KEY"] = "sk-..."  
+PDF_PATH      = "your_contract.pdf"            
+OUTPUT_EXCEL  = "contract_rates_output.xlsx"    
 
-# === AUTHENTICATION ===
-# Use GCP Application Default Credentials to fetch an identity token
-creds, _ = google.auth.default()
-req = Request()
-creds.refresh(req)
+# === STEP 1: Extract text from PDF with fallback ===
+pages = []
+with pdfplumber.open(PDF_PATH) as pdf:
+    for i, page in enumerate(pdf.pages, start=1):
+        txt = page.extract_text() or ""
+        print(f"[PDFPlumber] Page {i} length: {len(txt)}")
+        pages.append(txt)
 
-# Create an OpenAI client wrapped by instructor for structured JSON output
-CLIENT = instructor.from_openai(
-    OpenAI(base_url=BASE_URL, api_key=creds.token),
-    mode=instructor.Mode.JSON
-)
+contract_text = "\n".join(pages).strip()
+if not contract_text:
+    print("[Fallback] pdfplumber found no text, trying PyMuPDF...")
+    doc_fitz = fitz.open(PDF_PATH)
+    pages = []
+    for i, page in enumerate(doc_fitz, start=1):
+        txt = page.get_text("text") or ""
+        print(f"[PyMuPDF] Page {i} length: {len(txt)}")
+        pages.append(txt)
+    contract_text = "\n".join(pages).strip()
 
-# === Pydantic Schema with Validation and Fallback ===
+if not contract_text:
+    raise RuntimeError("No text extracted from PDF! Check that it truly contains selectable text.")
+
+# === STEP 2: Define Pydantic schema with validation & fallback ===
 class HospitalRateEntry(BaseModel):
     hospital: str = Field(..., description="Facility name")
-    lob: str = Field(..., description="Line of business (e.g., Commercial)")
+    lob: str = Field(..., description="Line of business")
     place_of_service: str = Field(..., description="IP or OP")
     service_category: str
-    billing_code_type: str       # DRG, Revenue, HCPC
+    billing_code_type: str
     billing_code: str
     rate: str
-    negotiated_type: str         # Per Diem / Per Unit / Percentage
+    negotiated_type: str
     additional_information: Optional[str] = ""
-    effective_date: str          # MM/DD/YYYY
+    effective_date: str
 
     @field_validator("rate")
     def validate_rate(cls, v):
         if not re.match(r"^\$?\d{1,3}(,\d{3})*(\.\d{2})?$|^\d{1,3}%$", v.strip()):
             raise ValueError(f"Invalid rate format: {v}")
-        return v
+        return v.strip()
 
     @field_validator("billing_code")
     def validate_billing_code(cls, v):
         if not re.match(r"^[A-Za-z0-9\-, ]+$", v.strip()):
-            raise ValueError(f"Invalid billing code format: {v}")
+            raise ValueError(f"Invalid billing code: {v}")
         return v.strip()
 
     @model_validator(mode="after")
@@ -61,62 +71,66 @@ class HospitalRateEntry(BaseModel):
                 setattr(self, f, "N/A")
         return self
 
-# === Step 1: Extract Raw Text from PDF ===
-with pdfplumber.open(PDF_PATH) as pdf:
-    contract_text = "\n".join(
-        page.extract_text() for page in pdf.pages if page.extract_text()
-    )
-
-# === Step 2: Build Document and Add Concept ===
+# === STEP 3: Build Document and attach concept ===
 doc = Document(raw_text=contract_text)
 doc.add_concepts([
     JsonObjectConcept(
         name="HospitalRateEntry",
-        description="Extract each billing entry from the hospital contract PDF. One row per billing code.",
+        description="One row per billing code with full context",
         schema=HospitalRateEntry,
         many=True
     )
 ])
 
-# === Step 3: Extract Structured Data with LLM ===
-llm = DocumentLLM(client=CLIENT, model=MODEL_NAME)
+# === STEP 4: Extract entries with ContextGem LLM and print them ===
+llm = DocumentLLM(
+    model="openai/gpt-4o-mini",
+    api_key=os.environ["CONTEXTGEM_OPENAI_API_KEY"]
+)
 doc = llm.extract_all(doc)
 entries = doc.get_concept_by_name("HospitalRateEntry").extracted_items
 
-# === Step 4: Expand Billing Code Ranges into Individual Rows ===
+print("\n— Raw extracted entries from LLM —")
+for idx, entry in enumerate(entries, 1):
+    print(f"{idx:2d}.", entry.model_dump())
+
+# === STEP 5: Expand billing code ranges ===
 def expand_billing_codes(entry):
-    codes = re.split(r',\s*', entry.billing_code)
-    expanded = []
-    for code in codes:
-        if '-' in code:
-            nums = re.findall(r'\d+', code)
+    parts = re.split(r',\s*', entry.billing_code)
+    out = []
+    for part in parts:
+        if '-' in part:
+            nums = re.findall(r'\d+', part)
             if len(nums) == 2:
-                start, end = map(int, nums)
-                for val in range(start, end + 1):
-                    new = entry.model_copy()
-                    new.billing_code = str(val)
-                    expanded.append(new)
+                a, b = map(int, nums)
+                for code in range(a, b+1):
+                    e = entry.model_copy()
+                    e.billing_code = str(code)
+                    out.append(e)
             else:
-                expanded.append(entry)
+                out.append(entry)
         else:
-            new = entry.model_copy()
-            new.billing_code = code.strip()
-            expanded.append(new)
-    return expanded
+            e = entry.model_copy()
+            e.billing_code = part.strip()
+            out.append(e)
+    return out
 
 final_entries = []
-for e in entries:
-    final_entries.extend(expand_billing_codes(e))
+print("\n— Expanding billing codes —")
+for entry in entries:
+    expanded = expand_billing_codes(entry)
+    print(f"Code '{entry.billing_code}' → {[e.billing_code for e in expanded]}")
+    final_entries.extend(expanded)
 
-# === Step 5: Convert to DataFrame, Reorder, Fill Missing, and Export ===
+# === STEP 6: Convert to DataFrame, reorder, fill N/A, export ===
 df = pd.DataFrame([e.model_dump() for e in final_entries])
 df = df[[
-    "hospital", "lob", "place_of_service", "service_category",
-    "billing_code_type", "billing_code", "rate", "negotiated_type",
-    "additional_information", "effective_date"
+    "hospital","lob","place_of_service","service_category",
+    "billing_code_type","billing_code","rate","negotiated_type",
+    "additional_information","effective_date"
 ]]
 df.fillna("N/A", inplace=True)
 df.to_excel(OUTPUT_EXCEL, index=False)
 
-# === Display Results ===
+print(f"\n✅ Done! {len(df)} rows written to {OUTPUT_EXCEL}")
 df.head()
