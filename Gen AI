@@ -1,24 +1,25 @@
-# 0) Install dependencies (run once per kernel)
-!pip install --quiet pdfminer.six openai instructor pandas openpyxl
-
-# 1) All‐in‐one extraction + parsing + Excel export
-import os, re, json
-from io import StringIO
-from pdfminer.high_level import extract_text_to_fp
-from pdfminer.layout import LAParams
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, List
-from openai import OpenAI
 import instructor
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import json
+from pprint import pprint
+from tenacity import Retrying, retry_if_not_exception_type, stop_after_attempt
+from pydantic import AfterValidator, field_validator, model_validator
+from instructor.exceptions import InstructorRetryException
+import re
+import ocrutils
+import form_model as model
+from openai import OpenAI
 import pandas as pd
+import os
 
 # === CONFIGURATION ===
-PDF_PATH     = r"C:\path\to\your_contract.pdf"       # ← your PDF file
-OUTPUT_XLSX  = r"C:\path\to\contract_rates.xlsx"     # ← where to save Excel
-MODEL_NAME   = "openai/gpt-4o-mini"                  # ← your model or Azure deployment
-os.environ["OPENAI_API_KEY"] = "sk-..."              # ← your OpenAI or Azure token
+PDF_PATH = r"C:\path\to\your_contract.pdf"          # ← your PDF file
+OUTPUT_XLSX = r"C:\path\to\contract_rates.xlsx"     # ← where to save Excel
+MODEL_NAME = "openai/gpt-4o-mini"                   # ← your model or Azure deployment
+os.environ["OPENAI_API_KEY"] = "sk-..."             # ← your OpenAI or Azure token
 
-# === 2) Initialize the Instructor client (no external init_model file) ===
+# === 1) Initialize the Instructor client ===
 CLIENT = None
 def init_model():
     global CLIENT
@@ -28,31 +29,19 @@ def init_model():
     )
 init_model()
 
-# === 3) Extract embedded text from the PDF via pdfminer.six ===
-def extract_pdf_text(path: str) -> str:
-    pages = []
-    laparams = LAParams()
-    for i in range(1000):
-        buf = StringIO()
-        try:
-            extract_text_to_fp(open(path, "rb"), buf,
-                               laparams=laparams,
-                               page_numbers=[i])
-        except IndexError:
-            break
-        txt = buf.getvalue()
-        print(f"[pdfminer] Page {i+1}: {len(txt)} chars")
-        if not txt:
-            break
-        pages.append(txt)
-    return "\n".join(pages).strip()
+# === 2) Get OCR text using ocrutils ===
+# Use ocrutils to process the PDF and get OCR text
+info = ocrutils.process_pdf(PDF_PATH)  # Assuming ocrutils has a process_pdf function
+ocr_text = info.context["ocr_text"]
 
-contract_text = extract_pdf_text(PDF_PATH)
-if not contract_text:
-    raise RuntimeError("No text extracted from PDF—verify it has embedded text.")
-print(f"\n✅ Total extracted chars: {len(contract_text)}\n")
+if not ocr_text:
+    raise RuntimeError("No OCR text found in info.context")
+if not ocr_text:
+    raise RuntimeError("No OCR text found in info.context")
+print(f"\n✅ Total OCR text chars: {len(ocr_text)}\n")
+print(f"Processing PDF: {PDF_PATH}")
 
-# === 4) Define Pydantic schema with validators & N/A fallback ===
+# === 3) Define Pydantic schema with validators & N/A fallback ===
 class HospitalRateEntry(BaseModel):
     hospital: str = Field(..., description="Facility name")
     lob: str = Field(..., description="Line of business")
@@ -79,13 +68,13 @@ class HospitalRateEntry(BaseModel):
 
     @model_validator(mode="after")
     def fill_na(self):
-        for f in self.__fields__:
-            val = getattr(self, f)
+        for field_name in self.model_fields:
+            val = getattr(self, field_name)
             if not val or (isinstance(val, str) and not val.strip()):
-                setattr(self, f, "N/A")
+                setattr(self, field_name, "N/A")
         return self
 
-# === 5) Ask the model to extract a JSON array of entries ===
+# === 4) Extract entries with retry logic ===
 prompt = f"""
 Extract every billing entry from this hospital contract into a JSON array.
 Each object must have exactly these keys:
@@ -95,53 +84,79 @@ additional_information, effective_date
 
 Here is the contract text:
 \"\"\"
-{contract_text}
+{ocr_text}
 \"\"\"
 """
-res = CLIENT.chat.completions.create(
-    model=MODEL_NAME,
-    messages=[
-        {"role":"system","content":"You extract structured JSON only."},
-        {"role":"user","content":prompt}
-    ],
-    temperature=0
-)
-payload = res.choices[0].message.content
-data = json.loads(payload)
-entries: List[HospitalRateEntry] = [HospitalRateEntry(**item) for item in data]
+
+# Use tenacity retry logic
+entries = []
+for attempt in Retrying(
+    retry=retry_if_not_exception_type(InstructorRetryException),
+    stop=stop_after_attempt(3)
+):
+    with attempt:
+        try:
+            res = CLIENT.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "You extract structured JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0,
+                response_model=List[HospitalRateEntry]  # Direct validation
+            )
+            entries = res
+        except Exception as e:
+            print(f"Attempt {attempt.retry_state.attempt_number} failed: {e}")
+            if attempt.retry_state.attempt_number == 3:
+                raise
 
 print("— Raw extracted entries —")
-for i,e in enumerate(entries,1):
+for i, e in enumerate(entries, 1):
     print(f"{i:2d}.", e.model_dump())
 
-# === 6) Expand billing-code ranges (e.g. "190-192") ===
-def expand_codes(e: HospitalRateEntry) -> List[HospitalRateEntry]:
-    out=[]
-    for part in re.split(r',\s*', e.billing_code):
+# === 5) Expand billing-code ranges (e.g. "190-192") ===
+def expand_codes(entry: HospitalRateEntry) -> List[HospitalRateEntry]:
+    expanded = []
+    for part in re.split(r',\s*', entry.billing_code):
         if '-' in part:
-            a,b = map(int, re.findall(r'\d+', part))
-            for n in range(a,b+1):
-                ne=e.model_copy(); ne.billing_code=str(n); out.append(ne)
-            continue
-        ne=e.model_copy(); ne.billing_code=part.strip(); out.append(ne)
-    return out
+            nums = re.findall(r'\d+', part)
+            if len(nums) >= 2:
+                start, end = int(nums[0]), int(nums[1])
+                for n in range(start, end + 1):
+                    new_entry = entry.model_copy()
+                    new_entry.billing_code = str(n)
+                    expanded.append(new_entry)
+            else:
+                new_entry = entry.model_copy()
+                new_entry.billing_code = part.strip()
+                expanded.append(new_entry)
+        else:
+            new_entry = entry.model_copy()
+            new_entry.billing_code = part.strip()
+            expanded.append(new_entry)
+    return expanded
 
-final: List[HospitalRateEntry] = []
+final_entries: List[HospitalRateEntry] = []
 print("\n— Range expansions —")
-for e in entries:
-    ex = expand_codes(e)
-    print(f" {e.billing_code} → {[x.billing_code for x in ex]}")
-    final.extend(ex)
+for entry in entries:
+    expanded = expand_codes(entry)
+    print(f" {entry.billing_code} → {[x.billing_code for x in expanded]}")
+    final_entries.extend(expanded)
 
-# === 7) To DataFrame, reorder columns, fill N/A, export to Excel ===
-df = pd.DataFrame([x.model_dump() for x in final])
-cols = [
-    "hospital","lob","place_of_service","service_category",
-    "billing_code_type","billing_code","rate","negotiated_type",
-    "additional_information","effective_date"
+# === 6) Convert to DataFrame and export to Excel ===
+df = pd.DataFrame([entry.model_dump() for entry in final_entries])
+
+# Reorder columns
+columns = [
+    "hospital", "lob", "place_of_service", "service_category",
+    "billing_code_type", "billing_code", "rate", "negotiated_type",
+    "additional_information", "effective_date"
 ]
-df = df[cols].fillna("N/A")
+df = df[columns].fillna("N/A")
+
+# Export to Excel
 df.to_excel(OUTPUT_XLSX, index=False)
 
 print(f"\n✅ Wrote {len(df)} rows to {OUTPUT_XLSX}")
-df.head()
+pprint(df.head().to_dict('records'))
