@@ -1,70 +1,34 @@
-# Install any missing packages (run once)
-!pip install PyPDF2 contextgem PyMuPDF pytesseract pdf2image pandas openpyxl
-
-# === Imports ===
-import os, re
-import pandas as pd
+import os, re, json, fitz, pytesseract
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional
+from typing import Optional, List
+from openai import OpenAI
+import instructor
 
-# PDF text extractors
-from PyPDF2 import PdfReader
-import fitz                       # PyMuPDF
-import pytesseract
-from pdf2image import convert_from_path
-from PIL import Image
+# -----------------------------------------------------------------------------
+# 1) AUTHENTICATE EXACTLY LIKE form_extractor.py (no hard‐coded key)
+# -----------------------------------------------------------------------------
+import google.auth
+from google.auth.transport.requests import Request
 
-# ContextGem
-from contextgem import Document, DocumentLLM, JsonObjectConcept
+creds, _ = google.auth.default()
+creds.refresh(Request())
+CLIENT = instructor.from_openai(
+    OpenAI(
+        base_url="https://YOUR‐AZURE‐RESOURCE.openai.azure.com/",
+        api_key=creds.token
+    ),
+    mode=instructor.Mode.JSON
+)
 
-# === CONFIG ===
-PDF_PATH     = r"C:\path\to\your_contract.pdf"      # ← your PDF
-OUTPUT_XLSX  = r"C:\path\to\contract_rates.xlsx"    # ← output file
-MODEL_NAME   = "openai/gpt-4o-mini"                 # or your Azure deployment
-os.environ["CONTEXTGEM_OPENAI_API_KEY"] = "sk-..."  # ← your key
+MODEL_NAME = "your‐deployment‐name"  # must match Azure deployment
 
-# === STEP 1: Try PyPDF2 ===
-pages = []
-reader = PdfReader(PDF_PATH)
-for i, page in enumerate(reader.pages, 1):
-    txt = page.extract_text() or ""
-    print(f"[PyPDF2] Page {i} length: {len(txt)}")
-    pages.append(txt)
-
-contract_text = "\n".join(pages).strip()
-
-# === STEP 2: Fallback to PyMuPDF if empty ===
-if not contract_text:
-    print("\nPyPDF2 failed; trying PyMuPDF...")
-    pages = []
-    doc = fitz.open(PDF_PATH)
-    for i, p in enumerate(doc, 1):
-        txt = p.get_text("text") or ""
-        print(f"[PyMuPDF] Page {i} length: {len(txt)}")
-        pages.append(txt)
-    contract_text = "\n".join(pages).strip()
-
-# === STEP 3: Fallback to OCR if still empty ===
-if not contract_text:
-    print("\nPyMuPDF failed; falling back to Tesseract OCR...")
-    pages = []
-    images = convert_from_path(PDF_PATH, dpi=200)
-    for i, img in enumerate(images, 1):
-        txt = pytesseract.image_to_string(img)
-        print(f"[OCR] Page {i} length: {len(txt)}")
-        pages.append(txt)
-    contract_text = "\n".join(pages).strip()
-
-if not contract_text:
-    raise RuntimeError("All extraction methods failed—no text found in PDF.")
-
-print(f"\n✅ Extracted {len(contract_text)} total characters. Proceeding…")
-
-# === STEP 4: Define Pydantic schema with validators ===
+# -----------------------------------------------------------------------------
+# 2) YOUR Pydantic schema (same as before)
+# -----------------------------------------------------------------------------
 class HospitalRateEntry(BaseModel):
-    hospital: str = Field(..., description="Facility name")
-    lob: str = Field(..., description="Line of business")
-    place_of_service: str = Field(..., description="IP or OP")
+    hospital: str
+    lob: str
+    place_of_service: str
     service_category: str
     billing_code_type: str
     billing_code: str
@@ -74,79 +38,85 @@ class HospitalRateEntry(BaseModel):
     effective_date: str
 
     @field_validator("rate")
-    def _check_rate(cls, v):
-        v = v.strip()
-        if not re.match(r"^\$?\d{1,3}(,\d{3})*(\.\d{2})?$|^\d{1,3}%$", v):
-            raise ValueError(f"Bad rate format: {v}")
-        return v
-
-    @field_validator("billing_code")
-    def _check_code(cls, v):
-        v = v.strip()
-        if not re.match(r"^[A-Za-z0-9\-, ]+$", v):
-            raise ValueError(f"Bad billing code: {v}")
-        return v
+    def validate_rate(cls, v):
+        if not re.match(r"^\$?\d{1,3}(,\d{3})*(\.\d{2})?$|^\d{1,3}%$", v.strip()):
+            raise ValueError(f"Bad rate: {v}")
+        return v.strip()
 
     @model_validator(mode="after")
-    def _fill_na(self):
-        for f in self.__fields__:
-            val = getattr(self, f)
-            if val is None or (isinstance(val, str) and not val.strip()):
-                setattr(self, f, "N/A")
-        return self
+    def fill_missing(cls, s):
+        for f in s.__fields__:
+            val = getattr(s, f)
+            if not val or (isinstance(val, str) and not val.strip()):
+                setattr(s, f, "N/A")
+        return s
 
-# === STEP 5: Build ContextGem Document & extract ===
-doc = Document(raw_text=contract_text)
-doc.add_concepts([ JsonObjectConcept(
-    name="HospitalRateEntry",
-    description="Extract one billing code per row with context & rates",
-    schema=HospitalRateEntry,
-    many=True
-)])
+# -----------------------------------------------------------------------------
+# 3) PROMPT builder
+# -----------------------------------------------------------------------------
+def build_prompt(text: str) -> str:
+    return f"""
+Extract every billing entry from this hospital contract.  Return a JSON array, where each element has:
+- hospital
+- lob
+- place_of_service
+- service_category
+- billing_code_type
+- billing_code
+- rate
+- negotiated_type
+- additional_information
+- effective_date
 
-llm = DocumentLLM(model=MODEL_NAME, api_key=os.environ["CONTEXTGEM_OPENAI_API_KEY"])
-doc = llm.extract_all(doc)
-entries = doc.get_concept_by_name("HospitalRateEntry").extracted_items
+Text:
+\"\"\"
+{text}
+\"\"\"
+"""
 
-# Log raw extractions
-print("\n— Raw LLM output —")
-for i, e in enumerate(entries, 1):
-    print(f"{i:2d}:", e.model_dump())
+# -----------------------------------------------------------------------------
+# 4) TEXT EXTRACTION (OCR fallback via PyMuPDF + Tesseract)
+# -----------------------------------------------------------------------------
+def extract_text(pdf_path: str) -> str:
+    import fitz, pytesseract
+    from PIL import Image
 
-# === STEP 6: Expand any code ranges ===
-def expand_codes(e):
-    parts = re.split(r',\s*', e.billing_code)
-    out = []
-    for p in parts:
-        if '-' in p:
-            a,b = map(int, re.findall(r'\d+', p))
-            for n in range(a, b+1):
-                ne = e.model_copy()
-                ne.billing_code = str(n)
-                out.append(ne)
-        else:
-            ne = e.model_copy()
-            ne.billing_code = p.strip()
-            out.append(ne)
-    return out
+    doc = fitz.open(pdf_path)
+    pages = []
+    for page in doc:
+        pix = page.get_pixmap(dpi=200)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        pages.append(pytesseract.image_to_string(img))
+    return "\n".join(pages)
 
-final = []
-print("\n— Range expansions —")
-for e in entries:
-    ex = expand_codes(e)
-    print(f"  {e.billing_code} → {[ee.billing_code for ee in ex]}")
-    final.extend(ex)
+# -----------------------------------------------------------------------------
+# 5) LLM extraction function (the “long way”)
+# -----------------------------------------------------------------------------
+def extract_with_instructor(text: str) -> List[HospitalRateEntry]:
+    prompt = build_prompt(text)
+    messages = [
+        {"role": "system", "content": "You are a JSON extraction engine."},
+        {"role": "user",   "content": prompt}
+    ]
+    res = CLIENT.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0,
+        max_tokens=5000
+    )
+    payload = res.choices[0].message.content
+    data = json.loads(payload)
+    return [HospitalRateEntry(**item) for item in data]
 
-# === STEP 7: To DataFrame, reorder, fill N/A, export ===
-df = pd.DataFrame([ee.model_dump() for ee in final])
-cols = [
-  "hospital","lob","place_of_service","service_category",
-  "billing_code_type","billing_code","rate","negotiated_type",
-  "additional_information","effective_date"
-]
-df = df[cols].fillna("N/A")
-df.to_excel(OUTPUT_XLSX, index=False)
-print(f"\n✅ Written {len(df)} rows to {OUTPUT_XLSX}")
+# -----------------------------------------------------------------------------
+# 6) Put it all together
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    pdf_path = "your_contract.pdf"
+    text = extract_text(pdf_path)
+    print("OCR →", len(text), "chars")
 
-# Show first few rows
-df.head()
+    entries = extract_with_instructor(text)
+    # (Optionally split ranges here, convert to DataFrame, export, etc.)
+    for idx, e in enumerate(entries, 1):
+        print(f"{idx:2d}.", e.dict())
