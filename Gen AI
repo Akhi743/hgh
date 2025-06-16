@@ -1,3 +1,6 @@
+# 0) Install dependencies (run once)
+# pip install easyocr pdf2image openai instructor pandas openpyxl
+
 import instructor
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -7,8 +10,8 @@ from tenacity import Retrying, retry_if_not_exception_type, stop_after_attempt
 from pydantic import AfterValidator, field_validator, model_validator
 from instructor.exceptions import InstructorRetryException
 import re
-import ocrutils
-import form_model as model
+# import ocrutils  # Commented out since module not found
+# import form_model as model  # Commented out if not needed
 from openai import OpenAI
 import pandas as pd
 import os
@@ -29,10 +32,45 @@ def init_model():
     )
 init_model()
 
-# === 2) Get OCR text using ocrutils ===
-# Use ocrutils to process the PDF and get OCR text
-info = ocrutils.process_pdf(PDF_PATH)  # Assuming ocrutils has a process_pdf function
-ocr_text = info.context["ocr_text"]
+# === 2) Get OCR text ===
+# Using EasyOCR for actual OCR on scanned PDFs
+try:
+    import easyocr
+    from pdf2image import convert_from_path
+    import numpy as np
+    
+    # Initialize EasyOCR reader
+    print("Initializing EasyOCR...")
+    reader = easyocr.Reader(['en'], gpu=False)  # Set gpu=True if you have CUDA
+    
+    # Convert PDF to images
+    print(f"Converting PDF to images: {PDF_PATH}")
+    images = convert_from_path(PDF_PATH, dpi=300)
+    
+    ocr_text = ""
+    for i, image in enumerate(images):
+        print(f"Processing page {i+1}/{len(images)}...")
+        
+        # Convert PIL image to numpy array
+        img_array = np.array(image)
+        
+        # Perform OCR
+        result = reader.readtext(img_array, detail=0)  # detail=0 returns only text
+        page_text = ' '.join(result)
+        ocr_text += page_text + "\n"
+    
+    # Create info object to match expected structure
+    class Info:
+        def __init__(self, text):
+            self.context = {"ocr_text": text}
+    
+    info = Info(ocr_text)
+    
+except ImportError as e:
+    print("Required packages not installed. Please install:")
+    print("pip install easyocr pdf2image pillow")
+    print(f"Error: {e}")
+    raise
 
 if not ocr_text:
     raise RuntimeError("No OCR text found in info.context")
