@@ -251,7 +251,9 @@ You are an expert table detection and classification specialist for hospital rat
 ANALYSIS STEPS:
 
 1. IDENTIFY DOCUMENT METADATA:
-   - Hospital/Health System name (look at document headers, titles)
+   - Hospital/Health System name: Extract the COMPLETE hospital name from document headers/titles
+     * Look for full names like "Mercy Springfield and Urbana Hospitals" not just "Mercy Health"
+     * Extract the exact full name as it appears in the document
    - Effective date (look for "Effective Date:" text)
    - Line of Business (LOB) type: 
      * If you see "COMMERCIAL RATE SCHEDULE" → lob_type = "Commercial"
@@ -273,13 +275,17 @@ ANALYSIS STEPS:
    - rate_amount: Just the monetary amount or percentage (e.g., "$1,800.00", "33%")
    - negotiated_type: The rate structure (e.g., "Per Diem", "Case Rate", "Base Rate", "Percentage")
    - additional_info: Any special conditions or notes (e.g., "Paid In Addition to Other Negotiated Rates", "Applied based upon Medicare Weights")
+     * IMPORTANT: If there are NO additional conditions/notes, set additional_info to "N/A"
+     * Only include actual additional information, not the basic rate type
 
    IMPORTANT: Break down the rate information properly:
-   - From "$1,800.00 Per Diem" extract: rate_amount="$1,800.00", negotiated_type="Per Diem"
-   - From "$354,075.00 Case Rate" extract: rate_amount="$354,075.00", negotiated_type="Case Rate"
-   - From "33% of Billed Charges" extract: rate_amount="33%", negotiated_type="Percentage"
+   - From "$1,800.00 Per Diem" extract: rate_amount="$1,800.00", negotiated_type="Per Diem", additional_info="N/A"
+   - From "$354,075.00 Case Rate" extract: rate_amount="$354,075.00", negotiated_type="Case Rate", additional_info="N/A"
+   - From "33% of Billed Charges" extract: rate_amount="33%", negotiated_type="Percentage", additional_info="N/A"
    - From "$9,600.00 Base Rate - Applied based upon Medicare Weights" extract: 
      rate_amount="$9,600.00", negotiated_type="Base Rate", additional_info="Applied based upon Medicare Weights"
+   - From "$750.00 Per Diem Paid In Addition to Other Negotiated Rates" extract:
+     rate_amount="$750.00", negotiated_type="Per Diem", additional_info="Paid In Addition to Other Negotiated Rates"
 
 4. Identify table type based on visual cues:
    - NEW TABLE: Has visible column headers at the top
