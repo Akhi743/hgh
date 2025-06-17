@@ -74,7 +74,7 @@ class TableData(BaseModel):
     table_type: Optional[str] = Field(default=None, description="Type: 'new', 'continuation', or 'none'")
     table_id: Optional[str] = Field(default=None, description="Unique identifier for this table")
     column_names: Optional[List[str]] = Field(default=None, description="List of column headers/names")
-    data: Optional[List[List[str]]] = Field(default=None, description="List of rows, where each row is a list of cell values")
+    data: Optional[List[Dict[str, str]]] = Field(default=None, description="List of rows with detailed breakdown: service, billing_code_type, billing_codes, rate_amount, negotiated_type, additional_info")
     table_description: Optional[str] = Field(default=None, description="Brief description of the table content")
     confidence_score: Optional[float] = Field(default=None, description="Confidence in table detection (0-1)")
     is_continuation: bool = Field(default=False, description="Whether this appears to be a continuation")
@@ -131,7 +131,7 @@ class TableRegistry:
            
         return str(csv_path)
    
-    def add_data_to_table(self, table_id: str, data_rows: List[List[str]], page_num: int):
+    def add_data_to_table(self, table_id: str, data_rows: List[Dict[str, str]], page_num: int):
         """Add data rows to existing table and append to CSV"""
         if table_id in self.active_tables:
             table_info = self.active_tables[table_id]
@@ -147,34 +147,33 @@ class TableRegistry:
                 for row_data in standardized_rows:
                     writer.writerow([row_data.get(col, 'N/A') for col in self.standard_columns])
                
-    def convert_to_standard_format(self, data_rows: List[List[str]], table_info: Dict[str, Any]) -> List[Dict[str, str]]:
+    def convert_to_standard_format(self, data_rows: List[Dict[str, str]], table_info: Dict[str, Any]) -> List[Dict[str, str]]:
         """Convert raw table data to standard format"""
         standardized_rows = []
         
         for row in data_rows:
-            if len(row) >= 3:  # Ensure we have at least Service, Billing Codes, Rates
-                service_name = row[0] if row[0] else "N/A"
-                billing_codes = row[1] if row[1] else "N/A"
-                rates = row[2] if row[2] else "N/A"
-                
-                # Determine place of service
-                place_of_service = "IP" if table_info['service_type'] == "INPATIENT" else "OP"
-                
-                row_data = {
-                    'Hospital': table_info['hospital_name'],
-                    'LOB': table_info['lob_type'],
-                    'Place of Service': place_of_service,
-                    'Service Category': service_name,
-                    'Billing Code Type': billing_codes.split(':')[0] if ':' in billing_codes else 'N/A',
-                    'Billing Code': billing_codes,
-                    'Rate': rates,
-                    'Negotiated Type': rates,  # Keep full rate text
-                    'Additional Information': 'N/A',
-                    'Effective Date': table_info['effective_date']
-                }
-                standardized_rows.append(row_data)
+            # Determine place of service
+            place_of_service = "IP" if table_info['service_type'] == "INPATIENT" else "OP"
+            
+            row_data = {
+                'Hospital': table_info['hospital_name'],
+                'LOB': table_info['lob_type'],
+                'Place of Service': place_of_service,
+                'Service Category': row.get('service', 'N/A'),
+                'Billing Code Type': row.get('billing_code_type', 'N/A'),
+                'Billing Code': row.get('billing_codes', 'N/A'),
+                'Rate': row.get('rate_amount', 'N/A'),
+                'Negotiated Type': row.get('negotiated_type', 'N/A'),
+                'Additional Information': row.get('additional_info', 'N/A'),
+                'Effective Date': table_info['effective_date']
+            }
+            standardized_rows.append(row_data)
         
         return standardized_rows
+    
+    def parse_rate_details(self, rates_text: str) -> tuple:
+        """This function is no longer needed - AI handles the parsing"""
+        return rates_text, rates_text, "N/A"
 
     def find_similar_table(self, potential_columns: List[str], similarity_threshold: float = 0.6) -> Optional[str]:
         """Find existing table with similar column structure"""
@@ -258,27 +257,34 @@ ANALYSIS STEPS:
      * If you see "COMMERCIAL RATE SCHEDULE" → lob_type = "Commercial"
      * If you see "ACOP COMMERCIAL" → lob_type = "ACOP Commercial" 
      * If no specific LOB mentioned → lob_type = "N/A"
-   - Service type: Look for "INPATIENT RATES" or "OUTPATIENT RATES" section headers
-     * IGNORE "CARVE OUT" sections - we only want INPATIENT or OUTPATIENT
-     * service_type should be "INPATIENT" or "OUTPATIENT"
+   - Service type: Look for section headers
+     * "INPATIENT RATES" or "INPATIENT CARVE OUT RATES" → service_type = "INPATIENT"
+     * "OUTPATIENT RATES" or "OUTPATIENT CARVE OUT RATES" → service_type = "OUTPATIENT"
+     * If contains "INPATIENT" (with or without "CARVE OUT") → service_type = "INPATIENT"
+     * If contains "OUTPATIENT" (with or without "CARVE OUT") → service_type = "OUTPATIENT"
 
-2. Look for structured data in rows and columns
+2. Look for structured data in rows and columns with Service, Billing Codes, Rates
 
-3. Identify table type based on visual cues:
+3. FOR TABLE DATA EXTRACTION:
+   For each row in the table, extract and break down:
+   - service: The service name/description (e.g., "Inpatient Psychiatric", "DRG", "Subacute Care - General")
+   - billing_code_type: The type of billing code (e.g., "DRG", "Revenue Codes", "HCPC Codes")
+   - billing_codes: The actual codes/ranges (e.g., "880-887", "190-192, 199", "S9982")
+   - rate_amount: Just the monetary amount or percentage (e.g., "$1,800.00", "33%")
+   - negotiated_type: The rate structure (e.g., "Per Diem", "Case Rate", "Base Rate", "Percentage")
+   - additional_info: Any special conditions or notes (e.g., "Paid In Addition to Other Negotiated Rates", "Applied based upon Medicare Weights")
+
+   IMPORTANT: Break down the rate information properly:
+   - From "$1,800.00 Per Diem" extract: rate_amount="$1,800.00", negotiated_type="Per Diem"
+   - From "$354,075.00 Case Rate" extract: rate_amount="$354,075.00", negotiated_type="Case Rate"
+   - From "33% of Billed Charges" extract: rate_amount="33%", negotiated_type="Percentage"
+   - From "$9,600.00 Base Rate - Applied based upon Medicare Weights" extract: 
+     rate_amount="$9,600.00", negotiated_type="Base Rate", additional_info="Applied based upon Medicare Weights"
+
+4. Identify table type based on visual cues:
    - NEW TABLE: Has visible column headers at the top
    - CONTINUATION: Has data rows but no headers (likely continuing from previous page)
    - NONE: No structured table present
-
-4. FOR NEW TABLES:
-   - Extract all column headers
-   - Provide descriptive table name
-   - Set confidence score (0-1)
-   - Generate unique table identifier
-
-5. FOR CONTINUATION TABLES:
-   - Set is_continuation to true
-   - List visual clues suggesting continuation
-   - Extract only data rows (no headers)
 
 {format_instructions}
 
@@ -323,20 +329,24 @@ You are extracting data from a KNOWN table continuation. This table has been ide
 KNOWN TABLE STRUCTURE:
 - Columns: {expected_columns}
 - Description: {table_description}
-- Column Count: {len(expected_columns)}
 
 EXTRACTION INSTRUCTIONS:
 1. Extract ONLY data rows (no headers)
-2. Maintain exact column order: {expected_columns}
-3. Each row must have exactly {len(expected_columns)} values
-4. Use empty string "" for missing/empty cells
-5. Preserve exact text including numbers, dates, symbols
+2. For each row, extract the detailed breakdown:
+   - service: The service name/description 
+   - billing_code_type: The type of billing code (DRG, Revenue Codes, HCPC Codes, etc.)
+   - billing_codes: The actual codes/ranges 
+   - rate_amount: Just the monetary amount or percentage 
+   - negotiated_type: The rate structure (Per Diem, Case Rate, etc.)
+   - additional_info: Any special conditions or notes
+
+3. Use empty string "" for missing/empty fields
+4. Preserve exact text including numbers, dates, symbols
 
 IMPORTANT SETTINGS:
 - Set has_table: true
 - Set is_continuation: true  
 - Set table_type: "continuation"
-- Use column_names: {expected_columns}
 
 {{format_instructions}}
 
