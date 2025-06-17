@@ -1,200 +1,544 @@
-# 0) Install dependencies (run once)
-# pip install easyocr pdf2image openai instructor pandas openpyxl
-
-import instructor
-from pydantic import BaseModel, Field
-from typing import List, Optional
-import json
-from pprint import pprint
-from tenacity import Retrying, retry_if_not_exception_type, stop_after_attempt
-from pydantic import AfterValidator, field_validator, model_validator
-from instructor.exceptions import InstructorRetryException
-import re
-# import ocrutils  # Commented out since module not found
-# import form_model as model  # Commented out if not needed
-from openai import OpenAI
-import pandas as pd
+import fitz  # PyMuPDF
 import os
+import csv
+import json
+import uuid
+from pathlib import Path
+from typing import List, Optional, Union, Dict, Any
+from google.genai import types
+import google.genai as genai
+from langchain.prompts import PromptTemplate
+from langchain.schema import HumanMessage
+from langchain.output_parsers import PydanticOutputParser, OutputFixingParser
+from langchain_core.exceptions import OutputParserException
+from langchain.agents import Tool, AgentExecutor, create_react_agent
+from langchain.memory import ConversationBufferMemory
+from pydantic import BaseModel, Field
+import pandas as pd
 
-# === CONFIGURATION ===
-PDF_PATH = r"C:\path\to\your_contract.pdf"          # ← your PDF file
-OUTPUT_XLSX = r"C:\path\to\contract_rates.xlsx"     # ← where to save Excel
-MODEL_NAME = "openai/gpt-4o-mini"                   # ← your model or Azure deployment
-os.environ["OPENAI_API_KEY"] = "sk-..."             # ← your OpenAI or Azure token
+def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
+    """
+    Convert each page of a PDF to individual images.
+   
+    Args:
+        pdf_path (str): Path to the input PDF file
+        output_dir (str): Directory to save images (default: same as PDF)
+        dpi (int): Resolution for output images (default: 150)
+        image_format (str): Output format ('png', 'jpg', 'jpeg')
+   
+    Returns:
+        list: Paths to the created image files
+    """
+    pdf_path = Path(pdf_path)
+   
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+   
+    if output_dir is None:
+        output_dir = pdf_path.parent
+    else:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+   
+    doc = fitz.open(pdf_path)
+    image_paths = []
+   
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+       
+        # Create transformation matrix for DPI
+        mat = fitz.Matrix(dpi/72, dpi/72)
+        pix = page.get_pixmap(matrix=mat)
+       
+        # Generate output filename
+        output_filename = f"{pdf_path.stem}_page_{page_num + 1:03d}.{image_format}"
+        output_path = output_dir / output_filename
+       
+        # Save image
+        pix.save(str(output_path))
+        image_paths.append(str(output_path))
+       
+        print(f"Saved page {page_num + 1} to {output_path}")
+        if page_num == 20:  # Limit to first 20 pages for large PDFs
+            print("Limiting to first 20 pages for large PDFs")
+            break
+   
+    doc.close()
+    return image_paths
 
-# === 1) Initialize the Instructor client ===
-CLIENT = None
-def init_model():
-    global CLIENT
-    CLIENT = instructor.from_openai(
-        OpenAI(api_key=os.environ["OPENAI_API_KEY"]),
-        mode=instructor.Mode.JSON
-    )
-init_model()
+class TableData(BaseModel):
+    """
+    Enhanced model for multi-page table data extraction.
+    """
+    has_table: bool = Field(description="Whether a structured data table is present in the image")
+    table_type: Optional[str] = Field(default=None, description="Type: 'new', 'continuation', or 'none'")
+    table_id: Optional[str] = Field(default=None, description="Unique identifier for this table")
+    column_names: Optional[List[str]] = Field(default=None, description="List of column headers/names")
+    data: Optional[List[List[str]]] = Field(default=None, description="List of rows, where each row is a list of cell values")
+    table_description: Optional[str] = Field(default=None, description="Brief description of the table content")
+    confidence_score: Optional[float] = Field(default=None, description="Confidence in table detection (0-1)")
+    is_continuation: bool = Field(default=False, description="Whether this appears to be a continuation")
+    continuation_clues: Optional[List[str]] = Field(default=None, description="Visual/textual clues for continuation")
+    
+    # Hospital-specific fields
+    hospital_name: Optional[str] = Field(default=None, description="Name of the hospital or health system")
+    effective_date: Optional[str] = Field(default=None, description="Effective date mentioned in the document")
+    lob_type: Optional[str] = Field(default=None, description="Line of Business type (Commercial, ACOP Commercial, etc.)")
+    service_type: Optional[str] = Field(default=None, description="INPATIENT or OUTPATIENT only")
 
-# === 2) Get OCR text ===
-# Using EasyOCR for actual OCR on scanned PDFs
-try:
-    import easyocr
-    from pdf2image import convert_from_path
-    import numpy as np
-    
-    # Initialize EasyOCR reader
-    print("Initializing EasyOCR...")
-    reader = easyocr.Reader(['en'], gpu=False)  # Set gpu=True if you have CUDA
-    
-    # Convert PDF to images
-    print(f"Converting PDF to images: {PDF_PATH}")
-    images = convert_from_path(PDF_PATH, dpi=300)
-    
-    ocr_text = ""
-    for i, image in enumerate(images):
-        print(f"Processing page {i+1}/{len(images)}...")
+class TableRegistry:
+    """
+    Registry to track active tables across multiple pages with CSV management.
+    """
+    def __init__(self, output_dir: Path):
+        self.active_tables: Dict[str, Dict[str, Any]] = {}
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Convert PIL image to numpy array
-        img_array = np.array(image)
+        # Standard output columns for hospital rates
+        self.standard_columns = [
+            'Hospital', 'LOB', 'Place of Service', 'Service Category', 
+            'Billing Code Type', 'Billing Code', 'Rate', 'Negotiated Type',
+            'Additional Information', 'Effective Date'
+        ]
+       
+    def register_table(self, table_id: str, column_names: List[str], description: str, page_num: int, 
+                      hospital_name: str = "N/A", lob_type: str = "N/A", service_type: str = "N/A", 
+                      effective_date: str = "N/A") -> str:
+        """Register a new table and create its CSV file"""
+        csv_filename = f"table_{len(self.active_tables) + 1}_{table_id[:8]}.csv"
+        csv_path = self.output_dir / csv_filename
+       
+        self.active_tables[table_id] = {
+            'column_names': self.standard_columns,
+            'original_columns': column_names,
+            'description': description,
+            'start_page': page_num,
+            'last_page': page_num,
+            'data_rows': [],
+            'csv_path': str(csv_path),
+            'csv_filename': csv_filename,
+            'hospital_name': hospital_name,
+            'lob_type': lob_type,
+            'service_type': service_type,
+            'effective_date': effective_date
+        }
+       
+        # Create CSV with standard headers
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(self.standard_columns)
+           
+        return str(csv_path)
+   
+    def add_data_to_table(self, table_id: str, data_rows: List[List[str]], page_num: int):
+        """Add data rows to existing table and append to CSV"""
+        if table_id in self.active_tables:
+            table_info = self.active_tables[table_id]
+            table_info['data_rows'].extend(data_rows)
+            table_info['last_page'] = page_num
+           
+            # Convert and append to CSV
+            csv_path = table_info['csv_path']
+            standardized_rows = self.convert_to_standard_format(data_rows, table_info)
+            
+            with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                for row_data in standardized_rows:
+                    writer.writerow([row_data.get(col, 'N/A') for col in self.standard_columns])
+               
+    def convert_to_standard_format(self, data_rows: List[List[str]], table_info: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Convert raw table data to standard format"""
+        standardized_rows = []
         
-        # Perform OCR
-        result = reader.readtext(img_array, detail=0)  # detail=0 returns only text
-        page_text = ' '.join(result)
-        ocr_text += page_text + "\n"
-    
-    # Create info object to match expected structure
-    class Info:
-        def __init__(self, text):
-            self.context = {"ocr_text": text}
-    
-    info = Info(ocr_text)
-    
-except ImportError as e:
-    print("Required packages not installed. Please install:")
-    print("pip install easyocr pdf2image pillow")
-    print(f"Error: {e}")
-    raise
+        for row in data_rows:
+            if len(row) >= 3:  # Ensure we have at least Service, Billing Codes, Rates
+                service_name = row[0] if row[0] else "N/A"
+                billing_codes = row[1] if row[1] else "N/A"
+                rates = row[2] if row[2] else "N/A"
+                
+                # Determine place of service
+                place_of_service = "IP" if table_info['service_type'] == "INPATIENT" else "OP"
+                
+                row_data = {
+                    'Hospital': table_info['hospital_name'],
+                    'LOB': table_info['lob_type'],
+                    'Place of Service': place_of_service,
+                    'Service Category': service_name,
+                    'Billing Code Type': billing_codes.split(':')[0] if ':' in billing_codes else 'N/A',
+                    'Billing Code': billing_codes,
+                    'Rate': rates,
+                    'Negotiated Type': rates,  # Keep full rate text
+                    'Additional Information': 'N/A',
+                    'Effective Date': table_info['effective_date']
+                }
+                standardized_rows.append(row_data)
+        
+        return standardized_rows
 
-if not ocr_text:
-    raise RuntimeError("No OCR text found in info.context")
-if not ocr_text:
-    raise RuntimeError("No OCR text found in info.context")
-print(f"\n✅ Total OCR text chars: {len(ocr_text)}\n")
-print(f"Processing PDF: {PDF_PATH}")
+    def find_similar_table(self, potential_columns: List[str], similarity_threshold: float = 0.6) -> Optional[str]:
+        """Find existing table with similar column structure"""
+        best_match = None
+        best_similarity = 0
+       
+        for table_id, table_info in self.active_tables.items():
+            existing_cols = table_info['original_columns']
+            similarity = self._calculate_column_similarity(existing_cols, potential_columns)
+           
+            if similarity >= similarity_threshold and similarity > best_similarity:
+                best_similarity = similarity
+                best_match = table_id
+               
+        return best_match
+       
+    def _calculate_column_similarity(self, cols1: List[str], cols2: List[str]) -> float:
+        """Calculate similarity between two column sets"""
+        if not cols1 or not cols2:
+            return 0.0
+           
+        # Normalize column names for comparison
+        cols1_norm = [col.lower().strip() for col in cols1]
+        cols2_norm = [col.lower().strip() for col in cols2]
+       
+        # Calculate Jaccard similarity
+        set1, set2 = set(cols1_norm), set(cols2_norm)
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+       
+        return intersection / union if union > 0 else 0.0
+       
+    def get_table_context(self, table_id: str) -> Dict[str, Any]:
+        """Get context information for a table"""
+        return self.active_tables.get(table_id, {})
+       
+    def get_all_tables(self) -> Dict[str, Dict[str, Any]]:
+        """Get all registered tables"""
+        return self.active_tables
 
-# === 3) Define Pydantic schema with validators & N/A fallback ===
-class HospitalRateEntry(BaseModel):
-    hospital: str = Field(..., description="Facility name")
-    lob: str = Field(..., description="Line of business")
-    place_of_service: str = Field(..., description="IP or OP")
-    service_category: str
-    billing_code_type: str
-    billing_code: str
-    rate: str
-    negotiated_type: str
-    additional_information: Optional[str] = ""
-    effective_date: str
+class MultiPageTableExtractor:
+    """
+    Main class for extracting tables across multiple pages with context awareness.
+    """
+   
+    def __init__(self, client, output_dir: str = None):
+        self.client = client
+        self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+        self.table_registry = TableRegistry(self.output_dir)
+       
+    def create_table_detection_prompt(self) -> tuple:
+        """Create prompt for initial table detection and classification"""
+        base_parser = PydanticOutputParser(pydantic_object=TableData)
+       
+        class GeminiLLM:
+            def __init__(self, client):
+                self.client = client
+               
+            def __call__(self, prompt: str) -> str:
+                try:
+                    response = self.client.models.generate_content(
+                        model='gemini-2.0-flash',
+                        contents=[prompt]
+                    )
+                    return response.text
+                except Exception as e:
+                    return f"Error: {e}"
+       
+        llm_wrapper = GeminiLLM(self.client)
+        table_parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
+       
+        template = """
+You are an expert table detection and classification specialist for hospital rate schedules.
 
-    @field_validator("rate")
-    def check_rate(cls, v):
-        if not re.match(r"^\$?\d{1,3}(,\d{3})*(\.\d{2})?$|^\d{1,3}%$", v.strip()):
-            raise ValueError(f"Invalid rate: {v}")
-        return v.strip()
+ANALYSIS STEPS:
 
-    @field_validator("billing_code")
-    def check_code(cls, v):
-        if not re.match(r"^[A-Za-z0-9\-, ]+$", v.strip()):
-            raise ValueError(f"Invalid code: {v}")
-        return v.strip()
+1. IDENTIFY DOCUMENT METADATA:
+   - Hospital/Health System name (look at document headers, titles)
+   - Effective date (look for "Effective Date:" text)
+   - Line of Business (LOB) type: 
+     * If you see "COMMERCIAL RATE SCHEDULE" → lob_type = "Commercial"
+     * If you see "ACOP COMMERCIAL" → lob_type = "ACOP Commercial" 
+     * If no specific LOB mentioned → lob_type = "N/A"
+   - Service type: Look for "INPATIENT RATES" or "OUTPATIENT RATES" section headers
+     * IGNORE "CARVE OUT" sections - we only want INPATIENT or OUTPATIENT
+     * service_type should be "INPATIENT" or "OUTPATIENT"
 
-    @model_validator(mode="after")
-    def fill_na(self):
-        for field_name in self.model_fields:
-            val = getattr(self, field_name)
-            if not val or (isinstance(val, str) and not val.strip()):
-                setattr(self, field_name, "N/A")
-        return self
+2. Look for structured data in rows and columns
 
-# === 4) Extract entries with retry logic ===
-prompt = f"""
-Extract every billing entry from this hospital contract into a JSON array.
-Each object must have exactly these keys:
-hospital, lob, place_of_service, service_category,
-billing_code_type, billing_code, rate, negotiated_type,
-additional_information, effective_date
+3. Identify table type based on visual cues:
+   - NEW TABLE: Has visible column headers at the top
+   - CONTINUATION: Has data rows but no headers (likely continuing from previous page)
+   - NONE: No structured table present
 
-Here is the contract text:
-\"\"\"
-{ocr_text}
-\"\"\"
+4. FOR NEW TABLES:
+   - Extract all column headers
+   - Provide descriptive table name
+   - Set confidence score (0-1)
+   - Generate unique table identifier
+
+5. FOR CONTINUATION TABLES:
+   - Set is_continuation to true
+   - List visual clues suggesting continuation
+   - Extract only data rows (no headers)
+
+{format_instructions}
+
+Analyze the image and extract hospital rate information:
 """
+       
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=[],
+            partial_variables={"format_instructions": table_parser.get_format_instructions()}
+        )
+       
+        return prompt, table_parser
+       
+    def create_context_aware_prompt(self, context_info: Dict[str, Any]) -> tuple:
+        """Create context-aware prompt for table continuation extraction"""
+        base_parser = PydanticOutputParser(pydantic_object=TableData)
+       
+        class GeminiLLM:
+            def __init__(self, client):
+                self.client = client
+               
+            def __call__(self, prompt: str) -> str:
+                try:
+                    response = self.client.models.generate_content(
+                        model='gemini-2.0-flash',
+                        contents=[prompt]
+                    )
+                    return response.text
+                except Exception as e:
+                    return f"Error: {e}"
+       
+        llm_wrapper = GeminiLLM(self.client)
+        table_parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
+       
+        expected_columns = context_info.get('original_columns', [])
+        table_description = context_info.get('description', 'Table continuation')
+       
+        template = f"""
+You are extracting data from a KNOWN table continuation. This table has been identified across multiple pages.
 
-# Use tenacity retry logic
-entries = []
-for attempt in Retrying(
-    retry=retry_if_not_exception_type(InstructorRetryException),
-    stop=stop_after_attempt(3)
-):
-    with attempt:
+KNOWN TABLE STRUCTURE:
+- Columns: {expected_columns}
+- Description: {table_description}
+- Column Count: {len(expected_columns)}
+
+EXTRACTION INSTRUCTIONS:
+1. Extract ONLY data rows (no headers)
+2. Maintain exact column order: {expected_columns}
+3. Each row must have exactly {len(expected_columns)} values
+4. Use empty string "" for missing/empty cells
+5. Preserve exact text including numbers, dates, symbols
+
+IMPORTANT SETTINGS:
+- Set has_table: true
+- Set is_continuation: true  
+- Set table_type: "continuation"
+- Use column_names: {expected_columns}
+
+{{format_instructions}}
+
+Extract the table data rows:
+"""
+       
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=[],
+            partial_variables={"format_instructions": table_parser.get_format_instructions()}
+        )
+       
+        return prompt, table_parser
+       
+    def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
+        """Process a single page with context awareness"""
+        print(f"Processing page {page_num}: {Path(image_path).name}")
+       
         try:
-            res = CLIENT.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": "You extract structured JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0,
-                response_model=List[HospitalRateEntry]  # Direct validation
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+           
+            mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
+           
+            # Step 1: Initial table detection
+            detection_prompt, detection_parser = self.create_table_detection_prompt()
+            detection_text = detection_prompt.format()
+           
+            response = self.client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    detection_text
+                ]
             )
-            entries = res
+           
+            parsed_response = detection_parser.parse(response.text.strip())
+           
+            if not parsed_response.has_table:
+                print(f"No table found on page {page_num}")
+                return {
+                    'page_num': page_num,
+                    'has_table': False,
+                    'reason': getattr(parsed_response, 'reason', 'No table detected')
+                }
+           
+            # Step 2: Handle different table types
+            if parsed_response.table_type == "new" or (parsed_response.column_names and not parsed_response.is_continuation):
+                # New table detected
+                table_id = str(uuid.uuid4())
+                column_names = parsed_response.column_names
+                description = parsed_response.table_description or f"Table starting on page {page_num}"
+               
+                print(f"New table detected: {description}")
+                print(f"Columns: {column_names}")
+               
+                # Register new table with hospital metadata
+                csv_path = self.table_registry.register_table(
+                    table_id, column_names, description, page_num,
+                    parsed_response.hospital_name or "N/A",
+                    parsed_response.lob_type or "N/A", 
+                    parsed_response.service_type or "N/A",
+                    parsed_response.effective_date or "N/A"
+                )
+               
+                # Add initial data if present
+                if parsed_response.data:
+                    self.table_registry.add_data_to_table(table_id, parsed_response.data, page_num)
+                    print(f"Added {len(parsed_response.data)} initial rows")
+               
+                return {
+                    'page_num': page_num,
+                    'has_table': True,
+                    'table_type': 'new',
+                    'table_id': table_id,
+                    'csv_path': csv_path,
+                    'rows_added': len(parsed_response.data) if parsed_response.data else 0
+                }
+               
+            elif parsed_response.is_continuation or parsed_response.table_type == "continuation":
+                # Table continuation detected
+                print(f"Table continuation detected on page {page_num}")
+               
+                # Try to match with existing table
+                if parsed_response.column_names:
+                    # Has some column info - try to match
+                    matching_table_id = self.table_registry.find_similar_table(parsed_response.column_names)
+                else:
+                    # No column info - assume continuation of most recent table
+                    matching_table_id = list(self.table_registry.active_tables.keys())[-1] if self.table_registry.active_tables else None
+               
+                if matching_table_id:
+                    context_info = self.table_registry.get_table_context(matching_table_id)
+                   
+                    # Re-extract with context
+                    context_prompt, context_parser = self.create_context_aware_prompt(context_info)
+                    context_text = context_prompt.format()
+                   
+                    context_response = self.client.models.generate_content(
+                        model='gemini-2.0-flash',
+                        contents=[
+                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                            context_text
+                        ]
+                    )
+                   
+                    context_parsed = context_parser.parse(context_response.text.strip())
+                   
+                    if context_parsed.data:
+                        self.table_registry.add_data_to_table(matching_table_id, context_parsed.data, page_num)
+                        print(f"Added {len(context_parsed.data)} rows to existing table")
+                       
+                        return {
+                            'page_num': page_num,
+                            'has_table': True,
+                            'table_type': 'continuation',
+                            'table_id': matching_table_id,
+                            'rows_added': len(context_parsed.data)
+                        }
+               
+                print(f"Could not match continuation to existing table")
+                return {
+                    'page_num': page_num,
+                    'has_table': False,
+                    'reason': 'Continuation detected but no matching table found'
+                }
+           
         except Exception as e:
-            print(f"Attempt {attempt.retry_state.attempt_number} failed: {e}")
-            if attempt.retry_state.attempt_number == 3:
-                raise
+            print(f"Error processing page {page_num}: {e}")
+            return {
+                'page_num': page_num,
+                'has_table': False,
+                'error': str(e)
+            }
+   
+    def extract_tables_from_pdf(self, pdf_path: str, dpi: int = 150, image_format: str = 'png') -> Dict[str, Any]:
+        """
+        Extract all tables from PDF with multi-page awareness.
+        """
+        print(f"Starting multi-page table extraction for: {pdf_path}")
+       
+        # Convert PDF to images
+        image_paths = pdf_to_images(pdf_path, self.output_dir, dpi, image_format)
+       
+        # Process each page
+        results = {
+            'pdf_path': pdf_path,
+            'total_pages': len(image_paths),
+            'processed_pages': [],
+            'tables_found': {},
+            'csv_files': []
+        }
+       
+        for page_num, image_path in enumerate(image_paths, 1):
+            page_result = self.process_page(image_path, page_num)
+            results['processed_pages'].append(page_result)
+           
+            if page_result.get('table_id'):
+                table_id = page_result['table_id']
+                if table_id not in results['tables_found']:
+                    table_info = self.table_registry.get_table_context(table_id)
+                    results['tables_found'][table_id] = {
+                        'description': table_info['description'],
+                        'columns': table_info['original_columns'],
+                        'csv_path': table_info['csv_path'],
+                        'hospital_name': table_info.get('hospital_name', 'N/A'),
+                        'lob_type': table_info.get('lob_type', 'N/A'),
+                        'service_type': table_info.get('service_type', 'N/A'),
+                        'pages': []
+                    }
+                results['tables_found'][table_id]['pages'].append(page_num)
+       
+        # Get final CSV files
+        for table_info in self.table_registry.get_all_tables().values():
+            results['csv_files'].append(table_info['csv_path'])
+       
+        # Summary
+        total_tables = len(results['tables_found'])
+        pages_with_tables = len([p for p in results['processed_pages'] if p.get('has_table')])
+       
+        print(f"\n=== MULTI-PAGE EXTRACTION SUMMARY ===")
+        print(f"Total pages processed: {results['total_pages']}")
+        print(f"Pages with tables: {pages_with_tables}")
+        print(f"Unique tables found: {total_tables}")
+        print(f"CSV files created: {len(results['csv_files'])}")
+       
+        if results['csv_files']:
+            print(f"\nCSV Files Created:")
+            for csv_file in results['csv_files']:
+                print(f"  - {csv_file}")
+       
+        return results
 
-print("— Raw extracted entries —")
-for i, e in enumerate(entries, 1):
-    print(f"{i:2d}.", e.model_dump())
-
-# === 5) Expand billing-code ranges (e.g. "190-192") ===
-def expand_codes(entry: HospitalRateEntry) -> List[HospitalRateEntry]:
-    expanded = []
-    for part in re.split(r',\s*', entry.billing_code):
-        if '-' in part:
-            nums = re.findall(r'\d+', part)
-            if len(nums) >= 2:
-                start, end = int(nums[0]), int(nums[1])
-                for n in range(start, end + 1):
-                    new_entry = entry.model_copy()
-                    new_entry.billing_code = str(n)
-                    expanded.append(new_entry)
-            else:
-                new_entry = entry.model_copy()
-                new_entry.billing_code = part.strip()
-                expanded.append(new_entry)
-        else:
-            new_entry = entry.model_copy()
-            new_entry.billing_code = part.strip()
-            expanded.append(new_entry)
-    return expanded
-
-final_entries: List[HospitalRateEntry] = []
-print("\n— Range expansions —")
-for entry in entries:
-    expanded = expand_codes(entry)
-    print(f" {entry.billing_code} → {[x.billing_code for x in expanded]}")
-    final_entries.extend(expanded)
-
-# === 6) Convert to DataFrame and export to Excel ===
-df = pd.DataFrame([entry.model_dump() for entry in final_entries])
-
-# Reorder columns
-columns = [
-    "hospital", "lob", "place_of_service", "service_category",
-    "billing_code_type", "billing_code", "rate", "negotiated_type",
-    "additional_information", "effective_date"
-]
-df = df[columns].fillna("N/A")
-
-# Export to Excel
-df.to_excel(OUTPUT_XLSX, index=False)
-
-print(f"\n✅ Wrote {len(df)} rows to {OUTPUT_XLSX}")
-pprint(df.head().to_dict('records'))
+# Usage example
+if __name__ == "__main__":
+    # Example usage
+    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"  # Replace with your PDF file path
+   
+    from google import genai
+    client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+   
+    extractor = MultiPageTableExtractor(client, output_dir="extracted_tables")
+    results = extractor.extract_tables_from_pdf(pdf_file, dpi=300)
+   
+    print("Multi-page table extractor ready!")
