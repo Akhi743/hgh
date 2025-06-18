@@ -101,6 +101,9 @@ class TableRegistry:
             'Billing Code Type', 'Billing Code', 'Rate', 'Negotiated Type',
             'Additional Information', 'Effective Date'
         ]
+        
+        # Track document-level hospital name
+        self.document_hospital_name = None
        
     def register_table(self, table_id: str, column_names: List[str], description: str, page_num: int, 
                       hospital_name: str = "N/A", lob_type: str = "N/A", service_type: str = "N/A", 
@@ -108,6 +111,17 @@ class TableRegistry:
         """Register a new table and create its CSV file"""
         csv_filename = f"table_{len(self.active_tables) + 1}_{table_id[:8]}.csv"
         csv_path = self.output_dir / csv_filename
+        
+        # Set document-level hospital name if this is the first valid hospital name we see
+        if (hospital_name and hospital_name != "N/A" and 
+            (not self.document_hospital_name or self.document_hospital_name == "N/A")):
+            self.document_hospital_name = hospital_name
+        
+        # Use document-level hospital name if current extraction is generic
+        final_hospital_name = hospital_name
+        if (self.document_hospital_name and 
+            (not hospital_name or hospital_name == "N/A" or "Health" in hospital_name and "Hospitals" not in hospital_name)):
+            final_hospital_name = self.document_hospital_name
        
         self.active_tables[table_id] = {
             'column_names': self.standard_columns,
@@ -118,7 +132,7 @@ class TableRegistry:
             'data_rows': [],
             'csv_path': str(csv_path),
             'csv_filename': csv_filename,
-            'hospital_name': hospital_name,
+            'hospital_name': final_hospital_name,
             'lob_type': lob_type,
             'service_type': service_type,
             'effective_date': effective_date
@@ -251,14 +265,17 @@ You are an expert table detection and classification specialist for hospital rat
 ANALYSIS STEPS:
 
 1. IDENTIFY DOCUMENT METADATA:
-   - Hospital/Health System name: Extract the COMPLETE hospital name from document headers/titles
-     * Look for full names like "Mercy Springfield and Urbana Hospitals" not just "Mercy Health"
-     * Extract the exact full name as it appears in the document
+   - Hospital/Health System name: Extract the SPECIFIC hospital name(s) from document headers/titles
+     * Look for hospital names like "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital", "Advocate Condell Medical Center and Advocate Sherman Hospital"
+     * Extract the actual facility names, NOT just system names like "Mercy Health" or "Advocate Health"
+     * The hospital name appears in the document header/title area before the tables
    - Effective date (look for "Effective Date:" text)
-   - Line of Business (LOB) type: 
-     * If you see "COMMERCIAL RATE SCHEDULE" → lob_type = "Commercial"
-     * If you see "ACOP COMMERCIAL" → lob_type = "ACOP Commercial" 
-     * If no specific LOB mentioned → lob_type = "N/A"
+   - Line of Business (LOB) type: Look carefully for LOB indicators in headers/titles
+     * If you see "COMMERCIAL" (like "COMMERCIAL GATEKEEPER", "COMMERCIAL RATE SCHEDULE") → lob_type = "Commercial"
+     * If you see "MEDICARE" → lob_type = "Medicare" 
+     * If you see "MEDICAID" → lob_type = "Medicaid"
+     * If you see "ACOP COMMERCIAL" → lob_type = "ACOP Commercial"
+     * If NO LOB is mentioned in headers → lob_type = "N/A"
    - Service type: Look for section headers
      * "INPATIENT RATES" or "INPATIENT CARVE OUT RATES" → service_type = "INPATIENT"
      * "OUTPATIENT RATES" or "OUTPATIENT CARVE OUT RATES" → service_type = "OUTPATIENT"
