@@ -125,8 +125,14 @@ class TableRegistry:
         # Use document-level hospital name if current extraction is generic
         final_hospital_name = hospital_name
         if (self.document_hospital_name and 
-            (not hospital_name or hospital_name == "N/A" or "Health" in hospital_name and "Hospitals" not in hospital_name)):
+            (not hospital_name or hospital_name == "N/A" or 
+             ("Health" in hospital_name and "Hospitals" not in hospital_name) or
+             hospital_name == "Mercy Health")):
             final_hospital_name = self.document_hospital_name
+        
+        # Debug print to see what's being extracted
+        print(f"DEBUG: Extracted hospital_name='{hospital_name}', Using final='{final_hospital_name}'")
+        print(f"DEBUG: Document-level hospital='{self.document_hospital_name}'")
             
         # Use document-level service type for consistency
         final_service_type = service_type
@@ -276,8 +282,12 @@ You are an expert table detection and classification specialist for hospital rat
 
 ANALYSIS STEPS:
 
-1. IDENTIFY DOCUMENT METADATA:
-   - Hospital/Health System name: Extract the SPECIFIC hospital name(s) from document headers/titles
+1. IDENTIFY DOCUMENT METADATA (CRITICAL - LOOK CAREFULLY):
+   - Hospital/Health System name: Extract the EXACT COMPLETE hospital name from document headers/titles
+     * LOOK FOR THE FULL HOSPITAL NAME in titles like "Mercy Springfield and Urbana Hospitals Qualified Health Plan rates"
+     * DO NOT extract system names like "Mercy Health" - extract the SPECIFIC facility name
+     * Examples: "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital", "Advocate Condell Medical Center"
+     * The complete hospital name appears in the main document title/header
    - Effective date (look for "Effective Date:" text)
    - Line of Business (LOB) type: Look for LOB indicators in headers/titles
      * If you see "COMMERCIAL" → lob_type = "Commercial"
@@ -313,6 +323,8 @@ ANALYSIS STEPS:
    - NEW TABLE: Has visible column headers
    - CONTINUATION: Has data rows but no headers
    - NONE: No structured table present
+
+CRITICAL: Always extract the COMPLETE hospital facility name from the document title, not the health system name.
 
 {format_instructions}
 
