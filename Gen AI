@@ -101,8 +101,9 @@ class TableRegistry:
             'Billing Codes', 'Rate', 'Negotiated Type', 'Effective Date'
         ]
         
-        # Track document-level hospital name
+        # Track document-level hospital name and service type
         self.document_hospital_name = None
+        self.document_service_type = None
        
     def register_table(self, table_id: str, column_names: List[str], description: str, page_num: int, 
                       hospital_name: str = "N/A", lob_type: str = "N/A", service_type: str = "N/A", 
@@ -116,11 +117,21 @@ class TableRegistry:
             (not self.document_hospital_name or self.document_hospital_name == "N/A")):
             self.document_hospital_name = hospital_name
         
+        # Set document-level service type if this is the first valid service type we see
+        if (service_type and service_type != "N/A" and 
+            (not self.document_service_type or self.document_service_type == "N/A")):
+            self.document_service_type = service_type
+        
         # Use document-level hospital name if current extraction is generic
         final_hospital_name = hospital_name
         if (self.document_hospital_name and 
             (not hospital_name or hospital_name == "N/A" or "Health" in hospital_name and "Hospitals" not in hospital_name)):
             final_hospital_name = self.document_hospital_name
+            
+        # Use document-level service type for consistency
+        final_service_type = service_type
+        if self.document_service_type and (not service_type or service_type == "N/A"):
+            final_service_type = self.document_service_type
        
         self.active_tables[table_id] = {
             'column_names': self.standard_columns,
@@ -133,7 +144,7 @@ class TableRegistry:
             'csv_filename': csv_filename,
             'hospital_name': final_hospital_name,
             'lob_type': lob_type,
-            'service_type': service_type,
+            'service_type': final_service_type,
             'effective_date': effective_date
         }
        
@@ -267,8 +278,6 @@ ANALYSIS STEPS:
 
 1. IDENTIFY DOCUMENT METADATA:
    - Hospital/Health System name: Extract the SPECIFIC hospital name(s) from document headers/titles
-     * Look for hospital names like "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital"
-     * Extract the actual facility names, NOT just system names like "Mercy Health"
    - Effective date (look for "Effective Date:" text)
    - Line of Business (LOB) type: Look for LOB indicators in headers/titles
      * If you see "COMMERCIAL" → lob_type = "Commercial"
@@ -284,17 +293,21 @@ ANALYSIS STEPS:
 2. FOR TABLE DATA EXTRACTION:
    For each row in the table, extract:
    - service: The service name/description (e.g., "Ambulatory Surgery", "Cardiac Catheterization Procedures")
-   - billing_codes: Extract the COMPLETE billing codes column AS-IS, including all code types and codes
-     * Example: "HCPC Code: C7521-C7529, C7552, C7553, C9758, C9760, G0448, CPT4 Codes: 0408T, 0410T, 0411T..."
-     * DO NOT split into separate billing code type and codes - keep it all together
-   - rate: Just the numerical rate (e.g., "$1,800.00", "85.1%")
-   - negotiated_type: Combine the rate type and any additional information into one field
-     * Example: "Per Diem", "85.1% of Billed Charges Rate Applies to Entire Bill", "Base Rate Applied based upon Medicare Weights"
+   - billing_codes: Extract the COMPLETE billing codes column AS-IS
+     * Example: "HCPC Code: C7521-C7529, C7552, C7553, CPT4 Codes: 0408T, 0410T, 0411T..."
+     * Keep all billing code information together
+   - rate: Extract ONLY the numerical rate/percentage (e.g., "85.1%", "$1,800.00")
+   - negotiated_type: Extract everything AFTER the rate number
+     * From "85.1% of Billed Charges Rate Applies to Entire Bill" extract:
+       rate = "85.1%", negotiated_type = "of Billed Charges Rate Applies to Entire Bill"
+     * From "$1,800.00 Per Diem" extract:
+       rate = "$1,800.00", negotiated_type = "Per Diem"
+     * From "230% of Medicare Physician Fee Schedule" extract:
+       rate = "230%", negotiated_type = "of Medicare Physician Fee Schedule"
 
    IMPORTANT: 
-   - Keep billing codes exactly as they appear in the Billing Codes column
-   - If a service has multiple billing code types (like HCPC and CPT4), include ALL of them in one billing_codes field
-   - Combine rate structure and additional info into negotiated_type
+   - Rate should be ONLY the number/percentage
+   - Negotiated type should be everything else that describes the rate structure
 
 3. Identify table type:
    - NEW TABLE: Has visible column headers
