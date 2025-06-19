@@ -1,123 +1,263 @@
+import fitz  # PyMuPDF
 import os
-import re
+import csv
 import json
-from datetime import datetime
-from PyPDF2 import PdfReader
-from langchain.chat_models import AzureChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage
+import uuid
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+from google.genai import types
+import google.genai as genai
+from langchain.prompts import PromptTemplate
+from langchain.output_parsers import PydanticOutputParser, OutputFixingParser
+from pydantic import BaseModel, Field
+import pandas as pd
 
-# 🔐 Azure OpenAI Configuration (REPLACE THESE)
-AZURE_OPENAI_ENDPOINT = "https://<your-resource-name>.openai.azure.com/"
-AZURE_OPENAI_KEY = "<your-azure-openai-key>"
-AZURE_OPENAI_DEPLOYMENT = "<your-deployment-name>"
-AZURE_OPENAI_VERSION = "2023-05-15"
-
-# Initialize Azure OpenAI LLM
-llm = AzureChatOpenAI(
-    openai_api_base=AZURE_OPENAI_ENDPOINT,
-    openai_api_version=AZURE_OPENAI_VERSION,
-    deployment_name=AZURE_OPENAI_DEPLOYMENT,
-    openai_api_key=AZURE_OPENAI_KEY,
-    temperature=0
-)
-
-REQUIRED_FIELDS = [
-    "Facility", "Charge Master Limit", "Charge Master Increase",
-    "Rate Adjustment Date", "Business", "Service Category",
-    "Current Rate", "Adjusted New Rate"
-]
-
-def extract_text(pdf_path):
-    try:
-        reader = PdfReader(pdf_path)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    except Exception as e:
-        print(f"❌ Error reading PDF: {e}")
-        return ""
-
-def extract_effective_date(text):
-    prompt = [
-        SystemMessage(content="You are an expert in hospital contract analysis."),
-        HumanMessage(content=f"""
-Scan the following hospital contract text and extract the most recent date associated with either:
-- "Effective Date"
-- "Rate Adjustment Date"
-
-Respond ONLY with JSON in this format:
-{{ "date": "MM/DD/YYYY" }} if a valid date exists,
-or {{ "date": null }} if no date found.
-
-Text:
-{text[:8000]}  # Limit to avoid token overload
-""")
-    ]
-    try:
-        response = llm(prompt).content.strip()
-        print("🔍 LLM raw date response:", response)
-
-        try:
-            parsed = json.loads(response)
-        except:
-            # Fallback: extract with regex if not valid JSON
-            match = re.search(r'"date"\s*:\s*"(\d{1,2}/\d{1,2}/\d{4})"', response)
-            if match:
-                parsed = {"date": match.group(1)}
-            else:
-                print("⚠️ No valid date format in response.")
-                return None
-
-        if parsed.get("date"):
-            return datetime.strptime(parsed["date"], "%m/%d/%Y")
-        return None
-    except Exception as e:
-        print(f"❌ Date extraction error: {e}")
-        return None
-
-def check_required_fields(text):
-    prompt = [
-        SystemMessage(content="You are an expert in hospital contract analysis."),
-        HumanMessage(content=f"""
-Check if ALL of these fields are present somewhere in the contract:
-- Facility
-- Charge Master Limit
-- Charge Master Increase
-- Rate Adjustment Date
-- Business
-- Service Category
-- Current Rate
-- Adjusted New Rate
-
-Respond ONLY with JSON: {{ "valid": true }} or {{ "valid": false }}
-
-Text:
-{text[:8000]}
-""")
-    ]
-    try:
-        response = llm(prompt).content.strip()
-        print("✅ LLM field check response:", response)
-        parsed = json.loads(response)
-        return parsed.get("valid", False)
-    except Exception as e:
-        print(f"❌ Field check error: {e}")
-        return False
-
-def is_valid_contract(text):
-    date = extract_effective_date(text)
-    print(f"📅 Extracted Effective Date: {date}")
-    if not date or date < datetime(2024, 7, 1):
-        print("⛔ Skipped: No valid or recent effective date")
-        return False
-    valid = check_required_fields(text)
-    print("📌 Required fields present:", valid)
-    return valid
-
-# ---- MAIN: RUN SINGLE PDF ----
-if __name__ == "__main__":
-    pdf_path = "./test_contract.pdf"  # 🔁 Replace with your actual test PDF file
-    text = extract_text(pdf_path)
-    if not text:
-        print("❗ No text extracted from PDF.")
+def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
+    """Convert each page of a PDF to individual images."""
+    pdf_path = Path(pdf_path)
+    
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    
+    if output_dir is None:
+        output_dir = pdf_path.parent
     else:
-        result = is_valid_contract(text)
-        print(f"\n✅ FINAL RESULT: {'VALID CONTRACT ✅' if result else 'SKIPPED ❌'}")
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    
+    doc = fitz.open(pdf_path)
+    image_paths = []
+    
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        mat = fitz.Matrix(dpi/72, dpi/72)
+        pix = page.get_pixmap(matrix=mat)
+        
+        output_filename = f"{pdf_path.stem}_page_{page_num + 1:03d}.{image_format}"
+        output_path = output_dir / output_filename
+        
+        pix.save(str(output_path))
+        image_paths.append(str(output_path))
+        
+        print(f"Saved page {page_num + 1} to {output_path}")
+        if page_num == 20:  # Limit to first 20 pages for large PDFs
+            print("Limiting to first 20 pages for large PDFs")
+            break
+    
+    doc.close()
+    return image_paths
+
+class HospitalRateData(BaseModel):
+    """Data model for hospital rate extraction."""
+    has_table: bool = Field(description="Whether a structured data table is present")
+    hospital_name: Optional[str] = Field(default=None, description="Complete hospital name from document header")
+    effective_date: Optional[str] = Field(default=None, description="Effective date")
+    lob_type: Optional[str] = Field(default=None, description="Line of Business type")
+    service_type: Optional[str] = Field(default=None, description="INPATIENT or OUTPATIENT")
+    
+    # Table data - list of all rows
+    table_data: Optional[List[Dict[str, str]]] = Field(
+        default=None, 
+        description="Complete list of ALL table rows with keys: service, billing_codes, rate, negotiated_type"
+    )
+
+class HospitalRateExtractor:
+    """Clean, structured extractor for hospital rate schedules."""
+    
+    def __init__(self, client, output_dir: str = None):
+        self.client = client
+        self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Standard output format
+        self.columns = [
+            'Hospital', 'LOB', 'Place of Service', 'Service Category', 
+            'Billing Codes', 'Rate', 'Negotiated Type', 'Effective Date'
+        ]
+        
+        # Document-level tracking for consistency
+        self.document_hospital = None
+        self.document_lob = None
+        self.document_service_type = None
+        
+    def create_extraction_prompt(self) -> tuple:
+        """Create the extraction prompt and parser."""
+        parser = PydanticOutputParser(pydantic_object=HospitalRateData)
+        
+        class GeminiLLM:
+            def __init__(self, client):
+                self.client = client
+                
+            def __call__(self, prompt: str) -> str:
+                response = self.client.models.generate_content(
+                    model='gemini-2.0-flash',
+                    contents=[prompt]
+                )
+                return response.text
+        
+        llm = GeminiLLM(self.client)
+        output_parser = OutputFixingParser.from_llm(parser=parser, llm=llm)
+        
+        template = """
+Extract ALL information from this hospital rate schedule page.
+
+DOCUMENT METADATA:
+1. Hospital Name: Extract COMPLETE hospital name from header (e.g., "Mercy Springfield and Urbana Hospitals")
+2. Effective Date: Look for "Effective Date:" text
+3. LOB: "Commercial", "Medicare", "Medicaid", or "N/A" if not specified
+4. Service Type: "INPATIENT" or "OUTPATIENT" based on section headers
+
+TABLE EXTRACTION:
+Extract EVERY SINGLE ROW from the table. Do not skip any rows.
+
+For each row, extract:
+- service: Service name from Service column
+- billing_codes: Complete billing codes text as-is
+- rate: Only the number/percentage (e.g., "85.1%", "$1,800.00")
+- negotiated_type: Everything after the rate number
+
+Examples:
+- "85.1% of Billed Charges" → rate="85.1%", negotiated_type="of Billed Charges"
+- "$1,100.00 Case Rate" → rate="$1,100.00", negotiated_type="Case Rate"
+
+CRITICAL: Scan the ENTIRE table and extract ALL rows. Count the rows and make sure you get them all.
+
+{format_instructions}
+"""
+        
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=[],
+            partial_variables={"format_instructions": output_parser.get_format_instructions()}
+        )
+        
+        return prompt, output_parser
+    
+    def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
+        """Process a single page and extract all data."""
+        print(f"Processing page {page_num}: {Path(image_path).name}")
+        
+        try:
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
+            
+            prompt, parser = self.create_extraction_prompt()
+            prompt_text = prompt.format()
+            
+            response = self.client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    prompt_text
+                ]
+            )
+            
+            extracted_data = parser.parse(response.text.strip())
+            
+            if not extracted_data.has_table:
+                print(f"No table found on page {page_num}")
+                return {'page_num': page_num, 'has_table': False}
+            
+            # Update document-level info on first extraction
+            if extracted_data.hospital_name and not self.document_hospital:
+                self.document_hospital = extracted_data.hospital_name
+            if extracted_data.lob_type and not self.document_lob:
+                self.document_lob = extracted_data.lob_type
+            if extracted_data.service_type and not self.document_service_type:
+                self.document_service_type = extracted_data.service_type
+            
+            # Convert to standard format
+            rows = self.convert_to_standard_format(extracted_data)
+            
+            print(f"Extracted {len(rows)} rows from page {page_num}")
+            
+            return {
+                'page_num': page_num,
+                'has_table': True,
+                'rows': rows,
+                'row_count': len(rows)
+            }
+            
+        except Exception as e:
+            print(f"Error processing page {page_num}: {e}")
+            return {'page_num': page_num, 'has_table': False, 'error': str(e)}
+    
+    def convert_to_standard_format(self, data: HospitalRateData) -> List[Dict[str, str]]:
+        """Convert extracted data to standard output format."""
+        if not data.table_data:
+            return []
+        
+        standardized_rows = []
+        
+        # Use document-level info for consistency
+        hospital = self.document_hospital or data.hospital_name or "N/A"
+        lob = self.document_lob or data.lob_type or "N/A"
+        service_type = self.document_service_type or data.service_type or "INPATIENT"
+        effective_date = data.effective_date or "N/A"
+        
+        place_of_service = "OP" if service_type == "OUTPATIENT" else "IP"
+        
+        for row in data.table_data:
+            standardized_row = {
+                'Hospital': hospital,
+                'LOB': lob,
+                'Place of Service': place_of_service,
+                'Service Category': row.get('service', 'N/A'),
+                'Billing Codes': row.get('billing_codes', 'N/A'),
+                'Rate': row.get('rate', 'N/A'),
+                'Negotiated Type': row.get('negotiated_type', 'N/A'),
+                'Effective Date': effective_date
+            }
+            standardized_rows.append(standardized_row)
+        
+        return standardized_rows
+    
+    def extract_rates_from_pdf(self, pdf_path: str) -> str:
+        """Extract hospital rates from PDF and save to CSV."""
+        print(f"Starting extraction for: {pdf_path}")
+        
+        # Convert PDF to images
+        image_paths = pdf_to_images(pdf_path, self.output_dir, dpi=300, image_format='png')
+        
+        # Process all pages
+        all_rows = []
+        
+        for page_num, image_path in enumerate(image_paths, 1):
+            result = self.process_page(image_path, page_num)
+            
+            if result.get('has_table') and 'rows' in result:
+                all_rows.extend(result['rows'])
+                print(f"Page {page_num}: Added {result['row_count']} rows")
+        
+        # Save to CSV
+        if all_rows:
+            output_file = self.output_dir / f"{Path(pdf_path).stem}_extracted_rates.csv"
+            
+            with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=self.columns)
+                writer.writeheader()
+                writer.writerows(all_rows)
+            
+            print(f"\n=== EXTRACTION COMPLETE ===")
+            print(f"Total rows extracted: {len(all_rows)}")
+            print(f"Output saved to: {output_file}")
+            
+            return str(output_file)
+        else:
+            print("No data extracted from PDF")
+            return None
+
+# Usage
+if __name__ == "__main__":
+    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"
+    
+    from google import genai
+    client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+    
+    extractor = HospitalRateExtractor(client, output_dir="extracted_hospital_rates")
+    output_file = extractor.extract_rates_from_pdf(pdf_file)
+    
+    if output_file:
+        print(f"Extraction completed! Output: {output_file}")
