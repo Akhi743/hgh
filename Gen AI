@@ -74,7 +74,7 @@ class TableData(BaseModel):
     table_type: Optional[str] = Field(default=None, description="Type: 'new', 'continuation', or 'none'")
     table_id: Optional[str] = Field(default=None, description="Unique identifier for this table")
     column_names: Optional[List[str]] = Field(default=None, description="List of column headers/names")
-    data: Optional[List[Dict[str, str]]] = Field(default=None, description="List of rows with detailed breakdown: service, billing_code_type, billing_codes, rate_amount, negotiated_type, additional_info")
+    data: Optional[List[Dict[str, str]]] = Field(default=None, description="List of rows with: service, billing_codes, rate, negotiated_type")
     table_description: Optional[str] = Field(default=None, description="Brief description of the table content")
     confidence_score: Optional[float] = Field(default=None, description="Confidence in table detection (0-1)")
     is_continuation: bool = Field(default=False, description="Whether this appears to be a continuation")
@@ -95,11 +95,10 @@ class TableRegistry:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Standard output columns for hospital rates
+        # Standard output columns for hospital rates - simplified
         self.standard_columns = [
             'Hospital', 'LOB', 'Place of Service', 'Service Category', 
-            'Billing Code Type', 'Billing Code', 'Rate', 'Negotiated Type',
-            'Additional Information', 'Effective Date'
+            'Billing Codes', 'Rate', 'Negotiated Type', 'Effective Date'
         ]
         
         # Track document-level hospital name
@@ -166,19 +165,21 @@ class TableRegistry:
         standardized_rows = []
         
         for row in data_rows:
-            # Determine place of service
-            place_of_service = "IP" if table_info['service_type'] == "INPATIENT" else "OP"
+            # Determine place of service - fix the logic
+            service_type = table_info.get('service_type', 'INPATIENT')
+            if service_type == "OUTPATIENT":
+                place_of_service = "OP"
+            else:
+                place_of_service = "IP"
             
             row_data = {
                 'Hospital': table_info['hospital_name'],
                 'LOB': table_info['lob_type'],
                 'Place of Service': place_of_service,
                 'Service Category': row.get('service', 'N/A'),
-                'Billing Code Type': row.get('billing_code_type', 'N/A'),
-                'Billing Code': row.get('billing_codes', 'N/A'),
-                'Rate': row.get('rate_amount', 'N/A'),
+                'Billing Codes': row.get('billing_codes', 'N/A'),
+                'Rate': row.get('rate', 'N/A'),
                 'Negotiated Type': row.get('negotiated_type', 'N/A'),
-                'Additional Information': row.get('additional_info', 'N/A'),
                 'Effective Date': table_info['effective_date']
             }
             standardized_rows.append(row_data)
@@ -266,47 +267,38 @@ ANALYSIS STEPS:
 
 1. IDENTIFY DOCUMENT METADATA:
    - Hospital/Health System name: Extract the SPECIFIC hospital name(s) from document headers/titles
-     * Look for hospital names like "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital", "Advocate Condell Medical Center and Advocate Sherman Hospital"
-     * Extract the actual facility names, NOT just system names like "Mercy Health" or "Advocate Health"
-     * The hospital name appears in the document header/title area before the tables
+     * Look for hospital names like "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital"
+     * Extract the actual facility names, NOT just system names like "Mercy Health"
    - Effective date (look for "Effective Date:" text)
-   - Line of Business (LOB) type: Look carefully for LOB indicators in headers/titles
-     * If you see "COMMERCIAL" (like "COMMERCIAL GATEKEEPER", "COMMERCIAL RATE SCHEDULE") → lob_type = "Commercial"
+   - Line of Business (LOB) type: Look for LOB indicators in headers/titles
+     * If you see "COMMERCIAL" → lob_type = "Commercial"
      * If you see "MEDICARE" → lob_type = "Medicare" 
      * If you see "MEDICAID" → lob_type = "Medicaid"
-     * If you see "ACOP COMMERCIAL" → lob_type = "ACOP Commercial"
-     * If NO LOB is mentioned in headers → lob_type = "N/A"
+     * If NO LOB mentioned → lob_type = "N/A"
    - Service type: Look for section headers
-     * "INPATIENT RATES" or "INPATIENT CARVE OUT RATES" → service_type = "INPATIENT"
-     * "OUTPATIENT RATES" or "OUTPATIENT CARVE OUT RATES" → service_type = "OUTPATIENT"
-     * If contains "INPATIENT" (with or without "CARVE OUT") → service_type = "INPATIENT"
-     * If contains "OUTPATIENT" (with or without "CARVE OUT") → service_type = "OUTPATIENT"
+     * "INPATIENT RATES" → service_type = "INPATIENT"
+     * "OUTPATIENT RATES" → service_type = "OUTPATIENT" 
+     * "INPATIENT CARVE OUT" → service_type = "INPATIENT"
+     * "OUTPATIENT CARVE OUT" → service_type = "OUTPATIENT"
 
-2. Look for structured data in rows and columns with Service, Billing Codes, Rates
+2. FOR TABLE DATA EXTRACTION:
+   For each row in the table, extract:
+   - service: The service name/description (e.g., "Ambulatory Surgery", "Cardiac Catheterization Procedures")
+   - billing_codes: Extract the COMPLETE billing codes column AS-IS, including all code types and codes
+     * Example: "HCPC Code: C7521-C7529, C7552, C7553, C9758, C9760, G0448, CPT4 Codes: 0408T, 0410T, 0411T..."
+     * DO NOT split into separate billing code type and codes - keep it all together
+   - rate: Just the numerical rate (e.g., "$1,800.00", "85.1%")
+   - negotiated_type: Combine the rate type and any additional information into one field
+     * Example: "Per Diem", "85.1% of Billed Charges Rate Applies to Entire Bill", "Base Rate Applied based upon Medicare Weights"
 
-3. FOR TABLE DATA EXTRACTION:
-   For each row in the table, extract and break down:
-   - service: The service name/description (e.g., "Inpatient Psychiatric", "DRG", "Subacute Care - General")
-   - billing_code_type: The type of billing code (e.g., "DRG", "Revenue Codes", "HCPC Codes")
-   - billing_codes: The actual codes/ranges (e.g., "880-887", "190-192, 199", "S9982")
-   - rate_amount: Just the monetary amount or percentage (e.g., "$1,800.00", "33%")
-   - negotiated_type: The rate structure (e.g., "Per Diem", "Case Rate", "Base Rate", "Percentage")
-   - additional_info: Any special conditions or notes (e.g., "Paid In Addition to Other Negotiated Rates", "Applied based upon Medicare Weights")
-     * IMPORTANT: If there are NO additional conditions/notes, set additional_info to "N/A"
-     * Only include actual additional information, not the basic rate type
+   IMPORTANT: 
+   - Keep billing codes exactly as they appear in the Billing Codes column
+   - If a service has multiple billing code types (like HCPC and CPT4), include ALL of them in one billing_codes field
+   - Combine rate structure and additional info into negotiated_type
 
-   IMPORTANT: Break down the rate information properly:
-   - From "$1,800.00 Per Diem" extract: rate_amount="$1,800.00", negotiated_type="Per Diem", additional_info="N/A"
-   - From "$354,075.00 Case Rate" extract: rate_amount="$354,075.00", negotiated_type="Case Rate", additional_info="N/A"
-   - From "33% of Billed Charges" extract: rate_amount="33%", negotiated_type="Percentage", additional_info="N/A"
-   - From "$9,600.00 Base Rate - Applied based upon Medicare Weights" extract: 
-     rate_amount="$9,600.00", negotiated_type="Base Rate", additional_info="Applied based upon Medicare Weights"
-   - From "$750.00 Per Diem Paid In Addition to Other Negotiated Rates" extract:
-     rate_amount="$750.00", negotiated_type="Per Diem", additional_info="Paid In Addition to Other Negotiated Rates"
-
-4. Identify table type based on visual cues:
-   - NEW TABLE: Has visible column headers at the top
-   - CONTINUATION: Has data rows but no headers (likely continuing from previous page)
+3. Identify table type:
+   - NEW TABLE: Has visible column headers
+   - CONTINUATION: Has data rows but no headers
    - NONE: No structured table present
 
 {format_instructions}
