@@ -221,8 +221,24 @@ class TableRegistry:
         standardized_rows = []
         
         for row in data_rows:
-            # Determine place of service
-            place_of_service = "IP" if table_info['service_type'] == "INPATIENT" else "OP"
+            # Determine place of service more accurately
+            service_type = table_info.get('service_type', 'N/A')
+            description = table_info.get('description', '').upper()
+            
+            # Check multiple sources for place of service determination
+            if service_type == "INPATIENT" or "INPATIENT" in description:
+                place_of_service = "IP"
+            elif service_type == "OUTPATIENT" or "OUTPATIENT" in description:
+                place_of_service = "OP"
+            else:
+                # Fallback: check the service name itself
+                service_name = row.get('service', '').upper()
+                if any(keyword in service_name for keyword in ['INPATIENT', 'DRG', 'ADMISSION']):
+                    place_of_service = "IP"
+                elif any(keyword in service_name for keyword in ['OUTPATIENT', 'AMBULATORY', 'EMERGENCY', 'OBSERVATION']):
+                    place_of_service = "OP"
+                else:
+                    place_of_service = "N/A"
             
             row_data = {
                 'Hospital': table_info['hospital_name'],
@@ -345,11 +361,15 @@ ANALYSIS STEPS:
      * "MEDICAID" → lob_type = "Medicaid"
      * "ACOP COMMERCIAL" → lob_type = "ACOP Commercial"
      * If NO LOB mentioned → lob_type = "N/A"
-   - Service type: Look for section headers
-     * "INPATIENT RATES" → service_type = "INPATIENT"
-     * "OUTPATIENT RATES" → service_type = "OUTPATIENT"
+   - Service type: Look CAREFULLY for section headers - this is CRITICAL for place of service
+     * If you see "INPATIENT RATES" or "INPATIENT CARVE OUT RATES" → service_type = "INPATIENT"
+     * If you see "OUTPATIENT RATES" or "OUTPATIENT CARVE OUT RATES" → service_type = "OUTPATIENT"
+     * Look at the section the table is under, not just the document title
 
-2. Look for structured data in rows and columns with Service, Billing Codes, Rates
+2. DETERMINE TABLE TYPE CAREFULLY - AVOID DUPLICATES:
+   - NEW TABLE: Has clear column headers AND is the start of a new section
+   - CONTINUATION: Has data rows but appears to continue from previous page
+   - If unsure and there's already an active table, lean towards CONTINUATION
 
 3. FOR TABLE DATA EXTRACTION:
    For each row in the table, extract and break down:
@@ -359,11 +379,6 @@ ANALYSIS STEPS:
    - rate_amount: Just the monetary amount or percentage
    - negotiated_type: The rate structure (e.g., "Per Diem", "Case Rate", "Percentage")
    - additional_info: Any special conditions or notes (use "N/A" if none)
-
-4. Identify table type:
-   - NEW TABLE: Has visible column headers at the top
-   - CONTINUATION: Has data rows but no headers
-   - NONE: No structured table present
 
 {format_instructions}
 
@@ -472,8 +487,25 @@ Extract the table data rows:
                     'reason': getattr(parsed_response, 'reason', 'No table detected')
                 }
            
-            # Step 2: Handle different table types
-            if parsed_response.table_type == "new" or (parsed_response.column_names and not parsed_response.is_continuation):
+            # Step 2: Handle different table types - Fix duplicate detection
+            
+            # Check if we already have an active table that this might continue
+            has_active_table = len(self.table_registry.active_tables) > 0
+            
+            # Determine if this is truly a new table or continuation
+            is_new_table = (
+                parsed_response.table_type == "new" and 
+                parsed_response.column_names and 
+                not parsed_response.is_continuation
+            )
+            
+            is_continuation = (
+                parsed_response.is_continuation or 
+                parsed_response.table_type == "continuation" or
+                (has_active_table and not is_new_table and parsed_response.data)
+            )
+            
+            if is_new_table and not is_continuation:
                 # New table detected
                 table_id = str(uuid.uuid4())
                 column_names = parsed_response.column_names
@@ -481,6 +513,7 @@ Extract the table data rows:
                
                 print(f"New table detected: {description}")
                 print(f"Hospital name extracted: {parsed_response.hospital_name}")
+                print(f"Service type: {parsed_response.service_type}")
                 print(f"Columns: {column_names}")
                
                 # Register new table with hospital metadata
@@ -506,7 +539,7 @@ Extract the table data rows:
                     'rows_added': len(parsed_response.data) if parsed_response.data else 0
                 }
                
-            elif parsed_response.is_continuation or parsed_response.table_type == "continuation":
+            elif is_continuation:
                 # Table continuation detected
                 print(f"Table continuation detected on page {page_num}")
                
