@@ -334,14 +334,18 @@ Analyze this page completely:
 
 # Usage
 if __name__ == "__main__":
-    pdf_file = r"path/to/your/hospital_rates.pdf"
+    # Use your existing working path
+    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"
     
-    # Initialize client
+    # Initialize client with your existing settings
     from google import genai
-    client = genai.Client(vertexai=True, project="your-project", location="us-central1")
+    client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
     
-    # Extract tables
-    extractor = HospitalRateExtractor(client, output_dir="extracted_tables")
-    results = extractor.extract_tables_from_pdf(pdf_file, dpi=300)
-    
-    print("Extraction complete!")
+    # Try with current directory first
+    try:
+        extractor = HospitalRateExtractor(client, output_dir="./extracted_tables")
+        results = extractor.extract_tables_from_pdf(pdf_file, dpi=300)
+        print("Extraction complete!")
+    except PermissionError as e:
+        print(f"Permission error: {e}")
+        print("Try running as administrator or change output directory")
