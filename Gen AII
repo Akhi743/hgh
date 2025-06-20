@@ -3,7 +3,6 @@ import os
 import csv
 import json
 import uuid
-import re
 from pathlib import Path
 from typing import List, Optional, Union, Dict, Any
 from google.genai import types
@@ -60,8 +59,8 @@ def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
         image_paths.append(str(output_path))
        
         print(f"Saved page {page_num + 1} to {output_path}")
-        if page_num == 50:  # Increased limit for larger documents
-            print("Limiting to first 50 pages for large PDFs")
+        if page_num == 20:  # Limit to first 20 pages for large PDFs
+            print("Limiting to first 20 pages for large PDFs")
             break
    
     doc.close()
@@ -75,122 +74,22 @@ class TableData(BaseModel):
     table_type: Optional[str] = Field(default=None, description="Type: 'new', 'continuation', or 'none'")
     table_id: Optional[str] = Field(default=None, description="Unique identifier for this table")
     column_names: Optional[List[str]] = Field(default=None, description="List of column headers/names")
-    data: Optional[List[Dict[str, str]]] = Field(default=None, description="List of rows with detailed breakdown")
+    data: Optional[List[Dict[str, str]]] = Field(default=None, description="List of rows with detailed breakdown: service, billing_code_type, billing_codes, rate_amount, negotiated_type, additional_info")
     table_description: Optional[str] = Field(default=None, description="Brief description of the table content")
     confidence_score: Optional[float] = Field(default=None, description="Confidence in table detection (0-1)")
     is_continuation: bool = Field(default=False, description="Whether this appears to be a continuation")
     continuation_clues: Optional[List[str]] = Field(default=None, description="Visual/textual clues for continuation")
     
-    # Enhanced hospital-specific fields
-    health_system_name: Optional[str] = Field(default=None, description="Health system name (e.g., Mercy Health, Memorial Health System)")
-    hospital_names: Optional[List[str]] = Field(default=None, description="Specific hospital facility names extracted from document")
+    # Hospital-specific fields - IMPROVED
+    hospital_name: Optional[str] = Field(default=None, description="FULL hospital facility name(s) - extract complete names like 'Mercy Springfield and Urbana Hospitals' or 'Advocate Condell Medical Center and Advocate Sherman Hospital'")
+    health_system: Optional[str] = Field(default=None, description="Health system name like 'Mercy Health', 'Memorial Health System', 'Advocate Health'")
     effective_date: Optional[str] = Field(default=None, description="Effective date mentioned in the document")
     lob_type: Optional[str] = Field(default=None, description="Line of Business type (Commercial, ACOP Commercial, etc.)")
-    service_type: Optional[str] = Field(default=None, description="INPATIENT or OUTPATIENT only")
-
-class HospitalNameExtractor:
-    """
-    Utility class to extract specific hospital names from health system information.
-    """
-    
-    # Known health system patterns and their typical hospital name patterns
-    HEALTH_SYSTEM_PATTERNS = {
-        'mercy_health': {
-            'system_indicators': ['mercy health', 'mercy'],
-            'hospital_patterns': [
-                r'mercy\s+([^,]+?)\s+hospital',
-                r'mercy\s+([^,]+?)\s+hospitals',
-                r'([^,]+?)\s+mercy\s+hospital',
-                r'mercy\s+([^,]+?)\s+medical\s+center'
-            ]
-        },
-        'memorial_health': {
-            'system_indicators': ['memorial health system'],
-            'hospital_patterns': [
-                r'([^,]+?)\s+general\s+hospital',
-                r'([^,]+?)\s+memorial\s+hospital',
-                r'([^,]+?)\s+medical\s+center',
-                r'memorial\s+([^,]+?)\s+hospital'
-            ]
-        },
-        'advocate_health': {
-            'system_indicators': ['advocate health', 'advocate'],
-            'hospital_patterns': [
-                r'advocate\s+([^,]+?)\s+medical\s+center',
-                r'advocate\s+([^,]+?)\s+hospital',
-                r'([^,]+?)\s+advocate\s+hospital'
-            ]
-        }
-    }
-    
-    @classmethod
-    def extract_hospital_names(cls, text: str, health_system: str = None) -> List[str]:
-        """
-        Extract specific hospital names from text.
-        """
-        if not text:
-            return []
-            
-        text_lower = text.lower()
-        hospital_names = []
-        
-        # Try to detect health system if not provided
-        if not health_system:
-            for system_key, system_info in cls.HEALTH_SYSTEM_PATTERNS.items():
-                for indicator in system_info['system_indicators']:
-                    if indicator in text_lower:
-                        health_system = system_key
-                        break
-                if health_system:
-                    break
-        
-        # Extract hospital names based on detected system
-        if health_system and health_system in cls.HEALTH_SYSTEM_PATTERNS:
-            patterns = cls.HEALTH_SYSTEM_PATTERNS[health_system]['hospital_patterns']
-            for pattern in patterns:
-                matches = re.finditer(pattern, text_lower)
-                for match in matches:
-                    hospital_name = match.group(1).strip()
-                    if hospital_name and len(hospital_name) > 2:
-                        # Clean up the name
-                        hospital_name = cls._clean_hospital_name(hospital_name)
-                        if hospital_name not in hospital_names:
-                            hospital_names.append(hospital_name)
-        
-        # Fallback: look for common hospital keywords
-        if not hospital_names:
-            fallback_patterns = [
-                r'([^,\n]+?)\s+hospital(?:s)?(?:\s|$)',
-                r'([^,\n]+?)\s+medical\s+center(?:\s|$)',
-                r'([^,\n]+?)\s+health\s+center(?:\s|$)'
-            ]
-            
-            for pattern in fallback_patterns:
-                matches = re.finditer(pattern, text_lower)
-                for match in matches:
-                    name = match.group(1).strip()
-                    if len(name) > 5 and 'system' not in name:
-                        name = cls._clean_hospital_name(name)
-                        if name not in hospital_names:
-                            hospital_names.append(name)
-        
-        return hospital_names[:3]  # Limit to top 3 matches
-    
-    @classmethod
-    def _clean_hospital_name(cls, name: str) -> str:
-        """Clean and standardize hospital name."""
-        # Remove common prefixes/suffixes that aren't part of the actual name
-        name = re.sub(r'^(the\s+)', '', name.strip())
-        name = re.sub(r'\s+(and|&)\s+', ' and ', name)
-        
-        # Title case
-        name = ' '.join(word.capitalize() for word in name.split())
-        
-        return name
+    service_type: Optional[str] = Field(default=None, description="INPATIENT or OUTPATIENT - extracted from section headers")
 
 class TableRegistry:
     """
-    Enhanced registry to track active tables across multiple pages with better hospital name handling.
+    Registry to track active tables across multiple pages with CSV management.
     """
     def __init__(self, output_dir: Path):
         self.active_tables: Dict[str, Dict[str, Any]] = {}
@@ -199,38 +98,35 @@ class TableRegistry:
         
         # Standard output columns for hospital rates
         self.standard_columns = [
-            'Health System', 'Hospital Name', 'LOB', 'Place of Service', 'Service Category', 
-            'Billing Code Type', 'Billing Code', 'Rate', 'Negotiated Type',
-            'Additional Information', 'Effective Date'
+            'Hospital', 'Health_System', 'LOB', 'Place_of_Service', 'Service_Category', 
+            'Billing_Code_Type', 'Billing_Code', 'Rate', 'Negotiated_Type',
+            'Additional_Information', 'Effective_Date'
         ]
         
-        # Track document-level information
+        # Track document-level metadata
+        self.document_hospital_name = None
         self.document_health_system = None
-        self.document_hospital_names = []
         self.document_effective_date = None
        
     def register_table(self, table_id: str, column_names: List[str], description: str, page_num: int, 
-                      health_system: str = "N/A", hospital_names: List[str] = None, 
-                      lob_type: str = "N/A", service_type: str = "N/A", 
-                      effective_date: str = "N/A") -> str:
+                      hospital_name: str = "N/A", health_system: str = "N/A", lob_type: str = "N/A", 
+                      service_type: str = "N/A", effective_date: str = "N/A") -> str:
         """Register a new table and create its CSV file"""
         csv_filename = f"table_{len(self.active_tables) + 1}_{table_id[:8]}.csv"
         csv_path = self.output_dir / csv_filename
         
-        # Update document-level information
+        # Update document-level metadata if we get better information
+        if hospital_name and hospital_name != "N/A":
+            self.document_hospital_name = hospital_name
         if health_system and health_system != "N/A":
             self.document_health_system = health_system
-            
-        if hospital_names:
-            for name in hospital_names:
-                if name and name not in self.document_hospital_names:
-                    self.document_hospital_names.append(name)
-                    
         if effective_date and effective_date != "N/A":
             self.document_effective_date = effective_date
         
-        # Use best available hospital name
-        best_hospital_name = self._get_best_hospital_name(hospital_names)
+        # Use document-level data as fallback
+        final_hospital_name = hospital_name if hospital_name != "N/A" else (self.document_hospital_name or "N/A")
+        final_health_system = health_system if health_system != "N/A" else (self.document_health_system or "N/A")
+        final_effective_date = effective_date if effective_date != "N/A" else (self.document_effective_date or "N/A")
        
         self.active_tables[table_id] = {
             'column_names': self.standard_columns,
@@ -241,11 +137,11 @@ class TableRegistry:
             'data_rows': [],
             'csv_path': str(csv_path),
             'csv_filename': csv_filename,
-            'health_system': self.document_health_system or "N/A",
-            'hospital_name': best_hospital_name,
+            'hospital_name': final_hospital_name,
+            'health_system': final_health_system,
             'lob_type': lob_type,
             'service_type': service_type,
-            'effective_date': self.document_effective_date or effective_date
+            'effective_date': final_effective_date
         }
        
         # Create CSV with standard headers
@@ -254,18 +150,6 @@ class TableRegistry:
             writer.writerow(self.standard_columns)
            
         return str(csv_path)
-    
-    def _get_best_hospital_name(self, provided_names: List[str] = None) -> str:
-        """Get the best available hospital name."""
-        # Prioritize provided names
-        if provided_names:
-            return provided_names[0]
-        
-        # Fall back to document-level names
-        if self.document_hospital_names:
-            return self.document_hospital_names[0]
-        
-        return "N/A"
    
     def add_data_to_table(self, table_id: str, data_rows: List[Dict[str, str]], page_num: int):
         """Add data rows to existing table and append to CSV"""
@@ -288,25 +172,50 @@ class TableRegistry:
         standardized_rows = []
         
         for row in data_rows:
-            # Determine place of service
-            place_of_service = "IP" if table_info['service_type'] == "INPATIENT" else "OP"
+            # Improved place of service logic
+            place_of_service = self.determine_place_of_service(table_info['service_type'])
             
             row_data = {
-                'Health System': table_info['health_system'],
-                'Hospital Name': table_info['hospital_name'],
+                'Hospital': table_info['hospital_name'],
+                'Health_System': table_info['health_system'],
                 'LOB': table_info['lob_type'],
-                'Place of Service': place_of_service,
-                'Service Category': row.get('service', 'N/A'),
-                'Billing Code Type': row.get('billing_code_type', 'N/A'),
-                'Billing Code': row.get('billing_codes', 'N/A'),
+                'Place_of_Service': place_of_service,
+                'Service_Category': row.get('service', 'N/A'),
+                'Billing_Code_Type': row.get('billing_code_type', 'N/A'),
+                'Billing_Code': row.get('billing_codes', 'N/A'),
                 'Rate': row.get('rate_amount', 'N/A'),
-                'Negotiated Type': row.get('negotiated_type', 'N/A'),
-                'Additional Information': row.get('additional_info', 'N/A'),
-                'Effective Date': table_info['effective_date']
+                'Negotiated_Type': row.get('negotiated_type', 'N/A'),
+                'Additional_Information': row.get('additional_info', 'N/A'),
+                'Effective_Date': table_info['effective_date']
             }
             standardized_rows.append(row_data)
         
         return standardized_rows
+    
+    def determine_place_of_service(self, service_type: str) -> str:
+        """Improved logic to determine place of service including CARVE OUT RATES"""
+        if not service_type or service_type == "N/A":
+            return "N/A"
+        
+        service_type_upper = service_type.upper()
+        
+        # Handle CARVE OUT RATES specifically
+        if "INPATIENT CARVE OUT RATES" in service_type_upper:
+            return "IP"
+        elif "OUTPATIENT CARVE OUT RATES" in service_type_upper:
+            return "OP"
+        # Handle regular RATES
+        elif "INPATIENT RATES" in service_type_upper:
+            return "IP"
+        elif "OUTPATIENT RATES" in service_type_upper:
+            return "OP"
+        # Fallback to general INPATIENT/OUTPATIENT detection
+        elif "INPATIENT" in service_type_upper:
+            return "IP"
+        elif "OUTPATIENT" in service_type_upper:
+            return "OP"
+        else:
+            return "N/A"
 
     def find_similar_table(self, potential_columns: List[str], similarity_threshold: float = 0.6) -> Optional[str]:
         """Find existing table with similar column structure"""
@@ -349,17 +258,16 @@ class TableRegistry:
 
 class MultiPageTableExtractor:
     """
-    Enhanced main class for extracting tables across multiple pages with improved hospital name detection.
+    Main class for extracting tables across multiple pages with context awareness.
     """
    
     def __init__(self, client, output_dir: str = None):
         self.client = client
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
         self.table_registry = TableRegistry(self.output_dir)
-        self.hospital_extractor = HospitalNameExtractor()
        
     def create_table_detection_prompt(self) -> tuple:
-        """Create enhanced prompt for initial table detection and classification"""
+        """Create prompt for initial table detection and classification with improved hospital name extraction"""
         base_parser = PydanticOutputParser(pydantic_object=TableData)
        
         class GeminiLLM:
@@ -383,69 +291,74 @@ class MultiPageTableExtractor:
 You are an expert table detection and classification specialist for hospital rate schedules.
 
 CRITICAL HOSPITAL NAME EXTRACTION RULES:
-1. HEALTH SYSTEM vs HOSPITAL NAME:
-   - Health System: "Mercy Health", "Memorial Health System", "Advocate Health And Hospital Corporation"
-   - Hospital Names: SPECIFIC facility names like "Springfield Hospital", "Urbana Hospital", "Sistersville General Hospital", "Condell Medical Center", "Sherman Hospital"
-   
-2. EXTRACT SPECIFIC HOSPITAL NAMES:
-   - Look for patterns like: "[Location] Hospital", "[Location] Medical Center", "[Location] General Hospital"
-   - Examples: "Mercy Springfield and Urbana Hospitals" → hospital_names: ["Springfield Hospital", "Urbana Hospital"]
-   - Examples: "Sistersville General Hospital" → hospital_names: ["Sistersville General Hospital"]
-   - Examples: "ADVOCATE CONDELL MEDICAL CENTER AND ADVOCATE SHERMAN HOSPITAL" → hospital_names: ["Condell Medical Center", "Sherman Hospital"]
-   
-3. AVOID SYSTEM-LEVEL NAMES:
-   - DO NOT use "Mercy Health", "Memorial Health System", "Advocate Health" as hospital names
-   - These are health systems, not individual hospital facilities
+1. **FULL HOSPITAL NAMES REQUIRED**: Extract complete, specific hospital facility names, NOT just health system names
+   - CORRECT: "Mercy Springfield and Urbana Hospitals" 
+   - CORRECT: "Advocate Condell Medical Center and Advocate Sherman Hospital"
+   - CORRECT: "Sistersville General Hospital"
+   - INCORRECT: Just "Mercy Health" or "Advocate Health" (these are system names)
 
-DOCUMENT METADATA EXTRACTION:
+2. **WHERE TO FIND HOSPITAL NAMES**: Look in document headers, titles, and sub-headers before tables
+   - Usually appears after health system name but before rate tables
+   - May be in blue/colored text or larger font
+   - Often includes multiple facilities separated by "and" or commas
 
-1. HEALTH SYSTEM IDENTIFICATION:
-   - Extract the health system name from document headers (e.g., "Mercy Health", "Memorial Health System")
-   
-2. HOSPITAL NAME EXTRACTION:
-   - Look carefully in document titles/headers for specific hospital facility names
-   - Common patterns: "[City] Hospital", "[Name] Medical Center", "[Location] General Hospital"
-   - If multiple hospitals mentioned, extract ALL of them into hospital_names list
-   
-3. EFFECTIVE DATE:
-   - Look for "Effective Date:" followed by a date (format: MM/DD/YYYY)
-   
-4. LINE OF BUSINESS (LOB):
-   - Scan headers/titles for LOB indicators:
-     * "COMMERCIAL" → lob_type = "Commercial"
+3. **HEALTH SYSTEM vs HOSPITAL**: Distinguish between them
+   - health_system: "Mercy Health", "Memorial Health System", "Advocate Health And Hospital Corporation"
+   - hospital_name: "Mercy Springfield and Urbana Hospitals", "Sistersville General Hospital"
+
+ANALYSIS STEPS:
+
+1. IDENTIFY DOCUMENT METADATA:
+   - **Health System**: Extract the overall system name (e.g., "Mercy Health", "Memorial Health System")
+   - **Hospital Name**: Extract COMPLETE facility names (e.g., "Mercy Springfield and Urbana Hospitals")
+     * Look for specific hospital names in headers/sub-headers
+     * Multiple hospitals may be listed together
+     * These are the actual facilities, not the system name
+   - **Effective Date**: Look for "Effective Date:" text (format like "09/01/2024")
+   - **Line of Business (LOB)**: Look for LOB indicators in headers/titles
+     * "COMMERCIAL GATEKEEPER" or "COMMERCIAL" → lob_type = "Commercial"
      * "MEDICARE" → lob_type = "Medicare" 
      * "MEDICAID" → lob_type = "Medicaid"
      * "ACOP COMMERCIAL" → lob_type = "ACOP Commercial"
      * If NO LOB mentioned → lob_type = "N/A"
-   
-5. SERVICE TYPE:
-   - Look for section headers:
-     * "INPATIENT RATES" or "INPATIENT CARVE OUT RATES" → service_type = "INPATIENT"
-     * "OUTPATIENT RATES" or "OUTPATIENT CARVE OUT RATES" → service_type = "OUTPATIENT"
 
-TABLE DATA EXTRACTION:
-For each row in the table, extract:
-- service: The service name/description
-- billing_code_type: The type of billing code (DRG, Revenue Codes, HCPC Codes, CPT4 Codes)
-- billing_codes: The actual codes/ranges
-- rate_amount: Just the monetary amount or percentage
-- negotiated_type: The rate structure (Per Diem, Case Rate, Base Rate, Percentage)
-- additional_info: Any special conditions or notes (set to "N/A" if none)
+2. **SERVICE TYPE DETECTION** (Critical for Place of Service):
+   Look for these EXACT section headers in order of priority:
+   - "INPATIENT CARVE OUT RATES:" → service_type = "INPATIENT CARVE OUT RATES"
+   - "OUTPATIENT CARVE OUT RATES:" → service_type = "OUTPATIENT CARVE OUT RATES"
+   - "INPATIENT RATES:" → service_type = "INPATIENT RATES"
+   - "OUTPATIENT RATES:" → service_type = "OUTPATIENT RATES"
+   - Any header containing "INPATIENT CARVE OUT" → service_type = "INPATIENT CARVE OUT RATES"
+   - Any header containing "OUTPATIENT CARVE OUT" → service_type = "OUTPATIENT CARVE OUT RATES"
+   - Any header containing "INPATIENT" → service_type = "INPATIENT"
+   - Any header containing "OUTPATIENT" → service_type = "OUTPATIENT"
 
-RATE PARSING EXAMPLES:
-- "$1,800.00 Per Diem" → rate_amount="$1,800.00", negotiated_type="Per Diem", additional_info="N/A"
-- "$354,075.00 Case Rate" → rate_amount="$354,075.00", negotiated_type="Case Rate", additional_info="N/A"
-- "33% of Billed Charges" → rate_amount="33%", negotiated_type="Percentage", additional_info="N/A"
-- "$750.00 Per Diem Paid In Addition to Other Negotiated Rates" → rate_amount="$750.00", negotiated_type="Per Diem", additional_info="Paid In Addition to Other Negotiated Rates"
+3. Look for structured data in rows and columns with Service, Billing Codes, Rates
 
-TABLE TYPE CLASSIFICATION:
-- NEW TABLE: Has visible column headers at the top
-- CONTINUATION: Has data rows but no headers (continuing from previous page)
-- NONE: No structured table present
+4. FOR TABLE DATA EXTRACTION:
+   For each row in the table, extract and break down:
+   - service: The service name/description (e.g., "Inpatient Psychiatric", "DRG", "Ambulatory Surgery")
+   - billing_code_type: The type of billing code (e.g., "DRG", "Revenue Codes", "HCPC Codes", "CPT4 Codes")
+   - billing_codes: The actual codes/ranges (e.g., "880-887", "190-192, 199", "S9982")
+   - rate_amount: Just the monetary amount or percentage (e.g., "$1,800.00", "33%", "57.87%")
+   - negotiated_type: The rate structure (e.g., "Per Diem", "Case Rate", "Base Rate", "Percentage of Billed Charges")
+   - additional_info: Any special conditions or notes
+     * IMPORTANT: If NO additional conditions/notes, set to "N/A"
+     * Include notes like "Paid In Addition to Other Negotiated Rates", "Applied based upon Medicare Weights"
+
+5. RATE PARSING EXAMPLES:
+   - "$1,800.00 Per Diem" → rate_amount="$1,800.00", negotiated_type="Per Diem", additional_info="N/A"
+   - "57.87% of Billed Charges to Max of $15,320.00" → rate_amount="57.87%", negotiated_type="Percentage of Billed Charges", additional_info="Max of $15,320.00"
+   - "$9,600.00 Base Rate - Applied based upon Medicare Weights" → rate_amount="$9,600.00", negotiated_type="Base Rate", additional_info="Applied based upon Medicare Weights"
+
+6. Table type classification:
+   - NEW TABLE: Has visible column headers at the top
+   - CONTINUATION: Has data rows but no headers (continuing from previous page)
+   - NONE: No structured table present
 
 {format_instructions}
 
-Analyze the image and extract hospital rate information with precise hospital name identification:
+Analyze the image and extract hospital rate information with COMPLETE hospital facility names:
 """
        
         prompt = PromptTemplate(
@@ -491,10 +404,10 @@ EXTRACTION INSTRUCTIONS:
 1. Extract ONLY data rows (no headers)
 2. For each row, extract the detailed breakdown:
    - service: The service name/description 
-   - billing_code_type: The type of billing code
+   - billing_code_type: The type of billing code (DRG, Revenue Codes, HCPC Codes, CPT4 Codes, etc.)
    - billing_codes: The actual codes/ranges 
    - rate_amount: Just the monetary amount or percentage 
-   - negotiated_type: The rate structure
+   - negotiated_type: The rate structure (Per Diem, Case Rate, Percentage of Billed Charges, etc.)
    - additional_info: Any special conditions or notes
 
 3. Use empty string "" for missing/empty fields
@@ -519,7 +432,7 @@ Extract the table data rows:
         return prompt, table_parser
        
     def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
-        """Process a single page with enhanced hospital name detection"""
+        """Process a single page with context awareness"""
         print(f"Processing page {page_num}: {Path(image_path).name}")
        
         try:
@@ -550,17 +463,6 @@ Extract the table data rows:
                     'reason': getattr(parsed_response, 'reason', 'No table detected')
                 }
            
-            # Enhanced hospital name processing
-            hospital_names = []
-            if parsed_response.hospital_names:
-                hospital_names = parsed_response.hospital_names
-            elif parsed_response.health_system_name:
-                # Try to extract hospital names from the full response text
-                hospital_names = self.hospital_extractor.extract_hospital_names(
-                    response.text, 
-                    parsed_response.health_system_name.lower().replace(' ', '_')
-                )
-           
             # Step 2: Handle different table types
             if parsed_response.table_type == "new" or (parsed_response.column_names and not parsed_response.is_continuation):
                 # New table detected
@@ -569,15 +471,16 @@ Extract the table data rows:
                 description = parsed_response.table_description or f"Table starting on page {page_num}"
                
                 print(f"New table detected: {description}")
-                print(f"Health System: {parsed_response.health_system_name}")
-                print(f"Hospital Names: {hospital_names}")
+                print(f"Hospital: {parsed_response.hospital_name}")
+                print(f"Health System: {parsed_response.health_system}")
+                print(f"Service Type: {parsed_response.service_type}")
                 print(f"Columns: {column_names}")
                
-                # Register new table with enhanced metadata
+                # Register new table with improved metadata
                 csv_path = self.table_registry.register_table(
                     table_id, column_names, description, page_num,
-                    parsed_response.health_system_name or "N/A",
-                    hospital_names,
+                    parsed_response.hospital_name or "N/A",
+                    parsed_response.health_system or "N/A",
                     parsed_response.lob_type or "N/A", 
                     parsed_response.service_type or "N/A",
                     parsed_response.effective_date or "N/A"
@@ -594,8 +497,7 @@ Extract the table data rows:
                     'table_type': 'new',
                     'table_id': table_id,
                     'csv_path': csv_path,
-                    'rows_added': len(parsed_response.data) if parsed_response.data else 0,
-                    'hospital_names': hospital_names
+                    'rows_added': len(parsed_response.data) if parsed_response.data else 0
                 }
                
             elif parsed_response.is_continuation or parsed_response.table_type == "continuation":
@@ -604,9 +506,10 @@ Extract the table data rows:
                
                 # Try to match with existing table
                 if parsed_response.column_names:
+                    # Has some column info - try to match
                     matching_table_id = self.table_registry.find_similar_table(parsed_response.column_names)
                 else:
-                    # Assume continuation of most recent table
+                    # No column info - assume continuation of most recent table
                     matching_table_id = list(self.table_registry.active_tables.keys())[-1] if self.table_registry.active_tables else None
                
                 if matching_table_id:
@@ -655,9 +558,9 @@ Extract the table data rows:
    
     def extract_tables_from_pdf(self, pdf_path: str, dpi: int = 150, image_format: str = 'png') -> Dict[str, Any]:
         """
-        Extract all tables from PDF with enhanced multi-page awareness.
+        Extract all tables from PDF with multi-page awareness.
         """
-        print(f"Starting enhanced multi-page table extraction for: {pdf_path}")
+        print(f"Starting multi-page table extraction for: {pdf_path}")
        
         # Convert PDF to images
         image_paths = pdf_to_images(pdf_path, self.output_dir, dpi, image_format)
@@ -668,12 +571,7 @@ Extract the table data rows:
             'total_pages': len(image_paths),
             'processed_pages': [],
             'tables_found': {},
-            'csv_files': [],
-            'document_summary': {
-                'health_system': None,
-                'hospital_names': [],
-                'effective_date': None
-            }
+            'csv_files': []
         }
        
         for page_num, image_path in enumerate(image_paths, 1):
@@ -688,8 +586,8 @@ Extract the table data rows:
                         'description': table_info['description'],
                         'columns': table_info['original_columns'],
                         'csv_path': table_info['csv_path'],
-                        'health_system': table_info.get('health_system', 'N/A'),
                         'hospital_name': table_info.get('hospital_name', 'N/A'),
+                        'health_system': table_info.get('health_system', 'N/A'),
                         'lob_type': table_info.get('lob_type', 'N/A'),
                         'service_type': table_info.get('service_type', 'N/A'),
                         'effective_date': table_info.get('effective_date', 'N/A'),
@@ -697,210 +595,48 @@ Extract the table data rows:
                     }
                 results['tables_found'][table_id]['pages'].append(page_num)
        
-        # Update document summary
-        results['document_summary'] = {
-            'health_system': self.table_registry.document_health_system,
-            'hospital_names': self.table_registry.document_hospital_names,
-            'effective_date': self.table_registry.document_effective_date
-        }
-       
         # Get final CSV files
         for table_info in self.table_registry.get_all_tables().values():
             results['csv_files'].append(table_info['csv_path'])
        
-        # Enhanced summary
+        # Summary
         total_tables = len(results['tables_found'])
         pages_with_tables = len([p for p in results['processed_pages'] if p.get('has_table')])
-        total_rows_extracted = sum(len(table_info['data_rows']) for table_info in self.table_registry.get_all_tables().values())
        
-        print(f"\n=== ENHANCED MULTI-PAGE EXTRACTION SUMMARY ===")
-        print(f"PDF File: {pdf_path}")
-        print(f"Health System: {results['document_summary']['health_system']}")
-        print(f"Hospital Names: {', '.join(results['document_summary']['hospital_names']) if results['document_summary']['hospital_names'] else 'N/A'}")
-        print(f"Effective Date: {results['document_summary']['effective_date']}")
+        print(f"\n=== MULTI-PAGE EXTRACTION SUMMARY ===")
         print(f"Total pages processed: {results['total_pages']}")
         print(f"Pages with tables: {pages_with_tables}")
         print(f"Unique tables found: {total_tables}")
-        print(f"Total rows extracted: {total_rows_extracted}")
         print(f"CSV files created: {len(results['csv_files'])}")
        
         if results['csv_files']:
             print(f"\nCSV Files Created:")
             for csv_file in results['csv_files']:
                 print(f"  - {csv_file}")
-        
-        # Generate summary report
-        self._generate_extraction_report(results)
+                
+        # Print extraction summary by table
+        print(f"\nEXTRACTED TABLES SUMMARY:")
+        for table_id, table_info in results['tables_found'].items():
+            print(f"\nTable: {table_info['description']}")
+            print(f"  Hospital: {table_info['hospital_name']}")
+            print(f"  Health System: {table_info['health_system']}")
+            print(f"  LOB: {table_info['lob_type']}")
+            print(f"  Service Type: {table_info['service_type']}")
+            print(f"  Effective Date: {table_info['effective_date']}")
+            print(f"  Pages: {table_info['pages']}")
+            print(f"  CSV: {table_info['csv_path']}")
        
         return results
-    
-    def _generate_extraction_report(self, results: Dict[str, Any]):
-        """Generate a detailed extraction report"""
-        report_path = self.output_dir / "extraction_report.txt"
-        
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("HOSPITAL RATE SCHEDULE EXTRACTION REPORT\n")
-            f.write("=" * 50 + "\n\n")
-            
-            f.write(f"Source PDF: {results['pdf_path']}\n")
-            f.write(f"Health System: {results['document_summary']['health_system']}\n")
-            f.write(f"Hospital Names: {', '.join(results['document_summary']['hospital_names']) if results['document_summary']['hospital_names'] else 'N/A'}\n")
-            f.write(f"Effective Date: {results['document_summary']['effective_date']}\n")
-            f.write(f"Total Pages: {results['total_pages']}\n\n")
-            
-            f.write("TABLE EXTRACTION DETAILS:\n")
-            f.write("-" * 30 + "\n")
-            
-            for table_id, table_info in results['tables_found'].items():
-                f.write(f"\nTable ID: {table_id[:8]}...\n")
-                f.write(f"  Description: {table_info['description']}\n")
-                f.write(f"  Health System: {table_info['health_system']}\n")
-                f.write(f"  Hospital: {table_info['hospital_name']}\n")
-                f.write(f"  LOB: {table_info['lob_type']}\n")
-                f.write(f"  Service Type: {table_info['service_type']}\n")
-                f.write(f"  Pages: {', '.join(map(str, table_info['pages']))}\n")
-                f.write(f"  CSV File: {table_info['csv_path']}\n")
-            
-            f.write(f"\nExtraction completed successfully!\n")
-        
-        print(f"Detailed report saved to: {report_path}")
 
-    def process_batch_pdfs(self, pdf_directory: str, output_base_dir: str = None) -> Dict[str, Any]:
-        """
-        Process multiple PDF files in batch.
-        """
-        pdf_dir = Path(pdf_directory)
-        if not pdf_dir.exists():
-            raise FileNotFoundError(f"Directory not found: {pdf_directory}")
-        
-        if output_base_dir is None:
-            output_base_dir = pdf_dir / "extracted_tables"
-        else:
-            output_base_dir = Path(output_base_dir)
-        
-        pdf_files = list(pdf_dir.glob("*.pdf"))
-        if not pdf_files:
-            print(f"No PDF files found in {pdf_directory}")
-            return {}
-        
-        batch_results = {
-            'total_pdfs': len(pdf_files),
-            'processed_pdfs': [],
-            'failed_pdfs': [],
-            'summary': {
-                'total_tables': 0,
-                'total_rows': 0,
-                'total_csv_files': 0
-            }
-        }
-        
-        print(f"Starting batch processing of {len(pdf_files)} PDF files...")
-        
-        for i, pdf_file in enumerate(pdf_files, 1):
-            print(f"\n{'='*60}")
-            print(f"Processing PDF {i}/{len(pdf_files)}: {pdf_file.name}")
-            print(f"{'='*60}")
-            
-            try:
-                # Create output directory for this PDF
-                pdf_output_dir = output_base_dir / pdf_file.stem
-                
-                # Update extractor output directory
-                self.output_dir = pdf_output_dir
-                self.table_registry = TableRegistry(pdf_output_dir)
-                
-                # Process the PDF
-                results = self.extract_tables_from_pdf(str(pdf_file))
-                
-                batch_results['processed_pdfs'].append({
-                    'pdf_name': pdf_file.name,
-                    'pdf_path': str(pdf_file),
-                    'output_dir': str(pdf_output_dir),
-                    'results': results
-                })
-                
-                # Update summary
-                batch_results['summary']['total_tables'] += len(results['tables_found'])
-                batch_results['summary']['total_csv_files'] += len(results['csv_files'])
-                
-                for table_info in self.table_registry.get_all_tables().values():
-                    batch_results['summary']['total_rows'] += len(table_info['data_rows'])
-                
-            except Exception as e:
-                print(f"ERROR processing {pdf_file.name}: {e}")
-                batch_results['failed_pdfs'].append({
-                    'pdf_name': pdf_file.name,
-                    'error': str(e)
-                })
-        
-        # Generate batch summary report
-        self._generate_batch_report(batch_results, output_base_dir)
-        
-        return batch_results
-    
-    def _generate_batch_report(self, batch_results: Dict[str, Any], output_dir: Path):
-        """Generate a comprehensive batch processing report"""
-        report_path = output_dir / "batch_extraction_summary.txt"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("HOSPITAL RATE SCHEDULE BATCH EXTRACTION SUMMARY\n")
-            f.write("=" * 60 + "\n\n")
-            
-            f.write(f"Total PDFs Processed: {batch_results['total_pdfs']}\n")
-            f.write(f"Successfully Processed: {len(batch_results['processed_pdfs'])}\n")
-            f.write(f"Failed: {len(batch_results['failed_pdfs'])}\n\n")
-            
-            f.write("OVERALL STATISTICS:\n")
-            f.write("-" * 20 + "\n")
-            f.write(f"Total Tables Extracted: {batch_results['summary']['total_tables']}\n")
-            f.write(f"Total Rows Extracted: {batch_results['summary']['total_rows']}\n")
-            f.write(f"Total CSV Files Created: {batch_results['summary']['total_csv_files']}\n\n")
-            
-            if batch_results['processed_pdfs']:
-                f.write("SUCCESSFULLY PROCESSED FILES:\n")
-                f.write("-" * 30 + "\n")
-                for pdf_info in batch_results['processed_pdfs']:
-                    f.write(f"\n{pdf_info['pdf_name']}:\n")
-                    f.write(f"  Health System: {pdf_info['results']['document_summary']['health_system']}\n")
-                    f.write(f"  Hospital Names: {', '.join(pdf_info['results']['document_summary']['hospital_names']) if pdf_info['results']['document_summary']['hospital_names'] else 'N/A'}\n")
-                    f.write(f"  Tables Found: {len(pdf_info['results']['tables_found'])}\n")
-                    f.write(f"  CSV Files: {len(pdf_info['results']['csv_files'])}\n")
-                    f.write(f"  Output Directory: {pdf_info['output_dir']}\n")
-            
-            if batch_results['failed_pdfs']:
-                f.write("\nFAILED FILES:\n")
-                f.write("-" * 15 + "\n")
-                for failed_pdf in batch_results['failed_pdfs']:
-                    f.write(f"{failed_pdf['pdf_name']}: {failed_pdf['error']}\n")
-        
-        print(f"\nBatch processing summary saved to: {report_path}")
-
-# Enhanced usage example
+# Usage example
 if __name__ == "__main__":
-    # Configuration
-    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"  # Single PDF
-    pdf_directory = r"C:\Users\N873855\Documents\pdf_batch"  # Directory for batch processing
-    output_directory = "enhanced_extracted_tables"
-    
-    # Initialize Gemini client
+    # Example usage
+    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"  # Replace with your PDF file path
+   
     from google import genai
     client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
-    
-    # Create extractor instance
-    extractor = MultiPageTableExtractor(client, output_dir=output_directory)
-    
-    print("Enhanced Hospital Rate Extractor Ready!")
-    print("Features:")
-    print("- Improved hospital name extraction")
-    print("- Enhanced health system vs hospital distinction")
-    print("- Better LOB and service type detection")
-    print("- Standardized CSV output format")
-    print("- Batch processing capabilities")
-    print("- Detailed extraction reports")
-    
-    # Example: Single PDF processing
-    # results = extractor.extract_tables_from_pdf(pdf_file, dpi=300)
-    
-    # Example: Batch processing
-    # batch_results = extractor.process_batch_pdfs(pdf_directory, output_directory)
+   
+    extractor = MultiPageTableExtractor(client, output_dir="extracted_tables")
+    results = extractor.extract_tables_from_pdf(pdf_file, dpi=300)
+   
+    print("Improved multi-page table extractor ready!")
