@@ -11,13 +11,23 @@ from langchain.prompts import PromptTemplate
 from langchain.schema import HumanMessage
 from langchain.output_parsers import PydanticOutputParser, OutputFixingParser
 from langchain_core.exceptions import OutputParserException
+from langchain.agents import Tool, AgentExecutor, create_react_agent
+from langchain.memory import ConversationBufferMemory
 from pydantic import BaseModel, Field
 import pandas as pd
-import re
 
 def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
     """
     Convert each page of a PDF to individual images.
+   
+    Args:
+        pdf_path (str): Path to the input PDF file
+        output_dir (str): Directory to save images (default: same as PDF)
+        dpi (int): Resolution for output images (default: 150)
+        image_format (str): Output format ('png', 'jpg', 'jpeg')
+   
+    Returns:
+        list: Paths to the created image files
     """
     pdf_path = Path(pdf_path)
    
@@ -56,224 +66,237 @@ def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
     doc.close()
     return image_paths
 
-class HospitalRateData(BaseModel):
+class TableData(BaseModel):
     """
-    Enhanced model for hospital rate data extraction with better structure.
+    Enhanced model for multi-page table data extraction.
     """
-    has_table: bool = Field(description="Whether a structured data table is present")
-    table_type: Optional[str] = Field(default=None, description="'header_with_data', 'continuation', or 'none'")
+    has_table: bool = Field(description="Whether a structured data table is present in the image")
+    table_type: Optional[str] = Field(default=None, description="Type: 'new', 'continuation', or 'none'")
+    table_id: Optional[str] = Field(default=None, description="Unique identifier for this table")
+    column_names: Optional[List[str]] = Field(default=None, description="List of column headers/names")
+    data: Optional[List[Dict[str, str]]] = Field(default=None, description="List of rows with detailed breakdown: service, billing_code_type, billing_codes, rate_amount, negotiated_type, additional_info")
+    table_description: Optional[str] = Field(default=None, description="Brief description of the table content")
+    confidence_score: Optional[float] = Field(default=None, description="Confidence in table detection (0-1)")
+    is_continuation: bool = Field(default=False, description="Whether this appears to be a continuation")
+    continuation_clues: Optional[List[str]] = Field(default=None, description="Visual/textual clues for continuation")
     
-    # Document metadata - extracted from headers/titles
-    health_system: Optional[str] = Field(default=None, description="Health system name (e.g., 'Mercy Health', 'Advocate Health')")
-    hospital_names: Optional[List[str]] = Field(default=None, description="Specific hospital facility names from document")
-    effective_date: Optional[str] = Field(default=None, description="Effective date from document")
-    lob_type: Optional[str] = Field(default=None, description="Line of Business: Commercial, Medicare, Medicaid, ACOP Commercial, etc.")
-    
-    # Table structure
-    service_setting: Optional[str] = Field(default=None, description="INPATIENT or OUTPATIENT")
-    carve_out_section: Optional[str] = Field(default=None, description="Regular rates or carve-out rates section")
-    
-    # Table data - simplified structure
-    table_rows: Optional[List[Dict[str, str]]] = Field(default=None, description="Extracted table rows")
-    
-    # Context for multi-page processing
-    is_continuation: bool = Field(default=False, description="Whether this is a continuation page")
-    page_context: Optional[str] = Field(default=None, description="Context about what type of page this is")
+    # Hospital-specific fields
+    hospital_name: Optional[str] = Field(default=None, description="SPECIFIC hospital facility name (not health system name)")
+    effective_date: Optional[str] = Field(default=None, description="Effective date mentioned in the document")
+    lob_type: Optional[str] = Field(default=None, description="Line of Business type (Commercial, ACOP Commercial, etc.)")
+    service_type: Optional[str] = Field(default=None, description="INPATIENT or OUTPATIENT only")
 
-class ImprovedTableRegistry:
+class HospitalNameExtractor:
     """
-    Improved registry with better hospital name handling and standardized output.
+    Specialized class for extracting proper hospital names from different document formats
+    """
+    
+    @staticmethod
+    def extract_hospital_name(text_content: str, fallback_name: str = None) -> str:
+        """
+        Extract specific hospital facility name, not health system name
+        """
+        # Priority patterns for specific hospital names
+        specific_patterns = [
+            # Mercy hospitals
+            r'Mercy\s+Springfield\s+(?:and\s+)?(?:Urbana\s+)?Hospitals?',
+            r'Mercy\s+Health\s+Youngstown\s+Hospital',
+            r'Mercy\s+(?:Medical\s+)?(?:Center|Hospital)\s*-?\s*\w+',
+            
+            # Memorial hospitals  
+            r'Memorial\s+Health\s+System\s*-?\s*([^,\n]+?)(?:\s+Hospital)?',
+            r'Sistersville\s+General\s+Hospital',
+            r'Memorial\s+(?:Medical\s+)?(?:Center|Hospital)\s*-?\s*\w+',
+            
+            # Advocate hospitals
+            r'Advocate\s+Condell\s+Medical\s+Center\s+and\s+Advocate\s+Sherman\s+Hospital',
+            r'Advocate\s+(?:Christ|Good\s+Samaritan|Good\s+Shepherd|IL\s+Masonic|Lutheran\s+General|South\s+Suburban|Trinity)\s+(?:Medical\s+Center|Hospital)',
+            r'Advocate\s+\w+\s+(?:Medical\s+Center|Hospital)',
+            
+            # Generic patterns for other systems
+            r'(?:St\.?\s+)?(\w+(?:\s+\w+)*)\s+(?:Medical\s+Center|Hospital|Healthcare|Regional|Community)',
+            r'(\w+(?:\s+\w+)*)\s+(?:General\s+)?Hospital'
+        ]
+        
+        # Look for specific hospital names first
+        for pattern in specific_patterns:
+            import re
+            match = re.search(pattern, text_content, re.IGNORECASE)
+            if match:
+                hospital_name = match.group(0).strip()
+                # Clean up the name
+                hospital_name = re.sub(r'\s+', ' ', hospital_name)
+                return hospital_name
+        
+        # Fallback to provided name if no specific match found
+        if fallback_name and fallback_name != "N/A":
+            # Check if it's a system name we should avoid
+            system_names = ['Mercy Health', 'Memorial Health System', 'Advocate Health']
+            if not any(sys_name in fallback_name for sys_name in system_names):
+                return fallback_name
+        
+        return "N/A"
+
+class TableRegistry:
+    """
+    Registry to track active tables across multiple pages with CSV management.
     """
     def __init__(self, output_dir: Path):
         self.active_tables: Dict[str, Dict[str, Any]] = {}
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Enhanced standard columns
+        # Standard output columns for hospital rates
         self.standard_columns = [
-            'Health_System',
-            'Hospital_Name', 
-            'LOB_Type',
-            'Service_Setting',
-            'Section_Type',
-            'Service_Description',
-            'Billing_Code_Type',
-            'Billing_Codes',
-            'Rate_Amount',
-            'Rate_Type',
-            'Additional_Notes',
-            'Effective_Date',
-            'Page_Number'
+            'Hospital', 'LOB', 'Place of Service', 'Service Category', 
+            'Billing Code Type', 'Billing Code', 'Rate', 'Negotiated Type',
+            'Additional Information', 'Effective Date'
         ]
         
-        # Document-level metadata
-        self.document_metadata = {
-            'health_system': None,
-            'hospital_names': [],
-            'effective_date': None,
-            'lob_type': None
-        }
-    
-    def update_document_metadata(self, extraction_data: HospitalRateData):
-        """Update document-level metadata from extraction."""
-        if extraction_data.health_system and not self.document_metadata['health_system']:
-            self.document_metadata['health_system'] = extraction_data.health_system
-            
-        if extraction_data.hospital_names:
-            for hospital in extraction_data.hospital_names:
-                if hospital not in self.document_metadata['hospital_names']:
-                    self.document_metadata['hospital_names'].append(hospital)
-                    
-        if extraction_data.effective_date and not self.document_metadata['effective_date']:
-            self.document_metadata['effective_date'] = extraction_data.effective_date
-            
-        if extraction_data.lob_type and not self.document_metadata['lob_type']:
-            self.document_metadata['lob_type'] = extraction_data.lob_type
-    
-    def determine_hospital_name(self, hospital_names: List[str]) -> str:
-        """Determine the most specific hospital name."""
-        if not hospital_names:
-            return self.document_metadata['hospital_names'][0] if self.document_metadata['hospital_names'] else "Unknown Hospital"
-        
-        # Prefer specific hospital names over generic ones
-        for name in hospital_names:
-            # Look for specific hospital indicators
-            if any(indicator in name.lower() for indicator in ['hospital', 'medical center', 'general', 'regional']):
-                return name
-        
-        # Fall back to first name or document-level names
-        return hospital_names[0] if hospital_names else (
-            self.document_metadata['hospital_names'][0] if self.document_metadata['hospital_names'] else "Unknown Hospital"
-        )
-    
-    def register_new_table(self, extraction_data: HospitalRateData, page_num: int) -> str:
-        """Register a new table with improved metadata handling."""
-        table_id = str(uuid.uuid4())
-        
-        # Update document metadata
-        self.update_document_metadata(extraction_data)
-        
-        # Determine specific hospital name
-        hospital_name = self.determine_hospital_name(extraction_data.hospital_names)
-        
-        # Create CSV filename with better naming
-        service_setting = extraction_data.service_setting or "UNKNOWN"
-        csv_filename = f"rates_{service_setting}_{table_id[:8]}_page_{page_num}.csv"
+        # Track document-level hospital name
+        self.document_hospital_name = None
+        self.hospital_extractor = HospitalNameExtractor()
+       
+    def register_table(self, table_id: str, column_names: List[str], description: str, page_num: int, 
+                      hospital_name: str = "N/A", lob_type: str = "N/A", service_type: str = "N/A", 
+                      effective_date: str = "N/A") -> str:
+        """Register a new table and create its CSV file"""
+        csv_filename = f"table_{len(self.active_tables) + 1}_{table_id[:8]}.csv"
         csv_path = self.output_dir / csv_filename
         
-        # Store table metadata
-        table_metadata = {
-            'table_id': table_id,
-            'csv_path': str(csv_path),
-            'csv_filename': csv_filename,
+        # Extract proper hospital name using the specialized extractor
+        final_hospital_name = self.hospital_extractor.extract_hospital_name(
+            f"{hospital_name} {description}", hospital_name
+        )
+        
+        # Set document-level hospital name if this is the first valid one
+        if (final_hospital_name and final_hospital_name != "N/A" and 
+            (not self.document_hospital_name or self.document_hospital_name == "N/A")):
+            self.document_hospital_name = final_hospital_name
+        
+        # Use document-level hospital name for consistency
+        if self.document_hospital_name and self.document_hospital_name != "N/A":
+            final_hospital_name = self.document_hospital_name
+       
+        self.active_tables[table_id] = {
+            'column_names': self.standard_columns,
+            'original_columns': column_names,
+            'description': description,
             'start_page': page_num,
             'last_page': page_num,
-            'health_system': self.document_metadata['health_system'],
-            'hospital_name': hospital_name,
-            'lob_type': self.document_metadata['lob_type'],
-            'service_setting': extraction_data.service_setting,
-            'carve_out_section': extraction_data.carve_out_section,
-            'effective_date': self.document_metadata['effective_date'],
-            'row_count': 0
+            'data_rows': [],
+            'csv_path': str(csv_path),
+            'csv_filename': csv_filename,
+            'hospital_name': final_hospital_name,
+            'lob_type': lob_type,
+            'service_type': service_type,
+            'effective_date': effective_date
         }
-        
-        self.active_tables[table_id] = table_metadata
-        
-        # Create CSV with headers
+       
+        # Create CSV with standard headers
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(self.standard_columns)
-        
-        return table_id
-    
-    def add_rows_to_table(self, table_id: str, extraction_data: HospitalRateData, page_num: int):
-        """Add rows to existing table with improved data processing."""
-        if table_id not in self.active_tables:
-            return
-        
-        table_info = self.active_tables[table_id]
-        table_info['last_page'] = page_num
-        
-        if not extraction_data.table_rows:
-            return
-        
-        # Convert extracted rows to standard format
-        standardized_rows = []
-        for row_data in extraction_data.table_rows:
-            standardized_row = self.convert_row_to_standard_format(row_data, table_info, page_num)
-            standardized_rows.append(standardized_row)
-        
-        # Append to CSV
-        csv_path = table_info['csv_path']
-        with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            for row in standardized_rows:
-                writer.writerow([row.get(col, '') for col in self.standard_columns])
-        
-        table_info['row_count'] += len(standardized_rows)
-        print(f"Added {len(standardized_rows)} rows to table {table_id[:8]}")
-    
-    def convert_row_to_standard_format(self, row_data: Dict[str, str], table_info: Dict[str, Any], page_num: int) -> Dict[str, str]:
-        """Convert extracted row data to standardized format."""
-        return {
-            'Health_System': table_info['health_system'] or '',
-            'Hospital_Name': table_info['hospital_name'] or '',
-            'LOB_Type': table_info['lob_type'] or '',
-            'Service_Setting': table_info['service_setting'] or '',
-            'Section_Type': table_info['carve_out_section'] or 'Regular',
-            'Service_Description': row_data.get('service', ''),
-            'Billing_Code_Type': row_data.get('code_type', ''),
-            'Billing_Codes': row_data.get('codes', ''),
-            'Rate_Amount': row_data.get('rate_amount', ''),
-            'Rate_Type': row_data.get('rate_type', ''),
-            'Additional_Notes': row_data.get('notes', ''),
-            'Effective_Date': table_info['effective_date'] or '',
-            'Page_Number': str(page_num)
-        }
-    
-    def find_continuation_table(self, extraction_data: HospitalRateData) -> Optional[str]:
-        """Find the most likely table for continuation."""
-        if not self.active_tables:
-            return None
-        
-        # Find most recent table with matching service setting
-        target_setting = extraction_data.service_setting
-        
-        for table_id in reversed(list(self.active_tables.keys())):
+           
+        return str(csv_path)
+   
+    def add_data_to_table(self, table_id: str, data_rows: List[Dict[str, str]], page_num: int):
+        """Add data rows to existing table and append to CSV"""
+        if table_id in self.active_tables:
             table_info = self.active_tables[table_id]
-            if table_info['service_setting'] == target_setting:
-                return table_id
+            table_info['data_rows'].extend(data_rows)
+            table_info['last_page'] = page_num
+           
+            # Convert and append to CSV
+            csv_path = table_info['csv_path']
+            standardized_rows = self.convert_to_standard_format(data_rows, table_info)
+            
+            with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                for row_data in standardized_rows:
+                    writer.writerow([row_data.get(col, 'N/A') for col in self.standard_columns])
+               
+    def convert_to_standard_format(self, data_rows: List[Dict[str, str]], table_info: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Convert raw table data to standard format"""
+        standardized_rows = []
         
-        # Fall back to most recent table
-        return list(self.active_tables.keys())[-1]
-    
-    def get_summary(self) -> Dict[str, Any]:
-        """Get extraction summary."""
-        return {
-            'document_metadata': self.document_metadata,
-            'tables_created': len(self.active_tables),
-            'total_rows': sum(table['row_count'] for table in self.active_tables.values()),
-            'csv_files': [table['csv_path'] for table in self.active_tables.values()]
-        }
+        for row in data_rows:
+            # Determine place of service
+            place_of_service = "IP" if table_info['service_type'] == "INPATIENT" else "OP"
+            
+            row_data = {
+                'Hospital': table_info['hospital_name'],
+                'LOB': table_info['lob_type'],
+                'Place of Service': place_of_service,
+                'Service Category': row.get('service', 'N/A'),
+                'Billing Code Type': row.get('billing_code_type', 'N/A'),
+                'Billing Code': row.get('billing_codes', 'N/A'),
+                'Rate': row.get('rate_amount', 'N/A'),
+                'Negotiated Type': row.get('negotiated_type', 'N/A'),
+                'Additional Information': row.get('additional_info', 'N/A'),
+                'Effective Date': table_info['effective_date']
+            }
+            standardized_rows.append(row_data)
+        
+        return standardized_rows
 
-class EnhancedHospitalExtractor:
+    def find_similar_table(self, potential_columns: List[str], similarity_threshold: float = 0.6) -> Optional[str]:
+        """Find existing table with similar column structure"""
+        best_match = None
+        best_similarity = 0
+       
+        for table_id, table_info in self.active_tables.items():
+            existing_cols = table_info['original_columns']
+            similarity = self._calculate_column_similarity(existing_cols, potential_columns)
+           
+            if similarity >= similarity_threshold and similarity > best_similarity:
+                best_similarity = similarity
+                best_match = table_id
+               
+        return best_match
+       
+    def _calculate_column_similarity(self, cols1: List[str], cols2: List[str]) -> float:
+        """Calculate similarity between two column sets"""
+        if not cols1 or not cols2:
+            return 0.0
+           
+        # Normalize column names for comparison
+        cols1_norm = [col.lower().strip() for col in cols1]
+        cols2_norm = [col.lower().strip() for col in cols2]
+       
+        # Calculate Jaccard similarity
+        set1, set2 = set(cols1_norm), set(cols2_norm)
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+       
+        return intersection / union if union > 0 else 0.0
+       
+    def get_table_context(self, table_id: str) -> Dict[str, Any]:
+        """Get context information for a table"""
+        return self.active_tables.get(table_id, {})
+       
+    def get_all_tables(self) -> Dict[str, Dict[str, Any]]:
+        """Get all registered tables"""
+        return self.active_tables
+
+class MultiPageTableExtractor:
     """
-    Enhanced extractor with improved prompts and error handling.
+    Main class for extracting tables across multiple pages with context awareness.
     """
-    
+   
     def __init__(self, client, output_dir: str = None):
         self.client = client
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
-        self.registry = ImprovedTableRegistry(self.output_dir)
-    
-    def create_detection_prompt(self) -> tuple:
-        """Create improved detection prompt with better instructions."""
-        base_parser = PydanticOutputParser(pydantic_object=HospitalRateData)
-        
+        self.table_registry = TableRegistry(self.output_dir)
+       
+    def create_table_detection_prompt(self) -> tuple:
+        """Create prompt for initial table detection and classification"""
+        base_parser = PydanticOutputParser(pydantic_object=TableData)
+       
         class GeminiLLM:
             def __init__(self, client):
                 self.client = client
-            
+               
             def __call__(self, prompt: str) -> str:
                 try:
                     response = self.client.models.generate_content(
@@ -283,220 +306,332 @@ class EnhancedHospitalExtractor:
                     return response.text
                 except Exception as e:
                     return f"Error: {e}"
-        
+       
         llm_wrapper = GeminiLLM(self.client)
         table_parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
-        
+       
         template = """
-You are an expert at extracting hospital rate information from medical documents.
+You are an expert table detection and classification specialist for hospital rate schedules.
 
-DOCUMENT ANALYSIS INSTRUCTIONS:
+CRITICAL HOSPITAL NAME EXTRACTION RULES:
+1. EXTRACT SPECIFIC HOSPITAL FACILITY NAMES, NOT HEALTH SYSTEM NAMES:
+   - CORRECT: "Mercy Springfield and Urbana Hospitals", "Sistersville General Hospital", "Advocate Condell Medical Center"
+   - INCORRECT: "Mercy Health", "Memorial Health System", "Advocate Health"
 
-1. EXTRACT DOCUMENT METADATA (look at headers, titles, and document top):
-   - health_system: Main health system name (e.g., "Mercy Health", "Advocate Health", "Memorial Health System")
-   - hospital_names: SPECIFIC hospital facility names (e.g., ["Mercy Springfield Hospital", "Mercy Urbana Hospital"])
-     * Look for: "Hospital", "Medical Center", "General Hospital", "Regional Medical Center"
-     * IGNORE generic system names - we want specific facility names
-   - effective_date: Look for "Effective Date:" followed by a date
-   - lob_type: Line of Business type from headers:
-     * "COMMERCIAL" → "Commercial"
-     * "MEDICARE" → "Medicare" 
-     * "MEDICAID" → "Medicaid"
-     * "ACOP COMMERCIAL" → "ACOP Commercial"
+2. LOOK FOR HOSPITAL NAMES IN THESE LOCATIONS:
+   - Document headers and titles
+   - Subtitle text under main headers
+   - Specific facility names mentioned in the rate schedule title
+   - Text that says "Hospital Service and Rate Schedule" for [Specific Hospital Name]
 
-2. IDENTIFY SERVICE SETTING AND SECTION:
-   - service_setting: Look for section headers:
-     * Contains "INPATIENT" → "INPATIENT"
-     * Contains "OUTPATIENT" → "OUTPATIENT"
-   - carve_out_section: Look for section type:
-     * Contains "CARVE OUT" → "Carve Out Rates"
-     * Otherwise → "Regular Rates"
+3. HOSPITAL NAME PATTERNS TO EXTRACT:
+   - Mercy: "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital"
+   - Memorial: "Sistersville General Hospital" (NOT just "Memorial Health System")
+   - Advocate: "Advocate Condell Medical Center and Advocate Sherman Hospital", "Advocate Christ Medical Center"
+   - Extract the FULL specific facility name, including "and" connectors if multiple hospitals
 
-3. TABLE DETECTION:
-   - has_table: true if there's a structured table with Service/Billing Codes/Rates
-   - table_type: 
-     * "header_with_data" if table has headers and data rows
-     * "continuation" if data rows without headers (continuing from previous page)
-     * "none" if no table present
+4. IF NO SPECIFIC HOSPITAL NAME IS FOUND:
+   - Set hospital_name to "N/A" 
+   - DO NOT use generic system names like "Mercy Health" or "Memorial Health System"
 
-4. TABLE DATA EXTRACTION (for each row):
-   Extract into table_rows as list of dictionaries with keys:
-   - service: Service description (e.g., "Inpatient Psychiatric", "Emergency Care")
-   - code_type: Type of billing code (e.g., "DRG Codes", "Revenue Codes", "HCPC Codes")
-   - codes: The actual codes (e.g., "880-887", "450, 451, 452, 459")
-   - rate_amount: Just the monetary value or percentage (e.g., "$1,800.00", "33%")
-   - rate_type: Rate structure (e.g., "Per Diem", "Case Rate", "Percentage of Billed Charges")
-   - notes: Additional conditions/notes (e.g., "Paid In Addition to Other Negotiated Rates")
+ANALYSIS STEPS:
 
-IMPORTANT: 
-- For continuation pages, focus on extracting data rows only
-- Set is_continuation: true if this appears to be continuing a table from previous page
-- Extract hospital names carefully - we want specific facilities, not just system names
+1. IDENTIFY DOCUMENT METADATA:
+   - Hospital name: Extract SPECIFIC hospital facility name from headers/titles (follow rules above)
+   - Effective date (look for "Effective Date:" text)
+   - Line of Business (LOB) type: Look for LOB indicators in headers/titles
+     * "COMMERCIAL" → lob_type = "Commercial"
+     * "MEDICARE" → lob_type = "Medicare" 
+     * "MEDICAID" → lob_type = "Medicaid"
+     * "ACOP COMMERCIAL" → lob_type = "ACOP Commercial"
+     * If NO LOB mentioned → lob_type = "N/A"
+   - Service type: Look for section headers
+     * "INPATIENT RATES" → service_type = "INPATIENT"
+     * "OUTPATIENT RATES" → service_type = "OUTPATIENT"
+
+2. Look for structured data in rows and columns with Service, Billing Codes, Rates
+
+3. FOR TABLE DATA EXTRACTION:
+   For each row in the table, extract and break down:
+   - service: The service name/description
+   - billing_code_type: The type of billing code (e.g., "DRG", "Revenue Codes", "HCPC Codes")
+   - billing_codes: The actual codes/ranges
+   - rate_amount: Just the monetary amount or percentage
+   - negotiated_type: The rate structure (e.g., "Per Diem", "Case Rate", "Percentage")
+   - additional_info: Any special conditions or notes (use "N/A" if none)
+
+4. Identify table type:
+   - NEW TABLE: Has visible column headers at the top
+   - CONTINUATION: Has data rows but no headers
+   - NONE: No structured table present
 
 {format_instructions}
 
-Analyze this hospital rate document:
+Analyze the image and extract hospital rate information:
 """
-        
+       
         prompt = PromptTemplate(
             template=template,
             input_variables=[],
             partial_variables={"format_instructions": table_parser.get_format_instructions()}
         )
-        
+       
         return prompt, table_parser
-    
+       
+    def create_context_aware_prompt(self, context_info: Dict[str, Any]) -> tuple:
+        """Create context-aware prompt for table continuation extraction"""
+        base_parser = PydanticOutputParser(pydantic_object=TableData)
+       
+        class GeminiLLM:
+            def __init__(self, client):
+                self.client = client
+               
+            def __call__(self, prompt: str) -> str:
+                try:
+                    response = self.client.models.generate_content(
+                        model='gemini-2.0-flash',
+                        contents=[prompt]
+                    )
+                    return response.text
+                except Exception as e:
+                    return f"Error: {e}"
+       
+        llm_wrapper = GeminiLLM(self.client)
+        table_parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
+       
+        expected_columns = context_info.get('original_columns', [])
+        table_description = context_info.get('description', 'Table continuation')
+       
+        template = f"""
+You are extracting data from a KNOWN table continuation. This table has been identified across multiple pages.
+
+KNOWN TABLE STRUCTURE:
+- Columns: {expected_columns}
+- Description: {table_description}
+
+EXTRACTION INSTRUCTIONS:
+1. Extract ONLY data rows (no headers)
+2. For each row, extract the detailed breakdown:
+   - service: The service name/description 
+   - billing_code_type: The type of billing code
+   - billing_codes: The actual codes/ranges 
+   - rate_amount: Just the monetary amount or percentage 
+   - negotiated_type: The rate structure
+   - additional_info: Any special conditions or notes
+
+3. Use empty string "" for missing/empty fields
+4. Preserve exact text including numbers, dates, symbols
+
+IMPORTANT SETTINGS:
+- Set has_table: true
+- Set is_continuation: true  
+- Set table_type: "continuation"
+
+{{format_instructions}}
+
+Extract the table data rows:
+"""
+       
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=[],
+            partial_variables={"format_instructions": table_parser.get_format_instructions()}
+        )
+       
+        return prompt, table_parser
+       
     def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
-        """Process a single page with enhanced error handling."""
-        print(f"\nProcessing page {page_num}: {Path(image_path).name}")
-        
+        """Process a single page with context awareness"""
+        print(f"Processing page {page_num}: {Path(image_path).name}")
+       
         try:
             with open(image_path, 'rb') as f:
                 image_bytes = f.read()
-            
+           
             mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
-            
-            # Create and run detection prompt
-            detection_prompt, detection_parser = self.create_detection_prompt()
-            prompt_text = detection_prompt.format()
-            
+           
+            # Step 1: Initial table detection
+            detection_prompt, detection_parser = self.create_table_detection_prompt()
+            detection_text = detection_prompt.format()
+           
             response = self.client.models.generate_content(
                 model='gemini-2.0-flash',
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    prompt_text
+                    detection_text
                 ]
             )
-            
-            # Parse response
-            parsed_data = detection_parser.parse(response.text.strip())
-            
-            # Print what was detected
-            print(f"  Has table: {parsed_data.has_table}")
-            if parsed_data.has_table:
-                print(f"  Table type: {parsed_data.table_type}")
-                print(f"  Service setting: {parsed_data.service_setting}")
-                if parsed_data.hospital_names:
-                    print(f"  Hospital names: {parsed_data.hospital_names}")
-                if parsed_data.table_rows:
-                    print(f"  Extracted {len(parsed_data.table_rows)} rows")
-            
-            # Process based on table type
-            if not parsed_data.has_table:
+           
+            parsed_response = detection_parser.parse(response.text.strip())
+           
+            if not parsed_response.has_table:
+                print(f"No table found on page {page_num}")
                 return {
                     'page_num': page_num,
                     'has_table': False,
-                    'extracted_metadata': bool(parsed_data.health_system or parsed_data.hospital_names)
+                    'reason': getattr(parsed_response, 'reason', 'No table detected')
                 }
-            
-            if parsed_data.table_type == "header_with_data":
-                # New table with headers and data
-                table_id = self.registry.register_new_table(parsed_data, page_num)
-                
-                if parsed_data.table_rows:
-                    self.registry.add_rows_to_table(table_id, parsed_data, page_num)
-                
+           
+            # Step 2: Handle different table types
+            if parsed_response.table_type == "new" or (parsed_response.column_names and not parsed_response.is_continuation):
+                # New table detected
+                table_id = str(uuid.uuid4())
+                column_names = parsed_response.column_names
+                description = parsed_response.table_description or f"Table starting on page {page_num}"
+               
+                print(f"New table detected: {description}")
+                print(f"Hospital name extracted: {parsed_response.hospital_name}")
+                print(f"Columns: {column_names}")
+               
+                # Register new table with hospital metadata
+                csv_path = self.table_registry.register_table(
+                    table_id, column_names, description, page_num,
+                    parsed_response.hospital_name or "N/A",
+                    parsed_response.lob_type or "N/A", 
+                    parsed_response.service_type or "N/A",
+                    parsed_response.effective_date or "N/A"
+                )
+               
+                # Add initial data if present
+                if parsed_response.data:
+                    self.table_registry.add_data_to_table(table_id, parsed_response.data, page_num)
+                    print(f"Added {len(parsed_response.data)} initial rows")
+               
                 return {
                     'page_num': page_num,
                     'has_table': True,
                     'table_type': 'new',
                     'table_id': table_id,
-                    'rows_added': len(parsed_data.table_rows) if parsed_data.table_rows else 0
+                    'csv_path': csv_path,
+                    'rows_added': len(parsed_response.data) if parsed_response.data else 0
                 }
-            
-            elif parsed_data.table_type == "continuation" or parsed_data.is_continuation:
-                # Continuation of existing table
-                continuation_table_id = self.registry.find_continuation_table(parsed_data)
-                
-                if continuation_table_id and parsed_data.table_rows:
-                    self.registry.add_rows_to_table(continuation_table_id, parsed_data, page_num)
-                    
-                    return {
-                        'page_num': page_num,
-                        'has_table': True,
-                        'table_type': 'continuation',
-                        'table_id': continuation_table_id,
-                        'rows_added': len(parsed_data.table_rows)
-                    }
+               
+            elif parsed_response.is_continuation or parsed_response.table_type == "continuation":
+                # Table continuation detected
+                print(f"Table continuation detected on page {page_num}")
+               
+                # Try to match with existing table
+                if parsed_response.column_names:
+                    matching_table_id = self.table_registry.find_similar_table(parsed_response.column_names)
                 else:
-                    print(f"  Warning: Could not find continuation table for page {page_num}")
-                    return {
-                        'page_num': page_num,
-                        'has_table': False,
-                        'reason': 'Continuation detected but no matching table found'
-                    }
-            
+                    matching_table_id = list(self.table_registry.active_tables.keys())[-1] if self.table_registry.active_tables else None
+               
+                if matching_table_id:
+                    context_info = self.table_registry.get_table_context(matching_table_id)
+                   
+                    # Re-extract with context
+                    context_prompt, context_parser = self.create_context_aware_prompt(context_info)
+                    context_text = context_prompt.format()
+                   
+                    context_response = self.client.models.generate_content(
+                        model='gemini-2.0-flash',
+                        contents=[
+                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                            context_text
+                        ]
+                    )
+                   
+                    context_parsed = context_parser.parse(context_response.text.strip())
+                   
+                    if context_parsed.data:
+                        self.table_registry.add_data_to_table(matching_table_id, context_parsed.data, page_num)
+                        print(f"Added {len(context_parsed.data)} rows to existing table")
+                       
+                        return {
+                            'page_num': page_num,
+                            'has_table': True,
+                            'table_type': 'continuation',
+                            'table_id': matching_table_id,
+                            'rows_added': len(context_parsed.data)
+                        }
+               
+                print(f"Could not match continuation to existing table")
+                return {
+                    'page_num': page_num,
+                    'has_table': False,
+                    'reason': 'Continuation detected but no matching table found'
+                }
+           
         except Exception as e:
-            print(f"  Error processing page {page_num}: {str(e)}")
+            print(f"Error processing page {page_num}: {e}")
             return {
                 'page_num': page_num,
                 'has_table': False,
                 'error': str(e)
             }
-        
-        return {
-            'page_num': page_num,
-            'has_table': False,
-            'reason': 'Unknown table type'
-        }
-    
-    def extract_tables_from_pdf(self, pdf_path: str, dpi: int = 300, image_format: str = 'png') -> Dict[str, Any]:
+   
+    def extract_tables_from_pdf(self, pdf_path: str, dpi: int = 150, image_format: str = 'png') -> Dict[str, Any]:
         """
-        Extract all tables from PDF with enhanced processing.
+        Extract all tables from PDF with multi-page awareness.
         """
-        print(f"Starting enhanced table extraction for: {pdf_path}")
-        
+        print(f"Starting multi-page table extraction for: {pdf_path}")
+       
         # Convert PDF to images
         image_paths = pdf_to_images(pdf_path, self.output_dir, dpi, image_format)
-        
+       
         # Process each page
-        page_results = []
-        
-        for page_num, image_path in enumerate(image_paths, 1):
-            page_result = self.process_page(image_path, page_num)
-            page_results.append(page_result)
-        
-        # Get final summary
-        summary = self.registry.get_summary()
-        
-        # Compile results
         results = {
             'pdf_path': pdf_path,
             'total_pages': len(image_paths),
-            'page_results': page_results,
-            'document_metadata': summary['document_metadata'],
-            'tables_created': summary['tables_created'],
-            'total_rows_extracted': summary['total_rows'],
-            'csv_files': summary['csv_files']
+            'processed_pages': [],
+            'tables_found': {},
+            'csv_files': []
         }
-        
-        # Print final summary
-        print(f"\n{'='*60}")
-        print(f"EXTRACTION COMPLETE")
-        print(f"{'='*60}")
-        print(f"Health System: {results['document_metadata']['health_system']}")
-        print(f"Hospital Names: {results['document_metadata']['hospital_names']}")
-        print(f"LOB Type: {results['document_metadata']['lob_type']}")
-        print(f"Effective Date: {results['document_metadata']['effective_date']}")
-        print(f"Total Pages: {results['total_pages']}")
-        print(f"Tables Created: {results['tables_created']}")
-        print(f"Total Rows: {results['total_rows_extracted']}")
-        print(f"\nCSV Files:")
-        for csv_file in results['csv_files']:
-            print(f"  - {csv_file}")
-        print(f"{'='*60}")
-        
+       
+        for page_num, image_path in enumerate(image_paths, 1):
+            page_result = self.process_page(image_path, page_num)
+            results['processed_pages'].append(page_result)
+           
+            if page_result.get('table_id'):
+                table_id = page_result['table_id']
+                if table_id not in results['tables_found']:
+                    table_info = self.table_registry.get_table_context(table_id)
+                    results['tables_found'][table_id] = {
+                        'description': table_info['description'],
+                        'columns': table_info['original_columns'],
+                        'csv_path': table_info['csv_path'],
+                        'hospital_name': table_info.get('hospital_name', 'N/A'),
+                        'lob_type': table_info.get('lob_type', 'N/A'),
+                        'service_type': table_info.get('service_type', 'N/A'),
+                        'pages': []
+                    }
+                results['tables_found'][table_id]['pages'].append(page_num)
+       
+        # Get final CSV files
+        for table_info in self.table_registry.get_all_tables().values():
+            results['csv_files'].append(table_info['csv_path'])
+       
+        # Summary
+        total_tables = len(results['tables_found'])
+        pages_with_tables = len([p for p in results['processed_pages'] if p.get('has_table')])
+       
+        print(f"\n=== MULTI-PAGE EXTRACTION SUMMARY ===")
+        print(f"Total pages processed: {results['total_pages']}")
+        print(f"Pages with tables: {pages_with_tables}")
+        print(f"Unique tables found: {total_tables}")
+        print(f"CSV files created: {len(results['csv_files'])}")
+       
+        if results['csv_files']:
+            print(f"\nCSV Files Created:")
+            for csv_file in results['csv_files']:
+                print(f"  - {csv_file}")
+                
+        # Print hospital names found
+        print(f"\nHospital Names Extracted:")
+        for table_info in self.table_registry.get_all_tables().values():
+            print(f"  - {table_info.get('hospital_name', 'N/A')}")
+       
         return results
 
 # Usage example
 if __name__ == "__main__":
     # Example usage
-    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"
-    
+    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"  # Replace with your PDF file path
+   
     from google import genai
     client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
-    
-    extractor = EnhancedHospitalExtractor(client, output_dir="extracted_tables")
+   
+    extractor = MultiPageTableExtractor(client, output_dir="extracted_tables")
     results = extractor.extract_tables_from_pdf(pdf_file, dpi=300)
-    
-    print("Enhanced hospital rate extractor ready!")
+   
+    print("Enhanced hospital table extractor ready!")
