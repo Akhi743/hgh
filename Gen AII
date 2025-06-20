@@ -396,6 +396,12 @@ CRITICAL HOSPITAL NAME EXTRACTION RULES:
    - Set hospital_name to "N/A" 
    - DO NOT use generic system names like "Mercy Health" or "Memorial Health System"
 
+CRITICAL: DETECT MULTIPLE TABLES ON SAME PAGE
+If you see BOTH "INPATIENT RATES:" AND "OUTPATIENT RATES:" sections on the same page:
+- Focus on extracting data from the FIRST visible table section only
+- Set table_type to "new" for the first section you encounter
+- The system will process the page again to detect the second section
+
 ANALYSIS STEPS:
 
 1. IDENTIFY DOCUMENT METADATA:
@@ -408,15 +414,15 @@ ANALYSIS STEPS:
      * "ACOP COMMERCIAL" → lob_type = "ACOP Commercial"
      * If NO LOB mentioned → lob_type = "N/A"
    - Service type: Look CAREFULLY for section headers - this is CRITICAL for place of service
-     * If you see "INPATIENT RATES" or "INPATIENT CARVE OUT RATES" → service_type = "INPATIENT"
-     * If you see "OUTPATIENT RATES" or "OUTPATIENT CARVE OUT RATES" → service_type = "OUTPATIENT"
-     * Look at the section the table is under, examine the page headers and section titles
+     * If extracting from "INPATIENT RATES:" section → service_type = "INPATIENT"
+     * If extracting from "OUTPATIENT RATES:" section → service_type = "OUTPATIENT"  
+     * If you see both sections, focus on the FIRST one and set service_type accordingly
      * Pay special attention to text like "INPATIENT RATES:" or "OUTPATIENT RATES:" above tables
 
 2. DETERMINE TABLE TYPE CAREFULLY - AVOID DUPLICATES:
    - NEW TABLE: Has clear column headers AND is the start of a new section
    - CONTINUATION: Has data rows but appears to continue from previous page
-   - If unsure and there's already an active table, lean towards CONTINUATION
+   - If you see multiple rate sections (IP and OP), treat the first one as "new"
 
 3. FOR TABLE DATA EXTRACTION:
    For each row in the table, extract and break down:
@@ -502,9 +508,10 @@ Extract the table data rows:
        
         return prompt, table_parser
        
-    def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
-        """Process a single page with context awareness"""
-        print(f"Processing page {page_num}: {Path(image_path).name}")
+    def process_page(self, image_path: str, page_num: int, section_focus: str = None) -> Dict[str, Any]:
+        """Process a single page with context awareness and optional section focus"""
+        section_text = f" (focusing on {section_focus} section)" if section_focus else ""
+        print(f"Processing page {page_num}: {Path(image_path).name}{section_text}")
        
         try:
             with open(image_path, 'rb') as f:
@@ -515,6 +522,10 @@ Extract the table data rows:
             # Step 1: Initial table detection
             detection_prompt, detection_parser = self.create_table_detection_prompt()
             detection_text = detection_prompt.format()
+            
+            # Add section focus instruction if provided
+            if section_focus:
+                detection_text += f"\n\nSPECIAL INSTRUCTION: Focus ONLY on extracting data from the {section_focus} section. Ignore other sections on this page."
            
             response = self.client.models.generate_content(
                 model='gemini-2.0-flash',
@@ -549,7 +560,7 @@ Extract the table data rows:
             is_continuation = (
                 parsed_response.is_continuation or 
                 parsed_response.table_type == "continuation" or
-                (has_active_table and not is_new_table and parsed_response.data)
+                (has_active_table and not is_new_table and parsed_response.data and not section_focus)
             )
             
             if is_new_table and not is_continuation:
@@ -557,6 +568,10 @@ Extract the table data rows:
                 table_id = str(uuid.uuid4())
                 column_names = parsed_response.column_names
                 description = parsed_response.table_description or f"Table starting on page {page_num}"
+                
+                # Add section focus to description if provided
+                if section_focus:
+                    description = f"{section_focus} - {description}"
                
                 print(f"New table detected: {description}")
                 print(f"Hospital name extracted: {parsed_response.hospital_name}")
@@ -583,10 +598,109 @@ Extract the table data rows:
                     'table_type': 'new',
                     'table_id': table_id,
                     'csv_path': csv_path,
-                    'rows_added': len(parsed_response.data) if parsed_response.data else 0
+                    'rows_added': len(parsed_response.data) if parsed_response.data else 0,
+                    'section_focus': section_focus
                 }
                
             elif is_continuation:
+                # Table continuation detected
+                print(f"Table continuation detected on page {page_num}")
+               
+                # Try to match with existing table
+                if parsed_response.column_names:
+                    matching_table_id = self.table_registry.find_similar_table(parsed_response.column_names)
+                else:
+                    matching_table_id = list(self.table_registry.active_tables.keys())[-1] if self.table_registry.active_tables else None
+               
+                if matching_table_id:
+                    context_info = self.table_registry.get_table_context(matching_table_id)
+                   
+                    # Re-extract with context
+                    context_prompt, context_parser = self.create_context_aware_prompt(context_info)
+                    context_text = context_prompt.format()
+                   
+                    context_response = self.client.models.generate_content(
+                        model='gemini-2.0-flash',
+                        contents=[
+                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                            context_text
+                        ]
+                    )
+                   
+                    context_parsed = context_parser.parse(context_response.text.strip())
+                   
+                    if context_parsed.data:
+                        self.table_registry.add_data_to_table(matching_table_id, context_parsed.data, page_num)
+                        print(f"Added {len(context_parsed.data)} rows to existing table")
+                       
+                        return {
+                            'page_num': page_num,
+                            'has_table': True,
+                            'table_type': 'continuation',
+                            'table_id': matching_table_id,
+                            'rows_added': len(context_parsed.data)
+                        }
+               
+                print(f"Could not match continuation to existing table")
+                return {
+                    'page_num': page_num,
+                    'has_table': False,
+                    'reason': 'Continuation detected but no matching table found'
+                }
+           
+        except Exception as e:
+            print(f"Error processing page {page_num}: {e}")
+            return {
+                'page_num': page_num,
+                'has_table': False,
+                'error': str(e)
+            }
+
+    def detect_multiple_sections(self, image_path: str) -> List[str]:
+        """
+        Detect if a page has multiple rate sections (INPATIENT and OUTPATIENT)
+        """
+        try:
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+           
+            mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
+            
+            # Simple detection prompt to identify sections
+            detection_text = """
+            Look at this image and identify if it contains multiple rate sections.
+            
+            Respond with one of these:
+            - "INPATIENT_ONLY" if you only see INPATIENT RATES section
+            - "OUTPATIENT_ONLY" if you only see OUTPATIENT RATES section  
+            - "BOTH_SECTIONS" if you see both INPATIENT RATES and OUTPATIENT RATES sections
+            - "NEITHER" if you don't see clear rate sections
+            
+            Look for headers like "INPATIENT RATES:" and "OUTPATIENT RATES:"
+            """
+           
+            response = self.client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    detection_text
+                ]
+            )
+            
+            response_text = response.text.strip().upper()
+            
+            if "BOTH_SECTIONS" in response_text:
+                return ["INPATIENT", "OUTPATIENT"]
+            elif "INPATIENT_ONLY" in response_text:
+                return ["INPATIENT"]
+            elif "OUTPATIENT_ONLY" in response_text:
+                return ["OUTPATIENT"]
+            else:
+                return ["GENERAL"]  # Default to general processing
+                
+        except Exception as e:
+            print(f"Error detecting sections: {e}")
+            return ["GENERAL"]
                 # Table continuation detected
                 print(f"Table continuation detected on page {page_num}")
                
@@ -659,23 +773,51 @@ Extract the table data rows:
         }
        
         for page_num, image_path in enumerate(image_paths, 1):
-            page_result = self.process_page(image_path, page_num)
-            results['processed_pages'].append(page_result)
-           
-            if page_result.get('table_id'):
-                table_id = page_result['table_id']
-                if table_id not in results['tables_found']:
-                    table_info = self.table_registry.get_table_context(table_id)
-                    results['tables_found'][table_id] = {
-                        'description': table_info['description'],
-                        'columns': table_info['original_columns'],
-                        'csv_path': table_info['csv_path'],
-                        'hospital_name': table_info.get('hospital_name', 'N/A'),
-                        'lob_type': table_info.get('lob_type', 'N/A'),
-                        'service_type': table_info.get('service_type', 'N/A'),
-                        'pages': []
-                    }
-                results['tables_found'][table_id]['pages'].append(page_num)
+            # First, detect if this page has multiple sections
+            sections = self.detect_multiple_sections(image_path)
+            
+            if len(sections) > 1:
+                # Process each section separately
+                print(f"Page {page_num} has multiple sections: {sections}")
+                for section in sections:
+                    page_result = self.process_page(image_path, page_num, section)
+                    # Add section info to the result
+                    page_result['section'] = section
+                    results['processed_pages'].append(page_result)
+                   
+                    if page_result.get('table_id'):
+                        table_id = page_result['table_id']
+                        if table_id not in results['tables_found']:
+                            table_info = self.table_registry.get_table_context(table_id)
+                            results['tables_found'][table_id] = {
+                                'description': table_info['description'],
+                                'columns': table_info['original_columns'],
+                                'csv_path': table_info['csv_path'],
+                                'hospital_name': table_info.get('hospital_name', 'N/A'),
+                                'lob_type': table_info.get('lob_type', 'N/A'),
+                                'service_type': table_info.get('service_type', 'N/A'),
+                                'pages': []
+                            }
+                        results['tables_found'][table_id]['pages'].append(f"{page_num}-{section}")
+            else:
+                # Single section, process normally
+                page_result = self.process_page(image_path, page_num)
+                results['processed_pages'].append(page_result)
+               
+                if page_result.get('table_id'):
+                    table_id = page_result['table_id']
+                    if table_id not in results['tables_found']:
+                        table_info = self.table_registry.get_table_context(table_id)
+                        results['tables_found'][table_id] = {
+                            'description': table_info['description'],
+                            'columns': table_info['original_columns'],
+                            'csv_path': table_info['csv_path'],
+                            'hospital_name': table_info.get('hospital_name', 'N/A'),
+                            'lob_type': table_info.get('lob_type', 'N/A'),
+                            'service_type': table_info.get('service_type', 'N/A'),
+                            'pages': []
+                        }
+                    results['tables_found'][table_id]['pages'].append(page_num)
        
         # Get final CSV files
         for table_info in self.table_registry.get_all_tables().values():
