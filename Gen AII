@@ -216,29 +216,75 @@ class TableRegistry:
                 for row_data in standardized_rows:
                     writer.writerow([row_data.get(col, 'N/A') for col in self.standard_columns])
                
+    def determine_place_of_service(self, row: Dict[str, str], table_info: Dict[str, Any]) -> str:
+        """
+        Determine place of service using multiple detection methods
+        """
+        # Method 1: Check table-level service type
+        service_type = table_info.get('service_type', '').upper()
+        if service_type == "INPATIENT":
+            return "IP"
+        elif service_type == "OUTPATIENT":
+            return "OP"
+        
+        # Method 2: Check table description for section headers
+        description = table_info.get('description', '').upper()
+        if "INPATIENT" in description:
+            return "IP"
+        elif "OUTPATIENT" in description:
+            return "OP"
+        
+        # Method 3: Check billing code type patterns
+        billing_code_type = row.get('billing_code_type', '').upper()
+        if billing_code_type in ['DRG', 'DRG CODES', 'MS-DRG']:
+            return "IP"  # DRG codes are typically inpatient
+        elif billing_code_type in ['REVENUE CODES', 'HCPC CODES', 'CPT4 CODES', 'HCPCS']:
+            # Revenue codes can be both, need to check the actual codes
+            billing_codes = row.get('billing_codes', '').upper()
+            # Common inpatient revenue code ranges
+            if any(code_range in billing_codes for code_range in ['100-219', '110-119', '120-129', '130-139']):
+                return "IP"
+            # Common outpatient revenue code ranges  
+            elif any(code_range in billing_codes for code_range in ['450-459', '760-769', '762']):
+                return "OP"
+        
+        # Method 4: Check service name patterns
+        service_name = row.get('service', '').upper()
+        
+        # Strong inpatient indicators
+        inpatient_keywords = [
+            'INPATIENT', 'DRG', 'ADMISSION', 'ACUTE CARE', 'MEDICAL/SURGICAL',
+            'SUBACUTE', 'PSYCHIATRIC', 'SUBSTANCE ABUSE', 'REHABILITATION',
+            'CESAREAN', 'VAGINAL DELIVERY', 'NEONATES', 'PREMATUR', 'NEWBORN'
+        ]
+        
+        # Strong outpatient indicators  
+        outpatient_keywords = [
+            'OUTPATIENT', 'AMBULATORY', 'EMERGENCY', 'OBSERVATION', 'CLINIC',
+            'CATHETERIZATION', 'CHEMOTHERAPY', 'DIALYSIS', 'LABORATORY',
+            'RADIOLOGY', 'IMAGING', 'PHYSICAL THERAPY', 'SLEEP STUDIES',
+            'MAMMOGRAPHY', 'CAT SCAN', 'MRI', 'PET SCAN'
+        ]
+        
+        if any(keyword in service_name for keyword in inpatient_keywords):
+            return "IP"
+        elif any(keyword in service_name for keyword in outpatient_keywords):
+            return "OP"
+        
+        # Method 5: Check for carve-out rates (usually outpatient)
+        if "CARVE OUT" in description or "CARVE-OUT" in description:
+            return "OP"
+        
+        # Default fallback
+        return "N/A"
+
     def convert_to_standard_format(self, data_rows: List[Dict[str, str]], table_info: Dict[str, Any]) -> List[Dict[str, str]]:
         """Convert raw table data to standard format"""
         standardized_rows = []
         
         for row in data_rows:
-            # Determine place of service more accurately
-            service_type = table_info.get('service_type', 'N/A')
-            description = table_info.get('description', '').upper()
-            
-            # Check multiple sources for place of service determination
-            if service_type == "INPATIENT" or "INPATIENT" in description:
-                place_of_service = "IP"
-            elif service_type == "OUTPATIENT" or "OUTPATIENT" in description:
-                place_of_service = "OP"
-            else:
-                # Fallback: check the service name itself
-                service_name = row.get('service', '').upper()
-                if any(keyword in service_name for keyword in ['INPATIENT', 'DRG', 'ADMISSION']):
-                    place_of_service = "IP"
-                elif any(keyword in service_name for keyword in ['OUTPATIENT', 'AMBULATORY', 'EMERGENCY', 'OBSERVATION']):
-                    place_of_service = "OP"
-                else:
-                    place_of_service = "N/A"
+            # Use the enhanced place of service determination
+            place_of_service = self.determine_place_of_service(row, table_info)
             
             row_data = {
                 'Hospital': table_info['hospital_name'],
@@ -364,7 +410,8 @@ ANALYSIS STEPS:
    - Service type: Look CAREFULLY for section headers - this is CRITICAL for place of service
      * If you see "INPATIENT RATES" or "INPATIENT CARVE OUT RATES" → service_type = "INPATIENT"
      * If you see "OUTPATIENT RATES" or "OUTPATIENT CARVE OUT RATES" → service_type = "OUTPATIENT"
-     * Look at the section the table is under, not just the document title
+     * Look at the section the table is under, examine the page headers and section titles
+     * Pay special attention to text like "INPATIENT RATES:" or "OUTPATIENT RATES:" above tables
 
 2. DETERMINE TABLE TYPE CAREFULLY - AVOID DUPLICATES:
    - NEW TABLE: Has clear column headers AND is the start of a new section
