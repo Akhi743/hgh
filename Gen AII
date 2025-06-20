@@ -1,17 +1,19 @@
-import fitz
+import fitz  # PyMuPDF
 import os
 import csv
 import json
 import uuid
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Union, Dict, Any
 from google.genai import types
 import google.genai as genai
 from langchain.prompts import PromptTemplate
 from langchain.output_parsers import PydanticOutputParser, OutputFixingParser
 from pydantic import BaseModel, Field
+import pandas as pd
 
 def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
+    """Convert each page of a PDF to individual images."""
     pdf_path = Path(pdf_path)
     
     if not pdf_path.exists():
@@ -45,35 +47,43 @@ def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
     doc.close()
     return image_paths
 
-class DocumentMetadata(BaseModel):
-    hospital_name: Optional[str] = Field(default=None, description="Specific hospital facility name (not system name)")
-    effective_date: Optional[str] = Field(default=None, description="Effective date from document")
-    lob_type: Optional[str] = Field(default=None, description="Commercial, Medicare, Medicaid, or ACOP Commercial")
-
 class TableSection(BaseModel):
+    """Model for individual table sections (IP/OP) within a page."""
     section_type: str = Field(description="INPATIENT or OUTPATIENT")
-    subsection: Optional[str] = Field(default=None, description="RATES or CARVE OUT RATES")
-    has_table: bool = Field(description="Whether this section has table data")
-    data: Optional[List[Dict[str, str]]] = Field(default=None, description="Extracted table rows")
+    carve_out: bool = Field(default=False, description="Whether this is a carve out section")
+    has_table: bool = Field(description="Whether this section contains table data")
+    data: Optional[List[Dict[str, str]]] = Field(default=None, description="Table rows")
 
 class PageAnalysis(BaseModel):
-    document_metadata: DocumentMetadata = Field(description="Document-level information")
-    sections: List[TableSection] = Field(description="All sections found on the page")
-    is_continuation: bool = Field(default=False, description="Whether page continues previous table")
+    """Enhanced model for complete page analysis."""
+    hospital_name: Optional[str] = Field(default=None, description="Specific hospital facility name")
+    effective_date: Optional[str] = Field(default=None, description="Document effective date")
+    lob_type: Optional[str] = Field(default=None, description="Line of Business type")
+    
+    # Multiple sections per page
+    sections: List[TableSection] = Field(default=[], description="All table sections found on page")
+    
+    # Page-level metadata
+    has_multiple_sections: bool = Field(default=False, description="Whether page has both IP and OP")
+    is_continuation: bool = Field(default=False, description="Whether page continues previous tables")
 
-class HospitalRateRegistry:
+class DocumentRegistry:
+    """Enhanced registry to handle multiple table types per document."""
+    
     def __init__(self, output_dir: Path):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Document-level metadata
-        self.document_hospital_name = None
-        self.document_lob_type = None
-        self.document_effective_date = None
+        # Separate tracking for each table type
+        self.inpatient_tables = {}
+        self.outpatient_tables = {}
+        self.inpatient_carve_tables = {}
+        self.outpatient_carve_tables = {}
         
-        # Track active tables by section type
-        self.active_tables = {}
-        self.csv_counter = 1
+        # Document-level context
+        self.document_hospital_name = None
+        self.document_effective_date = None
+        self.document_lob = None
         
         # Standard columns
         self.standard_columns = [
@@ -82,56 +92,86 @@ class HospitalRateRegistry:
             'Additional Information', 'Effective Date'
         ]
     
-    def update_document_metadata(self, metadata: DocumentMetadata):
-        """Update document-level metadata with first valid values found"""
-        if metadata.hospital_name and not self.document_hospital_name:
-            # Filter out system names, keep specific hospital names
-            if not any(sys_name in metadata.hospital_name.lower() for sys_name in ['health system', 'health and hospital', 'memorial health system']):
-                self.document_hospital_name = metadata.hospital_name
+    def update_document_context(self, hospital_name: str = None, effective_date: str = None, lob_type: str = None):
+        """Update document-level context information."""
+        if hospital_name and hospital_name != "N/A":
+            # Prioritize specific hospital names over system names
+            if (not self.document_hospital_name or 
+                self.document_hospital_name == "N/A" or
+                ("Hospital" in hospital_name and "Health" not in hospital_name)):
+                self.document_hospital_name = hospital_name
         
-        if metadata.lob_type and not self.document_lob_type:
-            self.document_lob_type = metadata.lob_type
+        if effective_date and effective_date != "N/A":
+            self.document_effective_date = effective_date
             
-        if metadata.effective_date and not self.document_effective_date:
-            self.document_effective_date = metadata.effective_date
+        if lob_type and lob_type != "N/A":
+            self.document_lob = lob_type
     
-    def get_or_create_table(self, section_type: str, subsection: str = "RATES") -> str:
-        """Get existing table path or create new one for section type"""
-        table_key = f"{section_type}_{subsection}"
+    def get_table_registry(self, service_type: str, is_carve_out: bool = False):
+        """Get the appropriate table registry based on service type."""
+        if service_type == "INPATIENT":
+            return self.inpatient_carve_tables if is_carve_out else self.inpatient_tables
+        else:
+            return self.outpatient_carve_tables if is_carve_out else self.outpatient_tables
+    
+    def register_or_update_table(self, section: TableSection, page_num: int) -> str:
+        """Register new table or add to existing table."""
+        registry = self.get_table_registry(section.section_type, section.carve_out)
         
-        if table_key not in self.active_tables:
-            # Create new CSV file
-            csv_filename = f"table_{self.csv_counter}_{section_type.lower()}_{subsection.lower().replace(' ', '_')}.csv"
+        # Create table key
+        table_key = f"{section.section_type}{'_CARVE' if section.carve_out else ''}"
+        
+        if table_key not in registry:
+            # Create new table
+            table_id = str(uuid.uuid4())[:8]
+            csv_filename = f"{table_key.lower()}_{table_id}.csv"
             csv_path = self.output_dir / csv_filename
+            
+            registry[table_key] = {
+                'table_id': table_id,
+                'csv_path': str(csv_path),
+                'start_page': page_num,
+                'last_page': page_num,
+                'row_count': 0
+            }
             
             # Create CSV with headers
             with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerow(self.standard_columns)
             
-            self.active_tables[table_key] = {
-                'csv_path': str(csv_path),
-                'section_type': section_type,
-                'subsection': subsection
-            }
-            self.csv_counter += 1
-            
-            print(f"Created new table: {csv_filename}")
+            print(f"Created new {table_key} table: {csv_filename}")
         
-        return self.active_tables[table_key]['csv_path']
+        # Add data to table
+        if section.data:
+            self._add_data_to_table(registry[table_key], section, page_num)
+        
+        return registry[table_key]['csv_path']
     
-    def add_data_to_table(self, section_type: str, subsection: str, data_rows: List[Dict[str, str]]):
-        """Add data to the appropriate table"""
-        csv_path = self.get_or_create_table(section_type, subsection)
+    def _add_data_to_table(self, table_info: Dict, section: TableSection, page_num: int):
+        """Add data rows to table."""
+        csv_path = table_info['csv_path']
+        standardized_rows = self._convert_to_standard_format(section)
         
-        # Convert to standard format
+        with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            for row_data in standardized_rows:
+                writer.writerow([row_data.get(col, 'N/A') for col in self.standard_columns])
+        
+        table_info['last_page'] = page_num
+        table_info['row_count'] += len(standardized_rows)
+        print(f"Added {len(standardized_rows)} rows to {section.section_type} table")
+    
+    def _convert_to_standard_format(self, section: TableSection) -> List[Dict[str, str]]:
+        """Convert section data to standard CSV format."""
         standardized_rows = []
-        for row in data_rows:
-            place_of_service = "IP" if section_type == "INPATIENT" else "OP"
+        
+        for row in section.data or []:
+            place_of_service = "IP" if section.section_type == "INPATIENT" else "OP"
             
             row_data = {
-                'Hospital': self.document_hospital_name or "Unknown",
-                'LOB': self.document_lob_type or "Unknown", 
+                'Hospital': self.document_hospital_name or "N/A",
+                'LOB': self.document_lob or "N/A",
                 'Place of Service': place_of_service,
                 'Service Category': row.get('service', 'N/A'),
                 'Billing Code Type': row.get('billing_code_type', 'N/A'),
@@ -139,26 +179,46 @@ class HospitalRateRegistry:
                 'Rate': row.get('rate_amount', 'N/A'),
                 'Negotiated Type': row.get('negotiated_type', 'N/A'),
                 'Additional Information': row.get('additional_info', 'N/A'),
-                'Effective Date': self.document_effective_date or "Unknown"
+                'Effective Date': self.document_effective_date or "N/A"
             }
             standardized_rows.append(row_data)
         
-        # Append to CSV
-        with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            for row_data in standardized_rows:
-                writer.writerow([row_data.get(col, 'N/A') for col in self.standard_columns])
+        return standardized_rows
+    
+    def get_summary(self) -> Dict[str, Any]:
+        """Get extraction summary."""
+        all_registries = [
+            self.inpatient_tables, self.outpatient_tables,
+            self.inpatient_carve_tables, self.outpatient_carve_tables
+        ]
         
-        print(f"Added {len(data_rows)} rows to {section_type} {subsection}")
+        csv_files = []
+        total_rows = 0
+        
+        for registry in all_registries:
+            for table_info in registry.values():
+                csv_files.append(table_info['csv_path'])
+                total_rows += table_info['row_count']
+        
+        return {
+            'hospital_name': self.document_hospital_name,
+            'effective_date': self.document_effective_date,
+            'lob_type': self.document_lob,
+            'csv_files': csv_files,
+            'total_tables': len(csv_files),
+            'total_rows': total_rows
+        }
 
-class HospitalRateExtractor:
+class MultiPageTableExtractor:
+    """Main extractor class with improved section handling."""
+    
     def __init__(self, client, output_dir: str = None):
         self.client = client
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
-        self.registry = HospitalRateRegistry(self.output_dir)
+        self.registry = DocumentRegistry(self.output_dir)
     
-    def create_analysis_prompt(self) -> tuple:
-        """Create comprehensive page analysis prompt"""
+    def create_page_analysis_prompt(self) -> tuple:
+        """Create enhanced prompt for complete page analysis."""
         base_parser = PydanticOutputParser(pydantic_object=PageAnalysis)
         
         class GeminiLLM:
@@ -179,46 +239,60 @@ class HospitalRateExtractor:
         parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
         
         template = """
-You are analyzing a hospital rate schedule page. Extract ALL information systematically.
+You are analyzing a hospital rate schedule page that may contain multiple table sections.
 
-STEP 1 - DOCUMENT METADATA:
-Extract these from headers/titles (look at top of page):
-- hospital_name: SPECIFIC hospital facility name (e.g., "Mercy Springfield and Urbana Hospitals", "Advocate Condell Medical Center", "Sistersville General Hospital")
-  * AVOID generic system names like "Mercy Health", "Memorial Health System"
-  * Look for actual facility names in document headers
-- effective_date: Look for "Effective Date:" followed by date
-- lob_type: Determine from headers/titles:
-  * "COMMERCIAL" → "Commercial"
-  * "MEDICARE" → "Medicare" 
-  * "MEDICAID" → "Medicaid"
-  * "ACOP COMMERCIAL" → "ACOP Commercial"
-  * No mention → null
+DOCUMENT METADATA EXTRACTION:
+1. Hospital Name: Extract SPECIFIC facility names, not system names
+   - Look for: "Mercy Springfield and Urbana Hospitals", "Advocate Condell Medical Center", "Sistersville General Hospital"
+   - AVOID: Generic system names like "Mercy Health", "Advocate Health", "Memorial Health System"
 
-STEP 2 - SECTION ANALYSIS:
-Identify ALL sections on the page. Look for these patterns:
-- "INPATIENT RATES:" → section_type="INPATIENT", subsection="RATES"
-- "INPATIENT CARVE OUT RATES:" → section_type="INPATIENT", subsection="CARVE OUT RATES"  
-- "OUTPATIENT RATES:" → section_type="OUTPATIENT", subsection="RATES"
-- "OUTPATIENT CARVE OUT RATES:" → section_type="OUTPATIENT", subsection="CARVE OUT RATES"
+2. Effective Date: Look for "Effective Date:" followed by date
 
-STEP 3 - TABLE EXTRACTION:
-For each section with table data, extract rows with this structure:
-- service: Service description (e.g., "DRG", "Inpatient Psychiatric", "Ambulatory Surgery")
-- billing_code_type: Type of codes (e.g., "DRG Codes", "Revenue Codes", "HCPC Codes")
-- billing_codes: Actual code values (e.g., "880-887", "190-192, 199", "S9982")
-- rate_amount: Just the money/percentage (e.g., "$1,800.00", "33%", "$16,316.00")
-- negotiated_type: Rate structure (e.g., "Per Diem", "Case Rate", "Base Rate", "Percentage")
-- additional_info: Extra conditions/notes (e.g., "Applied based upon Medicare Weights", "Paid In Addition to Other Negotiated Rates")
-  * Use "N/A" if no additional info
+3. Line of Business (LOB): 
+   - "COMMERCIAL" → "Commercial"
+   - "MEDICARE" → "Medicare" 
+   - "MEDICAID" → "Medicaid"
+   - "ACOP COMMERCIAL" → "ACOP Commercial"
 
-IMPORTANT RATE PARSING EXAMPLES:
+SECTION IDENTIFICATION:
+Look for multiple table sections on the same page:
+
+1. INPATIENT RATES section:
+   - Header contains "INPATIENT RATES"
+   - May have subsection "INPATIENT CARVE OUT RATES"
+
+2. OUTPATIENT RATES section:
+   - Header contains "OUTPATIENT RATES" 
+   - May have subsection "OUTPATIENT CARVE OUT RATES"
+
+For EACH section found, extract:
+- section_type: "INPATIENT" or "OUTPATIENT"
+- carve_out: true if "CARVE OUT" is mentioned
+- has_table: true if table data is present
+- data: Array of table rows with structure:
+  {{
+    "service": "Service name/description",
+    "billing_code_type": "DRG/Revenue Codes/HCPC Codes/CPT4 Codes",
+    "billing_codes": "Actual codes or ranges",
+    "rate_amount": "Dollar amount or percentage only",
+    "negotiated_type": "Per Diem/Case Rate/Percentage/Base Rate",
+    "additional_info": "Special conditions or N/A"
+  }}
+
+RATE PARSING EXAMPLES:
 - "$1,800.00 Per Diem" → rate_amount="$1,800.00", negotiated_type="Per Diem", additional_info="N/A"
-- "$9,600.00 Base Rate - Applied based upon Medicare Weights" → rate_amount="$9,600.00", negotiated_type="Base Rate", additional_info="Applied based upon Medicare Weights"
-- "85.1% of Billed Charges Rate Applies to Entire Bill" → rate_amount="85.1%", negotiated_type="Percentage", additional_info="Rate Applies to Entire Bill"
+- "33% of Billed Charges" → rate_amount="33%", negotiated_type="Percentage", additional_info="N/A"
+- "$750.00 Per Diem Paid In Addition to Other Negotiated Rates" → 
+  rate_amount="$750.00", negotiated_type="Per Diem", additional_info="Paid In Addition to Other Negotiated Rates"
+
+IMPORTANT:
+- Process ALL table sections on the page
+- Set has_multiple_sections=true if both IP and OP sections exist
+- Set is_continuation=true if page appears to continue previous tables (no headers, just data)
 
 {format_instructions}
 
-Analyze this page completely:
+Analyze this page for all hospital rate table sections:
 """
         
         prompt = PromptTemplate(
@@ -230,7 +304,7 @@ Analyze this page completely:
         return prompt, parser
     
     def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
-        """Process a single page comprehensively"""
+        """Process a single page with enhanced section detection."""
         print(f"Processing page {page_num}: {Path(image_path).name}")
         
         try:
@@ -239,8 +313,8 @@ Analyze this page completely:
             
             mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
             
-            # Analyze the page
-            prompt, parser = self.create_analysis_prompt()
+            # Analyze complete page
+            prompt, parser = self.create_page_analysis_prompt()
             prompt_text = prompt.format()
             
             response = self.client.models.generate_content(
@@ -251,34 +325,40 @@ Analyze this page completely:
                 ]
             )
             
-            parsed_response = parser.parse(response.text.strip())
+            analysis = parser.parse(response.text.strip())
             
-            # Update document metadata
-            self.registry.update_document_metadata(parsed_response.document_metadata)
+            # Update document context
+            self.registry.update_document_context(
+                analysis.hospital_name,
+                analysis.effective_date,
+                analysis.lob_type
+            )
             
             # Process each section
-            total_rows_added = 0
-            sections_processed = []
+            csv_paths = []
+            total_rows = 0
             
-            for section in parsed_response.sections:
+            for section in analysis.sections:
                 if section.has_table and section.data:
-                    self.registry.add_data_to_table(
-                        section.section_type, 
-                        section.subsection or "RATES",
-                        section.data
-                    )
-                    total_rows_added += len(section.data)
-                    sections_processed.append(f"{section.section_type} {section.subsection or 'RATES'}")
+                    csv_path = self.registry.register_or_update_table(section, page_num)
+                    csv_paths.append(csv_path)
+                    total_rows += len(section.data)
             
-            return {
+            result = {
                 'page_num': page_num,
-                'sections_found': len(parsed_response.sections),
-                'sections_processed': sections_processed,
-                'total_rows_added': total_rows_added,
-                'hospital_name': parsed_response.document_metadata.hospital_name,
-                'lob_type': parsed_response.document_metadata.lob_type,
-                'effective_date': parsed_response.document_metadata.effective_date
+                'hospital_name': analysis.hospital_name,
+                'sections_found': len(analysis.sections),
+                'has_multiple_sections': analysis.has_multiple_sections,
+                'csv_paths': csv_paths,
+                'total_rows_added': total_rows
             }
+            
+            if analysis.has_multiple_sections:
+                print(f"Page {page_num}: Found multiple sections (IP/OP)")
+            
+            print(f"Page {page_num}: Added {total_rows} total rows across {len(csv_paths)} tables")
+            
+            return result
             
         except Exception as e:
             print(f"Error processing page {page_num}: {e}")
@@ -290,8 +370,8 @@ Analyze this page completely:
             }
     
     def extract_tables_from_pdf(self, pdf_path: str, dpi: int = 150, image_format: str = 'png') -> Dict[str, Any]:
-        """Extract all tables from PDF"""
-        print(f"Starting extraction for: {pdf_path}")
+        """Extract all tables from PDF with enhanced multi-section support."""
+        print(f"Starting enhanced table extraction for: {pdf_path}")
         
         # Convert PDF to images
         image_paths = pdf_to_images(pdf_path, self.output_dir, dpi, image_format)
@@ -301,51 +381,39 @@ Analyze this page completely:
             'pdf_path': pdf_path,
             'total_pages': len(image_paths),
             'processed_pages': [],
-            'csv_files': []
+            'extraction_summary': {}
         }
         
         for page_num, image_path in enumerate(image_paths, 1):
             page_result = self.process_page(image_path, page_num)
             results['processed_pages'].append(page_result)
         
-        # Get final CSV files
-        for table_info in self.registry.active_tables.values():
-            results['csv_files'].append(table_info['csv_path'])
+        # Get final summary
+        results['extraction_summary'] = self.registry.get_summary()
         
-        # Summary
-        total_rows = sum(p.get('total_rows_added', 0) for p in results['processed_pages'])
-        pages_with_data = len([p for p in results['processed_pages'] if p.get('total_rows_added', 0) > 0])
-        
+        # Print summary
+        summary = results['extraction_summary']
         print(f"\n=== EXTRACTION SUMMARY ===")
+        print(f"Hospital: {summary['hospital_name']}")
+        print(f"Effective Date: {summary['effective_date']}")
+        print(f"LOB: {summary['lob_type']}")
         print(f"Total pages processed: {results['total_pages']}")
-        print(f"Pages with data: {pages_with_data}")
-        print(f"Total rows extracted: {total_rows}")
-        print(f"CSV files created: {len(results['csv_files'])}")
-        print(f"Hospital: {self.registry.document_hospital_name}")
-        print(f"LOB: {self.registry.document_lob_type}")
-        print(f"Effective Date: {self.registry.document_effective_date}")
+        print(f"Tables created: {summary['total_tables']}")
+        print(f"Total rows extracted: {summary['total_rows']}")
         
-        if results['csv_files']:
+        if summary['csv_files']:
             print(f"\nCSV Files Created:")
-            for csv_file in results['csv_files']:
-                print(f"  - {csv_file}")
+            for csv_file in summary['csv_files']:
+                print(f"  - {Path(csv_file).name}")
         
         return results
 
-# Usage
+# Usage example
 if __name__ == "__main__":
-    # Use your existing working path
-    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"
+    pdf_file = r"path_to_your_pdf.pdf"
     
-    # Initialize client with your existing settings
     from google import genai
-    client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+    client = genai.Client(vertexai=True, project="your-project", location="us-central1")
     
-    # Try with current directory first
-    try:
-        extractor = HospitalRateExtractor(client, output_dir="./extracted_tables")
-        results = extractor.extract_tables_from_pdf(pdf_file, dpi=300)
-        print("Extraction complete!")
-    except PermissionError as e:
-        print(f"Permission error: {e}")
-        print("Try running as administrator or change output directory")
+    extractor = MultiPageTableExtractor(client, output_dir="extracted_tables")
+    results = extractor.extract_tables_from_pdf(pdf_file, dpi=300)
