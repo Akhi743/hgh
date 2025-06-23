@@ -59,11 +59,18 @@ class ServiceSection(BaseModel):
     place_of_service: str = Field(description="INPATIENT, OUTPATIENT, INPATIENT CARVE OUT, OUTPATIENT CARVE OUT")
     service_rows: List[Dict[str, str]] = Field(description="List of service rows with service, billing_codes, rates exactly as they appear in table")
 
+class ContinuationData(BaseModel):
+    """Data for handling table continuations across pages."""
+    is_continuation_page: bool = Field(description="Whether this page continues tables from previous page")
+    continued_sections: List[Dict[str, str]] = Field(description="Data that continues from previous page with section_name, continued_content")
+    new_rows: List[Dict[str, str]] = Field(description="New complete rows that start on this page")
+
 class PageExtraction(BaseModel):
     """Complete page extraction including metadata and all sections."""
     has_new_document_section: bool = Field(description="Whether page starts new hospital/LOB section")
     metadata: Optional[DocumentMetadata] = Field(default=None, description="Document metadata if new section")
     service_sections: List[ServiceSection] = Field(description="All Place of Service sections found on this page")
+    continuation_data: Optional[ContinuationData] = Field(default=None, description="Continuation handling for multi-page tables")
     is_continuation: bool = Field(default=False, description="Whether this continues tables from previous page")
 
 class DocumentContext:
@@ -72,6 +79,7 @@ class DocumentContext:
         self.current_effective_date = None
         self.current_hospital_names = []
         self.current_lob = None
+        self.pending_continuations = {}  # Track incomplete rows from previous page
         
     def update_context(self, metadata: DocumentMetadata):
         """Update context with new metadata."""
@@ -82,6 +90,14 @@ class DocumentContext:
                 self.current_hospital_names = metadata.hospital_names
             if metadata.lob_type:
                 self.current_lob = metadata.lob_type
+    
+    def add_pending_continuation(self, section_name: str, partial_row: Dict[str, str]):
+        """Add a partial row that continues to next page."""
+        self.pending_continuations[section_name] = partial_row
+    
+    def get_pending_continuation(self, section_name: str) -> Optional[Dict[str, str]]:
+        """Get and remove pending continuation for a section."""
+        return self.pending_continuations.pop(section_name, None)
 
 class HospitalRateExtractor:
     """Main extractor class with improved multi-section detection."""
@@ -128,64 +144,58 @@ class HospitalRateExtractor:
         template = """
 You are an expert at extracting ALL structured data from hospital rate schedule documents.
 
-CRITICAL EXTRACTION REQUIREMENTS:
-1. EXTRACT EVERY SINGLE ROW from every table - NO EXCEPTIONS
-2. Count the rows in each table and ensure you extract that exact number
-3. If you see 10 rows, extract all 10. If you see 15 rows, extract all 15.
+CRITICAL: Handle multi-page table continuations correctly!
 
-STEP 1 - DETECT NEW DOCUMENT SECTION:
-Look for NEW MAIN DOCUMENT HEADER (large centered text) with hospital names like:
-- "Sistersville General Hospital"
-- "Marietta Memorial TIN 314379509 and Selby General Hospital TIN 314413259"
-- "Advocate Condell Medical Center and Advocate Sherman Hospital"
+STEP 1 - DETECT PAGE TYPE:
+Determine if this is:
+A) NEW document section with main header (e.g., "Sistersville General Hospital")
+B) CONTINUATION page where table data continues from previous page
+C) MIXED page with both continuation and new sections
 
-CRITICAL: NEVER extract random text like "MHS REFERENCE LAB" or system names from corners!
-ONLY extract hospital names from the MAIN CENTERED DOCUMENT TITLE.
+STEP 2 - DETECT CONTINUATION PATTERNS:
+Look for these continuation indicators:
+- Billing codes that start mid-list (e.g., starting with "A9536, A9537..." instead of "HCPC Codes: A4641...")
+- Table rows without service names (empty left column, only billing codes)
+- Partial table structures that seem to continue from above
 
-STEP 2 - EXTRACT METADATA (only if NEW MAIN HEADER detected):
-- Hospital Names: ONLY from main document title (e.g., "Sistersville General Hospital")
+STEP 3 - EXTRACT METADATA (only if NEW MAIN HEADER detected):
+- Hospital Names: ONLY from main document title (e.g., "Sistersville General Hospital") 
+- NEVER extract random text like "MHS REFERENCE LAB"
 - Effective Date: Date ranges in header (e.g., "6/1/2025 through 5/31/2026")
 - LOB Type: Business line from header (COMMERCIAL, MEDICARE, etc.)
 
-STEP 3 - IDENTIFY ALL PLACE OF SERVICE SECTIONS:
-Find ALL section headers:
-- "INPATIENT RATES:" → "INPATIENT"
-- "OUTPATIENT RATES:" → "OUTPATIENT"  
-- "INPATIENT CARVE OUT RATES:" → "INPATIENT CARVE OUT"
-- "OUTPATIENT CARVE OUT RATES:" → "OUTPATIENT CARVE OUT"
+STEP 4 - HANDLE CONTINUATION DATA:
+If you see continuation patterns:
+1. Identify which service the continuation belongs to
+2. Extract the continued billing codes or other data
+3. Mark it as continuation data with the service name
 
-STEP 4 - EXTRACT EVERY SINGLE TABLE ROW:
+EXAMPLE CONTINUATION:
+If you see codes "A9536, A9537, A9538, A9539, A9540..." at the top of a page without a service name, this is likely continuation of "Imaging Enhancing Substance" from the previous page.
 
-MANDATORY PROCESS FOR EACH TABLE:
-1. Count the total rows in the table visually
-2. Extract row-by-row, going through each one systematically
-3. For each row extract:
-   - service: Exact text from Service column
-   - billing_codes: Complete text from Billing Codes column
-   - rates: Complete text from Rates column
+STEP 5 - EXTRACT COMPLETE NEW ROWS:
+For each complete new table row (that has service name + billing codes + rates):
+- service: Exact text from Service column
+- billing_codes: Complete text from Billing Codes column
+- rates: Complete text from Rates column
 
-EXAMPLE - If you see this OUTPATIENT table:
-Row 1: Ambulatory Surgery: Default Rate | All surgical procedures not otherwise identified | 85.1% of Billed Charges Rate Applies to Entire Bill
-Row 2: Cardiac Catheterization Procedures | HCPC Code: C7521-C7529... | 85.1% of Billed Charges Rate Applies to Entire Bill
-Row 3: Cardiac Catheterization Injections | CPT4 Codes: 93563-93568 | 85.1% of Billed Charges Rate Applies to Entire Bill
-Row 4: Cardiac Studies | CPT4 Codes: 0541T, 0542T... | 85.1% of Billed Charges
-Row 5: Vascular Diagnostic Studies | CPT4 Codes: 93880-93998 | 85.1% of Billed Charges
-Row 6: Emergency Care | Revenue Codes: 450, 451, 452, 459 | 85.1% of Billed Charges Rate Applies to Entire Bill
-Row 7: Observation Services | Revenue Codes: 762 | 85.1% of Billed Charges
+STEP 6 - STRUCTURE THE OUTPUT:
+Return:
+- continuation_data: Any billing codes or data that continues from previous page
+- service_sections: Complete new rows that start and end on this page
 
-YOU MUST EXTRACT ALL 7 ROWS - NOT 2 OR 3!
+CRITICAL RULES:
+1. If you see billing codes without a service name, it's likely a continuation
+2. Don't lose any billing codes - capture both continuation codes AND new complete rows
+3. Identify which service the continuation codes belong to (usually the last service from previous page)
 
-VERIFICATION CHECKLIST:
-- Did I count all visible rows?
-- Did I extract every service name I can see?
-- Did I get all the billing codes for each service?
-- Did I capture all rate information?
-
-CRITICAL: If a table has 15 visible rows, your extraction MUST have 15 rows. NO SHORTCUTS!
+EXAMPLE - Page with continuation:
+Continuation codes: "A9536, A9537, A9538...Q9983" (for Imaging Enhancing Substance)
+New complete row: "Physical, Occupational and Speech Therapy | CPT4 Codes: 07911, 92507-92508... | 85.1% of Billed Charges"
 
 {format_instructions}
 
-Now extract EVERY row from EVERY table on this page:
+Extract all data including continuations from this page:
 """
         
         prompt = PromptTemplate(
@@ -254,29 +264,56 @@ Now extract EVERY row from EVERY table on this page:
                     if parsed_data.metadata.effective_date:
                         self.context.current_effective_date = parsed_data.metadata.effective_date
             
-            # Process ALL service sections with detailed logging
-            total_rows_added = 0
-            sections_processed = []
+            # Process continuation data first
+            if parsed_data.continuation_data and parsed_data.continuation_data.continued_sections:
+                for continuation in parsed_data.continuation_data.continued_sections:
+                    section_name = continuation.get('section_name', 'UNKNOWN')
+                    continued_content = continuation.get('continued_content', '')
+                    
+                    print(f"  Found continuation for '{section_name}': {continued_content[:100]}...")
+                    
+                    # Try to merge with pending continuation from previous page
+                    pending = self.context.get_pending_continuation(section_name)
+                    if pending:
+                        # Merge the billing codes
+                        existing_codes = pending.get('billing_codes', '')
+                        merged_codes = f"{existing_codes} {continued_content}".strip()
+                        
+                        # Create complete row with merged data
+                        complete_row = {
+                            'service': pending.get('service', ''),
+                            'billing_codes': merged_codes,
+                            'rates': pending.get('rates', '')
+                        }
+                        
+                        # Save the complete row
+                        self.save_single_row(complete_row, section_name)
+                        total_rows_added += 1
+                        print(f"  Merged continuation: {complete_row['service']} with {len(merged_codes)} chars of billing codes")
             
+            # Process ALL service sections with detailed logging
             if not parsed_data.service_sections:
-                print(f"  CRITICAL ERROR: No service sections found on page {page_num}")
-                print(f"  This indicates the AI failed to extract the table data!")
-            else:
                 print(f"  Found {len(parsed_data.service_sections)} service sections")
             
             for i, section in enumerate(parsed_data.service_sections):
                 print(f"  Processing section {i+1}: {section.place_of_service}")
                 
                 if not section.service_rows:
-                    print(f"    CRITICAL ERROR: Section has 0 rows - this is likely wrong!")
+                    print(f"    Section has 0 rows")
                 else:
                     print(f"    Found {len(section.service_rows)} rows")
                 
-                # Log ALL rows for verification
+                # Check for incomplete rows that might continue to next page
                 for j, row in enumerate(section.service_rows):
                     service_text = row.get('service', 'MISSING')
                     billing_text = row.get('billing_codes', 'MISSING')
                     rates_text = row.get('rates', 'MISSING')
+                    
+                    # Check if this row seems incomplete (very long billing codes that might continue)
+                    if len(billing_text) > 200 and billing_text.endswith(','):
+                        print(f"    Row {j+1} might continue to next page (ends with comma)")
+                        # Store as pending continuation
+                        self.context.add_pending_continuation(section.place_of_service, row)
                     
                     print(f"    Row {j+1}:")
                     print(f"      Service: '{service_text}'")
@@ -312,6 +349,23 @@ Now extract EVERY row from EVERY table on this page:
                 'total_rows_added': 0,
                 'sections_found': []
             }
+    
+    def save_single_row(self, row_data: Dict[str, str], place_of_service: str) -> None:
+        """Save a single completed row to CSV."""
+        csv_row = [
+            '; '.join(self.context.current_hospital_names) if self.context.current_hospital_names else 'N/A',
+            self.context.current_lob or 'N/A',
+            place_of_service,
+            row_data.get('service', 'N/A'),
+            row_data.get('billing_codes', 'N/A'),
+            row_data.get('rates', 'N/A'),
+            self.context.current_effective_date or 'N/A'
+        ]
+        
+        # Append to main CSV
+        with open(self.csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(csv_row)
     
     def save_section_data(self, section: ServiceSection) -> int:
         """Save extracted section data to CSV exactly as extracted."""
