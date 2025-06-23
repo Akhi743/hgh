@@ -133,14 +133,19 @@ CRITICAL: You must extract ALL Place of Service sections on this page, not just 
 
 STEP 1 - DETECT NEW DOCUMENT SECTION:
 Check if this page starts a NEW hospital/LOB combination by looking for:
-- New hospital names in main title (e.g., "Marietta Memorial TIN 314379509 and Selby General Hospital TIN 314413259")
-- New LOB type (COMMERCIAL, MEDICARE, MEDICAID, etc.)
-- New effective date
+- NEW MAIN HEADER with hospital names (large title in center, NOT the system name in top corner)
+- Example: "Marietta Memorial TIN 314379509 and Selby General Hospital TIN 314413259"
+- Example: "Sistersville General Hospital"  
+- NEW LOB type in the main header area (COMMERCIAL, MEDICARE, MEDICAID, etc.)
 
-STEP 2 - EXTRACT METADATA (only if new section):
-- Effective Date: Look for date ranges (e.g., "6/1/2025 through 5/31/2026")
-- Hospital Names: Extract ACTUAL hospital facility names (e.g., "Marietta Memorial", "Selby General Hospital")
-- LOB Type: Extract from title (e.g., "COMMERCIAL" → "Commercial")
+IMPORTANT: IGNORE system names in top corners like "Memorial Health System" - these are NOT hospital names!
+
+STEP 2 - EXTRACT METADATA (only if NEW MAIN HEADER detected):
+- Effective Date: Look for date ranges in header area (e.g., "6/1/2025 through 5/31/2026")
+- Hospital Names: Extract ONLY from MAIN HEADER/TITLE area, NOT from top corner
+  * Examples: "Marietta Memorial", "Selby General Hospital", "Sistersville General Hospital"
+  * NEVER use system names like "Memorial Health System", "Mercy Health", etc.
+- LOB Type: Extract from main header area (e.g., "COMMERCIAL" → "Commercial")
 
 STEP 3 - IDENTIFY ALL PLACE OF SERVICE SECTIONS:
 Look for ALL section headers on this page:
@@ -209,10 +214,31 @@ Extract ALL sections and tables from this hospital rate schedule page:
             
             parsed_data = parser.parse(response.text.strip())
             
-            # Update context if new document section
+            # Update context ONLY if new document section with valid hospital names
             if parsed_data.has_new_document_section and parsed_data.metadata:
-                self.context.update_context(parsed_data.metadata)
-                print(f"New section detected - Hospitals: {self.context.current_hospital_names}, LOB: {self.context.current_lob}")
+                # Validate hospital names - reject system names
+                if parsed_data.metadata.hospital_names:
+                    valid_hospitals = []
+                    for hospital in parsed_data.metadata.hospital_names:
+                        # Filter out system names
+                        if not any(system_word in hospital.lower() for system_word in 
+                                 ['health system', 'health', 'memorial health system', 'mercy health']):
+                            valid_hospitals.append(hospital)
+                    
+                    if valid_hospitals:
+                        # Only update if we have valid hospital names
+                        old_metadata = parsed_data.metadata
+                        old_metadata.hospital_names = valid_hospitals
+                        self.context.update_context(old_metadata)
+                        print(f"New section detected - Hospitals: {self.context.current_hospital_names}, LOB: {self.context.current_lob}")
+                    else:
+                        print(f"Ignoring system name extraction, keeping current context: {self.context.current_hospital_names}")
+                else:
+                    # Update other metadata but keep existing hospital names
+                    if parsed_data.metadata.lob_type:
+                        self.context.current_lob = parsed_data.metadata.lob_type
+                    if parsed_data.metadata.effective_date:
+                        self.context.current_effective_date = parsed_data.metadata.effective_date
             
             # Process ALL service sections
             total_rows_added = 0
