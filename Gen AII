@@ -50,31 +50,21 @@ def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
 
 class DocumentMetadata(BaseModel):
     """Document-level metadata extraction."""
-    effective_date: Optional[str] = Field(default=None, description="Effective date found in top corner")
+    effective_date: Optional[str] = Field(default=None, description="Effective date found in document")
     hospital_names: Optional[List[str]] = Field(default=None, description="List of hospital names from main title")
     lob_type: Optional[str] = Field(default=None, description="Line of Business type")
 
-class PageStructure(BaseModel):
-    """Page structure detection and metadata."""
-    has_new_section: bool = Field(description="Whether page contains a new hospital/LOB section")
+class ServiceSection(BaseModel):
+    """Individual Place of Service section with its table data."""
+    place_of_service: str = Field(description="INPATIENT, OUTPATIENT, INPATIENT CARVE OUT, OUTPATIENT CARVE OUT")
+    service_rows: List[Dict[str, str]] = Field(description="List of service rows with service, billing_code_type, billing_codes, rate_amount, negotiated_type, additional_info")
+
+class PageExtraction(BaseModel):
+    """Complete page extraction including metadata and all sections."""
+    has_new_document_section: bool = Field(description="Whether page starts new hospital/LOB section")
     metadata: Optional[DocumentMetadata] = Field(default=None, description="Document metadata if new section")
-    place_of_service: Optional[str] = Field(default=None, description="INPATIENT, OUTPATIENT, etc.")
-    has_table: bool = Field(description="Whether page contains tabular data")
-    is_continuation: bool = Field(default=False, description="Whether this continues previous table")
-
-class TableRowData(BaseModel):
-    """Individual table row data."""
-    service: str = Field(description="Service name/description")
-    billing_code_type: str = Field(description="Type of billing code (DRG, Revenue Codes, etc.)")
-    billing_codes: str = Field(description="The actual codes/ranges")
-    rate_amount: str = Field(description="Monetary amount or percentage")
-    negotiated_type: str = Field(description="Rate structure (Per Diem, Case Rate, etc.)")
-    additional_info: str = Field(description="Special conditions or notes, 'N/A' if none")
-
-class TableData(BaseModel):
-    """Complete table extraction."""
-    page_structure: PageStructure = Field(description="Page structure information")
-    table_rows: Optional[List[TableRowData]] = Field(default=None, description="Extracted table rows")
+    service_sections: List[ServiceSection] = Field(description="All Place of Service sections found on this page")
+    is_continuation: bool = Field(default=False, description="Whether this continues tables from previous page")
 
 class DocumentContext:
     """Tracks document-level context across pages."""
@@ -82,9 +72,8 @@ class DocumentContext:
         self.current_effective_date = None
         self.current_hospital_names = []
         self.current_lob = None
-        self.current_place_of_service = None
         
-    def update_context(self, metadata: DocumentMetadata, place_of_service: str = None):
+    def update_context(self, metadata: DocumentMetadata):
         """Update context with new metadata."""
         if metadata:
             if metadata.effective_date:
@@ -93,12 +82,9 @@ class DocumentContext:
                 self.current_hospital_names = metadata.hospital_names
             if metadata.lob_type:
                 self.current_lob = metadata.lob_type
-        
-        if place_of_service:
-            self.current_place_of_service = place_of_service
 
 class HospitalRateExtractor:
-    """Main extractor class with improved structure detection."""
+    """Main extractor class with improved multi-section detection."""
     
     def __init__(self, client, output_dir: str = None):
         self.client = client
@@ -119,9 +105,9 @@ class HospitalRateExtractor:
             writer = csv.writer(csvfile)
             writer.writerow(self.csv_columns)
     
-    def create_extraction_prompt(self) -> tuple:
-        """Create prompt for structured extraction."""
-        base_parser = PydanticOutputParser(pydantic_object=TableData)
+    def create_multi_section_prompt(self) -> tuple:
+        """Create prompt for extracting ALL sections from a page."""
+        base_parser = PydanticOutputParser(pydantic_object=PageExtraction)
         
         class GeminiLLM:
             def __init__(self, client):
@@ -141,48 +127,54 @@ class HospitalRateExtractor:
         parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
         
         template = """
-You are an expert at extracting structured data from hospital rate schedule documents.
+You are an expert at extracting ALL structured data from hospital rate schedule documents.
 
-EXTRACTION STEPS:
+CRITICAL: You must extract ALL Place of Service sections on this page, not just one!
 
-1. DETECT PAGE STRUCTURE:
-   - Check if this page starts a NEW hospital/LOB section (new main title)
-   - Identify the Place of Service (INPATIENT RATES, OUTPATIENT RATES, etc.)
-   - Determine if page contains tabular data or is continuation
+STEP 1 - DETECT NEW DOCUMENT SECTION:
+Check if this page starts a NEW hospital/LOB combination by looking for:
+- New hospital names in main title (e.g., "Marietta Memorial TIN 314379509 and Selby General Hospital TIN 314413259")
+- New LOB type (COMMERCIAL, MEDICARE, MEDICAID, etc.)
+- New effective date
 
-2. EXTRACT METADATA (only if new section detected):
-   - Effective Date: Look for "Effective Date:" in top corner (format: MM/DD/YYYY)
-   - Hospital Names: Extract ACTUAL hospital names from main title, NOT system names
-     * Examples: "Mercy Springfield and Urbana Hospitals", "Advocate Condell Medical Center"
-     * Ignore system names like "Mercy Health", "Memorial Health System"
-   - LOB Type: Look for business line indicators
-     * "COMMERCIAL" → "Commercial"
-     * "MEDICARE" → "Medicare"  
-     * "MEDICAID" → "Medicaid"
-     * "ACOP COMMERCIAL" → "ACOP Commercial"
+STEP 2 - EXTRACT METADATA (only if new section):
+- Effective Date: Look for date ranges (e.g., "6/1/2025 through 5/31/2026")
+- Hospital Names: Extract ACTUAL hospital facility names (e.g., "Marietta Memorial", "Selby General Hospital")
+- LOB Type: Extract from title (e.g., "COMMERCIAL" → "Commercial")
 
-3. IDENTIFY PLACE OF SERVICE:
-   - Look for section headers like "INPATIENT RATES:", "OUTPATIENT RATES:", etc.
-   - Extract: "INPATIENT", "OUTPATIENT", "INPATIENT CARVE OUT", "OUTPATIENT CARVE OUT"
+STEP 3 - IDENTIFY ALL PLACE OF SERVICE SECTIONS:
+Look for ALL section headers on this page:
+- "INPATIENT RATES:" → "INPATIENT"
+- "INPATIENT CARVE OUT RATES:" → "INPATIENT CARVE OUT"  
+- "OUTPATIENT RATES:" → "OUTPATIENT"
+- "OUTPATIENT CARVE OUT RATES:" → "OUTPATIENT CARVE OUT"
 
-4. EXTRACT TABLE DATA:
-   For each row in any table, extract:
-   - service: Service name/description
-   - billing_code_type: Code type (DRG, Revenue Codes, HCPC Codes, CPT4 Codes, etc.)
-   - billing_codes: Actual codes/ranges
-   - rate_amount: Just the monetary amount or percentage
-   - negotiated_type: Rate structure (Per Diem, Case Rate, Base Rate, Percentage, etc.)
-   - additional_info: Special conditions/notes, or "N/A" if none
+STEP 4 - EXTRACT ALL TABLES:
+For EACH Place of Service section found, extract ALL rows in its table:
+- service: Service name/description
+- billing_code_type: Code type (Revenue Codes, HCPC Codes, CPT4 Codes, etc.)
+- billing_codes: Actual codes/ranges  
+- rate_amount: Just the monetary amount or percentage
+- negotiated_type: Rate structure (Per Diem, Case Rate, Percentage, etc.)
+- additional_info: Special conditions/notes, or "N/A" if none
 
-IMPORTANT RULES:
-- Only extract hospital names that are ACTUAL facility names, not health system names
-- If no new section header, assume continuation of previous context
-- Break down rate information properly (separate amount from type)
+EXAMPLE EXTRACTION:
+If page has:
+1. INPATIENT RATES section with 2 rows
+2. INPATIENT CARVE OUT RATES section with 3 rows  
+3. OUTPATIENT RATES section with 5 rows
+
+You should return 3 ServiceSection objects, each with their respective rows.
+
+CRITICAL RULES:
+- Extract EVERY section and EVERY table on the page
+- Don't skip sections - if you see "INPATIENT RATES:" and "OUTPATIENT RATES:", extract BOTH
+- Each ServiceSection should contain ALL rows from that section's table
 - Use "N/A" for missing information
 
 {format_instructions}
 
-Analyze this hospital rate schedule page:
+Extract ALL sections and tables from this hospital rate schedule page:
 """
         
         prompt = PromptTemplate(
@@ -194,7 +186,7 @@ Analyze this hospital rate schedule page:
         return prompt, parser
     
     def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
-        """Process a single page with context awareness."""
+        """Process a single page extracting ALL sections."""
         print(f"Processing page {page_num}: {Path(image_path).name}")
         
         try:
@@ -203,8 +195,8 @@ Analyze this hospital rate schedule page:
             
             mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
             
-            # Extract data using AI
-            prompt, parser = self.create_extraction_prompt()
+            # Extract ALL sections using AI
+            prompt, parser = self.create_multi_section_prompt()
             prompt_text = prompt.format()
             
             response = self.client.models.generate_content(
@@ -217,27 +209,30 @@ Analyze this hospital rate schedule page:
             
             parsed_data = parser.parse(response.text.strip())
             
-            # Update context based on extraction
-            if parsed_data.page_structure.has_new_section and parsed_data.page_structure.metadata:
-                self.context.update_context(
-                    parsed_data.page_structure.metadata,
-                    parsed_data.page_structure.place_of_service
-                )
-                print(f"New section detected - Hospital: {self.context.current_hospital_names}, LOB: {self.context.current_lob}")
-            elif parsed_data.page_structure.place_of_service:
-                self.context.current_place_of_service = parsed_data.page_structure.place_of_service
+            # Update context if new document section
+            if parsed_data.has_new_document_section and parsed_data.metadata:
+                self.context.update_context(parsed_data.metadata)
+                print(f"New section detected - Hospitals: {self.context.current_hospital_names}, LOB: {self.context.current_lob}")
             
-            # Process table data if present
-            rows_added = 0
-            if parsed_data.table_rows:
-                rows_added = self.save_table_data(parsed_data.table_rows)
+            # Process ALL service sections
+            total_rows_added = 0
+            sections_processed = []
+            
+            for section in parsed_data.service_sections:
+                rows_added = self.save_section_data(section)
+                total_rows_added += rows_added
+                sections_processed.append({
+                    'place_of_service': section.place_of_service,
+                    'rows_added': rows_added
+                })
+                print(f"  - {section.place_of_service}: {rows_added} rows")
             
             return {
                 'page_num': page_num,
-                'has_new_section': parsed_data.page_structure.has_new_section,
-                'place_of_service': self.context.current_place_of_service,
-                'has_table': parsed_data.page_structure.has_table,
-                'rows_added': rows_added,
+                'has_new_section': parsed_data.has_new_document_section,
+                'sections_found': [s['place_of_service'] for s in sections_processed],
+                'total_rows_added': total_rows_added,
+                'sections_detail': sections_processed,
                 'current_context': {
                     'hospitals': self.context.current_hospital_names,
                     'lob': self.context.current_lob,
@@ -250,25 +245,28 @@ Analyze this hospital rate schedule page:
             return {
                 'page_num': page_num,
                 'error': str(e),
-                'has_table': False,
-                'rows_added': 0
+                'total_rows_added': 0,
+                'sections_found': []
             }
     
-    def save_table_data(self, table_rows: List[TableRowData]) -> int:
-        """Save extracted table rows to CSV."""
+    def save_section_data(self, section: ServiceSection) -> int:
+        """Save extracted section data to CSV."""
+        if not section.service_rows:
+            return 0
+            
         rows_to_write = []
         
-        for row in table_rows:
+        for row_data in section.service_rows:
             csv_row = [
                 '; '.join(self.context.current_hospital_names) if self.context.current_hospital_names else 'N/A',
                 self.context.current_lob or 'N/A',
-                self.context.current_place_of_service or 'N/A',
-                row.service,
-                row.billing_code_type,
-                row.billing_codes,
-                row.rate_amount,
-                row.negotiated_type,
-                row.additional_info,
+                section.place_of_service,
+                row_data.get('service', 'N/A'),
+                row_data.get('billing_code_type', 'N/A'),
+                row_data.get('billing_codes', 'N/A'),
+                row_data.get('rate_amount', 'N/A'),
+                row_data.get('negotiated_type', 'N/A'),
+                row_data.get('additional_info', 'N/A'),
                 self.context.current_effective_date or 'N/A'
             ]
             rows_to_write.append(csv_row)
@@ -278,11 +276,10 @@ Analyze this hospital rate schedule page:
             writer = csv.writer(csvfile)
             writer.writerows(rows_to_write)
         
-        print(f"Added {len(rows_to_write)} rows to CSV")
         return len(rows_to_write)
     
     def extract_from_pdf(self, pdf_path: str, dpi: int = 300) -> Dict[str, Any]:
-        """Extract all data from PDF with structured approach."""
+        """Extract all data from PDF with multi-section awareness."""
         print(f"Starting extraction for: {pdf_path}")
         
         # Convert PDF to images
@@ -294,18 +291,26 @@ Analyze this hospital rate schedule page:
             'total_pages': len(image_paths),
             'pages_processed': [],
             'total_rows_extracted': 0,
+            'sections_summary': {},
             'csv_file': str(self.csv_path)
         }
         
         for page_num, image_path in enumerate(image_paths, 1):
             page_result = self.process_page(image_path, page_num)
             results['pages_processed'].append(page_result)
-            results['total_rows_extracted'] += page_result.get('rows_added', 0)
+            results['total_rows_extracted'] += page_result.get('total_rows_added', 0)
+            
+            # Track sections found
+            for section in page_result.get('sections_found', []):
+                if section not in results['sections_summary']:
+                    results['sections_summary'][section] = 0
+                results['sections_summary'][section] += 1
         
         # Summary
         print(f"\n=== EXTRACTION COMPLETE ===")
         print(f"Total pages processed: {results['total_pages']}")
         print(f"Total rows extracted: {results['total_rows_extracted']}")
+        print(f"Sections found: {results['sections_summary']}")
         print(f"Output CSV: {results['csv_file']}")
         
         return results
