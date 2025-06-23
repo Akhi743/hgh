@@ -153,37 +153,43 @@ Look for ALL section headers on this page:
 - "OUTPATIENT RATES:" → "OUTPATIENT"
 - "OUTPATIENT CARVE OUT RATES:" → "OUTPATIENT CARVE OUT"
 
-STEP 4 - EXTRACT ALL TABLES:
-For EACH Place of Service section found, extract ALL rows in its table EXACTLY as they appear:
-- service: Service name/description (exactly as shown in Service column)
-- billing_codes: Complete billing codes text (exactly as shown in Billing Codes column)  
-- rates: Complete rates text (exactly as shown in Rates column)
+STEP 4 - EXTRACT ALL TABLES - BE VERY CAREFUL HERE:
+For EACH Place of Service section found, look at the table and extract EVERY SINGLE ROW.
 
-DO NOT break down or split the billing codes or rates - keep them exactly as they appear in the table.
+MANDATORY: Extract the following for each table row:
+- service: The exact text from the "Service" column (e.g., "Cardiac Catheterization Procedures", "Emergency Care", "Ambulatory Surgery: Default Rate")
+- billing_codes: The complete text from the "Billing Codes" column (e.g., "HCPC Code: C7521-C7529, C7552, C7553, C9758, C9760, G0448, CPT4 Codes: 0408T, 0410T...")
+- rates: The complete text from the "Rates" column (e.g., "85.1% of Billed Charges Rate Applies to Entire Bill")
 
-EXAMPLE:
-Service: "Cardiac Catheterization Procedures"
-Billing_Codes: "HCPC Code: C7521-C7529, C7552, C7553, C9758, C9760, G0448, CPT4 Codes: 0408T, 0410T, 0411T, 0413T, 0415T, 0543T-0545T, 0569T-0570T, 0613T, 0632T, 0643T, 0644T, 0646T, 33017-33019, 33289, 33477, 33745-33746, 34717-34718, 93451-93462, 93503-93505, 93593-93597"
-Rates: "85.1% of Billed Charges Rate Applies to Entire Bill"
+CRITICAL EXTRACTION RULES:
+1. Look at EVERY row in EVERY table - do not skip any rows
+2. If you see a table with 10 rows, you MUST extract all 10 rows
+3. Copy the text EXACTLY as it appears - do not summarize or abbreviate
+4. If a cell spans multiple lines, include ALL the text
+5. For billing codes that have multiple types (HCPC Codes, CPT4 Codes, Revenue Codes), include ALL of them in one field
 
-EXAMPLE EXTRACTION:
-If page has:
-1. INPATIENT RATES section with 2 rows
-2. INPATIENT CARVE OUT RATES section with 3 rows  
-3. OUTPATIENT RATES section with 5 rows
+EXAMPLE FROM A REAL TABLE:
+Row 1:
+- service: "Cardiac Catheterization Procedures"
+- billing_codes: "HCPC Code: C7521-C7529, C7552, C7553, C9758, C9760, G0448, CPT4 Codes: 0408T, 0410T, 0411T, 0413T, 0415T, 0543T-0545T, 0569T-0570T, 0613T, 0632T, 0643T, 0644T, 0646T, 33017-33019, 33289, 33477, 33745-33746, 34717-34718, 93451-93462, 93503-93505, 93593-93597"
+- rates: "85.1% of Billed Charges Rate Applies to Entire Bill"
 
-You should return 3 ServiceSection objects, each with their respective rows.
+Row 2:
+- service: "Emergency Care"
+- billing_codes: "Revenue Codes: 450, 451, 452, 459"
+- rates: "85.1% of Billed Charges Rate Applies to Entire Bill"
 
-CRITICAL RULES:
-- Extract EVERY section and EVERY table on the page
-- Don't skip sections - if you see "INPATIENT RATES:" and "OUTPATIENT RATES:", extract BOTH
-- Each ServiceSection should contain ALL rows from that section's table
-- Keep billing codes and rates EXACTLY as they appear - do not split or break them down
-- Use "N/A" for missing information
+YOU MUST EXTRACT EVERY ROW LIKE THIS - NO EXCEPTIONS!
+
+FINAL CHECK:
+- Count the rows in each table visually
+- Make sure your extraction has the same number of rows
+- Verify every service name is captured
+- Verify every billing code is captured completely
 
 {format_instructions}
 
-Extract ALL sections and tables from this hospital rate schedule page:
+Extract ALL sections and tables from this hospital rate schedule page. DO NOT MISS ANY ROWS:
 """
         
         prompt = PromptTemplate(
@@ -204,7 +210,7 @@ Extract ALL sections and tables from this hospital rate schedule page:
             
             mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
             
-            # Extract ALL sections using AI
+            # Extract ALL sections using AI with error checking
             prompt, parser = self.create_multi_section_prompt()
             prompt_text = prompt.format()
             
@@ -215,6 +221,9 @@ Extract ALL sections and tables from this hospital rate schedule page:
                     prompt_text
                 ]
             )
+            
+            print(f"Raw AI response for page {page_num}:")
+            print(response.text[:500] + "..." if len(response.text) > 500 else response.text)
             
             parsed_data = parser.parse(response.text.strip())
             
@@ -244,18 +253,28 @@ Extract ALL sections and tables from this hospital rate schedule page:
                     if parsed_data.metadata.effective_date:
                         self.context.current_effective_date = parsed_data.metadata.effective_date
             
-            # Process ALL service sections
+            # Process ALL service sections with detailed logging
             total_rows_added = 0
             sections_processed = []
             
-            for section in parsed_data.service_sections:
+            if not parsed_data.service_sections:
+                print(f"  WARNING: No service sections found on page {page_num}")
+            
+            for i, section in enumerate(parsed_data.service_sections):
+                print(f"  Processing section {i+1}: {section.place_of_service}")
+                print(f"    Found {len(section.service_rows)} rows")
+                
+                # Log first few rows for verification
+                for j, row in enumerate(section.service_rows[:3]):
+                    print(f"    Row {j+1}: Service='{row.get('service', 'MISSING')}', Billing='{row.get('billing_codes', 'MISSING')[:50]}...', Rates='{row.get('rates', 'MISSING')[:50]}...'")
+                
                 rows_added = self.save_section_data(section)
                 total_rows_added += rows_added
                 sections_processed.append({
                     'place_of_service': section.place_of_service,
                     'rows_added': rows_added
                 })
-                print(f"  - {section.place_of_service}: {rows_added} rows")
+                print(f"  - {section.place_of_service}: {rows_added} rows added to CSV")
             
             return {
                 'page_num': page_num,
