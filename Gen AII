@@ -57,7 +57,7 @@ class DocumentMetadata(BaseModel):
 class ServiceSection(BaseModel):
     """Individual Place of Service section with its table data."""
     place_of_service: str = Field(description="INPATIENT, OUTPATIENT, INPATIENT CARVE OUT, OUTPATIENT CARVE OUT")
-    service_rows: List[Dict[str, str]] = Field(description="List of service rows with service, billing_code_type, billing_codes, rate_amount, negotiated_type, additional_info")
+    service_rows: List[Dict[str, str]] = Field(description="List of service rows with service, billing_codes, rates exactly as they appear in table")
 
 class PageExtraction(BaseModel):
     """Complete page extraction including metadata and all sections."""
@@ -92,11 +92,10 @@ class HospitalRateExtractor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.context = DocumentContext()
         
-        # Standard CSV columns
+        # Standard CSV columns - simplified to match table structure
         self.csv_columns = [
             'Hospital_Names', 'LOB', 'Place_of_Service', 'Service', 
-            'Billing_Code_Type', 'Billing_Codes', 'Rate_Amount', 
-            'Negotiated_Type', 'Additional_Info', 'Effective_Date'
+            'Billing_Codes', 'Rates', 'Effective_Date'
         ]
         
         # Initialize main CSV file
@@ -155,13 +154,17 @@ Look for ALL section headers on this page:
 - "OUTPATIENT CARVE OUT RATES:" → "OUTPATIENT CARVE OUT"
 
 STEP 4 - EXTRACT ALL TABLES:
-For EACH Place of Service section found, extract ALL rows in its table:
-- service: Service name/description
-- billing_code_type: Code type (Revenue Codes, HCPC Codes, CPT4 Codes, etc.)
-- billing_codes: Actual codes/ranges  
-- rate_amount: Just the monetary amount or percentage
-- negotiated_type: Rate structure (Per Diem, Case Rate, Percentage, etc.)
-- additional_info: Special conditions/notes, or "N/A" if none
+For EACH Place of Service section found, extract ALL rows in its table EXACTLY as they appear:
+- service: Service name/description (exactly as shown in Service column)
+- billing_codes: Complete billing codes text (exactly as shown in Billing Codes column)  
+- rates: Complete rates text (exactly as shown in Rates column)
+
+DO NOT break down or split the billing codes or rates - keep them exactly as they appear in the table.
+
+EXAMPLE:
+Service: "Cardiac Catheterization Procedures"
+Billing_Codes: "HCPC Code: C7521-C7529, C7552, C7553, C9758, C9760, G0448, CPT4 Codes: 0408T, 0410T, 0411T, 0413T, 0415T, 0543T-0545T, 0569T-0570T, 0613T, 0632T, 0643T, 0644T, 0646T, 33017-33019, 33289, 33477, 33745-33746, 34717-34718, 93451-93462, 93503-93505, 93593-93597"
+Rates: "85.1% of Billed Charges Rate Applies to Entire Bill"
 
 EXAMPLE EXTRACTION:
 If page has:
@@ -175,6 +178,7 @@ CRITICAL RULES:
 - Extract EVERY section and EVERY table on the page
 - Don't skip sections - if you see "INPATIENT RATES:" and "OUTPATIENT RATES:", extract BOTH
 - Each ServiceSection should contain ALL rows from that section's table
+- Keep billing codes and rates EXACTLY as they appear - do not split or break them down
 - Use "N/A" for missing information
 
 {format_instructions}
@@ -276,7 +280,7 @@ Extract ALL sections and tables from this hospital rate schedule page:
             }
     
     def save_section_data(self, section: ServiceSection) -> int:
-        """Save extracted section data to CSV."""
+        """Save extracted section data to CSV exactly as extracted."""
         if not section.service_rows:
             return 0
             
@@ -288,11 +292,8 @@ Extract ALL sections and tables from this hospital rate schedule page:
                 self.context.current_lob or 'N/A',
                 section.place_of_service,
                 row_data.get('service', 'N/A'),
-                row_data.get('billing_code_type', 'N/A'),
                 row_data.get('billing_codes', 'N/A'),
-                row_data.get('rate_amount', 'N/A'),
-                row_data.get('negotiated_type', 'N/A'),
-                row_data.get('additional_info', 'N/A'),
+                row_data.get('rates', 'N/A'),
                 self.context.current_effective_date or 'N/A'
             ]
             rows_to_write.append(csv_row)
