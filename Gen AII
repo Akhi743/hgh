@@ -128,68 +128,64 @@ class HospitalRateExtractor:
         template = """
 You are an expert at extracting ALL structured data from hospital rate schedule documents.
 
-CRITICAL: You must extract ALL Place of Service sections on this page, not just one!
+CRITICAL EXTRACTION REQUIREMENTS:
+1. EXTRACT EVERY SINGLE ROW from every table - NO EXCEPTIONS
+2. Count the rows in each table and ensure you extract that exact number
+3. If you see 10 rows, extract all 10. If you see 15 rows, extract all 15.
 
 STEP 1 - DETECT NEW DOCUMENT SECTION:
-Check if this page starts a NEW hospital/LOB combination by looking for:
-- NEW MAIN HEADER with hospital names (large title in center, NOT the system name in top corner)
-- Example: "Marietta Memorial TIN 314379509 and Selby General Hospital TIN 314413259"
-- Example: "Sistersville General Hospital"  
-- NEW LOB type in the main header area (COMMERCIAL, MEDICARE, MEDICAID, etc.)
+Look for NEW MAIN DOCUMENT HEADER (large centered text) with hospital names like:
+- "Sistersville General Hospital"
+- "Marietta Memorial TIN 314379509 and Selby General Hospital TIN 314413259"
+- "Advocate Condell Medical Center and Advocate Sherman Hospital"
 
-IMPORTANT: IGNORE system names in top corners like "Memorial Health System" - these are NOT hospital names!
+CRITICAL: NEVER extract random text like "MHS REFERENCE LAB" or system names from corners!
+ONLY extract hospital names from the MAIN CENTERED DOCUMENT TITLE.
 
 STEP 2 - EXTRACT METADATA (only if NEW MAIN HEADER detected):
-- Effective Date: Look for date ranges in header area (e.g., "6/1/2025 through 5/31/2026")
-- Hospital Names: Extract ONLY from MAIN HEADER/TITLE area, NOT from top corner
-  * Examples: "Marietta Memorial", "Selby General Hospital", "Sistersville General Hospital"
-  * NEVER use system names like "Memorial Health System", "Mercy Health", etc.
-- LOB Type: Extract from main header area (e.g., "COMMERCIAL" → "Commercial")
+- Hospital Names: ONLY from main document title (e.g., "Sistersville General Hospital")
+- Effective Date: Date ranges in header (e.g., "6/1/2025 through 5/31/2026")
+- LOB Type: Business line from header (COMMERCIAL, MEDICARE, etc.)
 
 STEP 3 - IDENTIFY ALL PLACE OF SERVICE SECTIONS:
-Look for ALL section headers on this page:
+Find ALL section headers:
 - "INPATIENT RATES:" → "INPATIENT"
-- "INPATIENT CARVE OUT RATES:" → "INPATIENT CARVE OUT"  
-- "OUTPATIENT RATES:" → "OUTPATIENT"
+- "OUTPATIENT RATES:" → "OUTPATIENT"  
+- "INPATIENT CARVE OUT RATES:" → "INPATIENT CARVE OUT"
 - "OUTPATIENT CARVE OUT RATES:" → "OUTPATIENT CARVE OUT"
 
-STEP 4 - EXTRACT ALL TABLES - BE VERY CAREFUL HERE:
-For EACH Place of Service section found, look at the table and extract EVERY SINGLE ROW.
+STEP 4 - EXTRACT EVERY SINGLE TABLE ROW:
 
-MANDATORY: Extract the following for each table row:
-- service: The exact text from the "Service" column (e.g., "Cardiac Catheterization Procedures", "Emergency Care", "Ambulatory Surgery: Default Rate")
-- billing_codes: The complete text from the "Billing Codes" column (e.g., "HCPC Code: C7521-C7529, C7552, C7553, C9758, C9760, G0448, CPT4 Codes: 0408T, 0410T...")
-- rates: The complete text from the "Rates" column (e.g., "85.1% of Billed Charges Rate Applies to Entire Bill")
+MANDATORY PROCESS FOR EACH TABLE:
+1. Count the total rows in the table visually
+2. Extract row-by-row, going through each one systematically
+3. For each row extract:
+   - service: Exact text from Service column
+   - billing_codes: Complete text from Billing Codes column
+   - rates: Complete text from Rates column
 
-CRITICAL EXTRACTION RULES:
-1. Look at EVERY row in EVERY table - do not skip any rows
-2. If you see a table with 10 rows, you MUST extract all 10 rows
-3. Copy the text EXACTLY as it appears - do not summarize or abbreviate
-4. If a cell spans multiple lines, include ALL the text
-5. For billing codes that have multiple types (HCPC Codes, CPT4 Codes, Revenue Codes), include ALL of them in one field
+EXAMPLE - If you see this OUTPATIENT table:
+Row 1: Ambulatory Surgery: Default Rate | All surgical procedures not otherwise identified | 85.1% of Billed Charges Rate Applies to Entire Bill
+Row 2: Cardiac Catheterization Procedures | HCPC Code: C7521-C7529... | 85.1% of Billed Charges Rate Applies to Entire Bill
+Row 3: Cardiac Catheterization Injections | CPT4 Codes: 93563-93568 | 85.1% of Billed Charges Rate Applies to Entire Bill
+Row 4: Cardiac Studies | CPT4 Codes: 0541T, 0542T... | 85.1% of Billed Charges
+Row 5: Vascular Diagnostic Studies | CPT4 Codes: 93880-93998 | 85.1% of Billed Charges
+Row 6: Emergency Care | Revenue Codes: 450, 451, 452, 459 | 85.1% of Billed Charges Rate Applies to Entire Bill
+Row 7: Observation Services | Revenue Codes: 762 | 85.1% of Billed Charges
 
-EXAMPLE FROM A REAL TABLE:
-Row 1:
-- service: "Cardiac Catheterization Procedures"
-- billing_codes: "HCPC Code: C7521-C7529, C7552, C7553, C9758, C9760, G0448, CPT4 Codes: 0408T, 0410T, 0411T, 0413T, 0415T, 0543T-0545T, 0569T-0570T, 0613T, 0632T, 0643T, 0644T, 0646T, 33017-33019, 33289, 33477, 33745-33746, 34717-34718, 93451-93462, 93503-93505, 93593-93597"
-- rates: "85.1% of Billed Charges Rate Applies to Entire Bill"
+YOU MUST EXTRACT ALL 7 ROWS - NOT 2 OR 3!
 
-Row 2:
-- service: "Emergency Care"
-- billing_codes: "Revenue Codes: 450, 451, 452, 459"
-- rates: "85.1% of Billed Charges Rate Applies to Entire Bill"
+VERIFICATION CHECKLIST:
+- Did I count all visible rows?
+- Did I extract every service name I can see?
+- Did I get all the billing codes for each service?
+- Did I capture all rate information?
 
-YOU MUST EXTRACT EVERY ROW LIKE THIS - NO EXCEPTIONS!
-
-FINAL CHECK:
-- Count the rows in each table visually
-- Make sure your extraction has the same number of rows
-- Verify every service name is captured
-- Verify every billing code is captured completely
+CRITICAL: If a table has 15 visible rows, your extraction MUST have 15 rows. NO SHORTCUTS!
 
 {format_instructions}
 
-Extract ALL sections and tables from this hospital rate schedule page. DO NOT MISS ANY ROWS:
+Now extract EVERY row from EVERY table on this page:
 """
         
         prompt = PromptTemplate(
@@ -229,14 +225,19 @@ Extract ALL sections and tables from this hospital rate schedule page. DO NOT MI
             
             # Update context ONLY if new document section with valid hospital names
             if parsed_data.has_new_document_section and parsed_data.metadata:
-                # Validate hospital names - reject system names
+                # Validate hospital names - reject system names and random text
                 if parsed_data.metadata.hospital_names:
                     valid_hospitals = []
                     for hospital in parsed_data.metadata.hospital_names:
-                        # Filter out system names
-                        if not any(system_word in hospital.lower() for system_word in 
-                                 ['health system', 'health', 'memorial health system', 'mercy health']):
-                            valid_hospitals.append(hospital)
+                        # Filter out system names and random text
+                        hospital_lower = hospital.lower()
+                        if not any(invalid_word in hospital_lower for invalid_word in 
+                                 ['health system', 'health', 'memorial health system', 'mercy health', 
+                                  'mhs reference lab', 'reference lab', 'lab']):
+                            # Also check it contains "hospital" or recognizable hospital terms
+                            if any(valid_word in hospital_lower for valid_word in 
+                                 ['hospital', 'medical center', 'general', 'memorial', 'regional']):
+                                valid_hospitals.append(hospital)
                     
                     if valid_hospitals:
                         # Only update if we have valid hospital names
@@ -245,7 +246,7 @@ Extract ALL sections and tables from this hospital rate schedule page. DO NOT MI
                         self.context.update_context(old_metadata)
                         print(f"New section detected - Hospitals: {self.context.current_hospital_names}, LOB: {self.context.current_lob}")
                     else:
-                        print(f"Ignoring system name extraction, keeping current context: {self.context.current_hospital_names}")
+                        print(f"Ignoring invalid hospital extraction '{parsed_data.metadata.hospital_names}', keeping current context: {self.context.current_hospital_names}")
                 else:
                     # Update other metadata but keep existing hospital names
                     if parsed_data.metadata.lob_type:
@@ -258,15 +259,29 @@ Extract ALL sections and tables from this hospital rate schedule page. DO NOT MI
             sections_processed = []
             
             if not parsed_data.service_sections:
-                print(f"  WARNING: No service sections found on page {page_num}")
+                print(f"  CRITICAL ERROR: No service sections found on page {page_num}")
+                print(f"  This indicates the AI failed to extract the table data!")
+            else:
+                print(f"  Found {len(parsed_data.service_sections)} service sections")
             
             for i, section in enumerate(parsed_data.service_sections):
                 print(f"  Processing section {i+1}: {section.place_of_service}")
-                print(f"    Found {len(section.service_rows)} rows")
                 
-                # Log first few rows for verification
-                for j, row in enumerate(section.service_rows[:3]):
-                    print(f"    Row {j+1}: Service='{row.get('service', 'MISSING')}', Billing='{row.get('billing_codes', 'MISSING')[:50]}...', Rates='{row.get('rates', 'MISSING')[:50]}...'")
+                if not section.service_rows:
+                    print(f"    CRITICAL ERROR: Section has 0 rows - this is likely wrong!")
+                else:
+                    print(f"    Found {len(section.service_rows)} rows")
+                
+                # Log ALL rows for verification
+                for j, row in enumerate(section.service_rows):
+                    service_text = row.get('service', 'MISSING')
+                    billing_text = row.get('billing_codes', 'MISSING')
+                    rates_text = row.get('rates', 'MISSING')
+                    
+                    print(f"    Row {j+1}:")
+                    print(f"      Service: '{service_text}'")
+                    print(f"      Billing: '{billing_text[:100]}{'...' if len(billing_text) > 100 else ''}'")
+                    print(f"      Rates: '{rates_text}'")
                 
                 rows_added = self.save_section_data(section)
                 total_rows_added += rows_added
