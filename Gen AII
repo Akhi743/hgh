@@ -144,63 +144,60 @@ Return the text as a simple list of lines, one line per row.
         if any(skip in line_lower for skip in ['mercy health', 'memorial health system']):
             return False
             
-        # Look for hospital indicators in centered headers
-        hospital_indicators = ['hospital', 'medical center', 'health center', 'healthcare']
-        has_hospital = any(indicator in line_lower for indicator in hospital_indicators)
+        # Look for main header indicators
+        header_indicators = [
+            'hospital service', 'rate schedule', 'service and rate',
+            'hospital.*rate.*schedule', 'rate.*schedule.*hospital'
+        ]
         
-        # Check if it looks like a main header (has hospital service/rate schedule context)
-        has_header_context = any(context in line_lower for context in [
-            'hospital service', 'rate schedule', 'service and rate'
-        ])
-        
-        return has_hospital or has_header_context
+        return any(indicator in line_lower for indicator in header_indicators)
     
-    def extract_hospital_names(self, line: str) -> List[str]:
-        """Extract hospital names from main header line."""
-        # Remove common header words
-        clean_line = re.sub(r'\b(hospital|service|and|rate|schedule)\b', '', line, flags=re.IGNORECASE)
-        
-        # Look for hospital names
-        hospital_names = []
-        
-        # Pattern 1: Names with "Hospital"
-        hospital_matches = re.findall(r'([A-Za-z\s]+Hospital)', line, re.IGNORECASE)
-        hospital_names.extend([match.strip() for match in hospital_matches])
-        
-        # Pattern 2: Names with "Medical Center"
-        medical_matches = re.findall(r'([A-Za-z\s]+Medical Center)', line, re.IGNORECASE)
-        hospital_names.extend([match.strip() for match in medical_matches])
-        
-        # Pattern 3: Names with TIN numbers
-        tin_matches = re.findall(r'([A-Za-z\s]+)\s+TIN\s+\d+', line, re.IGNORECASE)
-        hospital_names.extend([match.strip() for match in tin_matches])
-        
-        return [name for name in hospital_names if len(name) > 3]
-    
-    def extract_lob(self, line: str) -> Optional[str]:
-        """Extract LOB from line."""
-        line_lower = line.lower()
-        
-        if 'commercial' in line_lower:
-            if 'acop' in line_lower:
-                return 'ACOP Commercial'
-            elif 'gatekeeper' in line_lower:
-                return 'Commercial'
-            else:
-                return 'Commercial'
-        elif 'medicare' in line_lower:
-            return 'Medicare'
-        elif 'medicaid' in line_lower:
-            return 'Medicaid'
-        elif 'hmo' in line_lower:
-            return 'HMO'
-        elif 'ppo' in line_lower:
-            return 'PPO'
-        
-        return None
+    def extract_hospital_and_lob(self, line: str) -> Dict[str, Any]:
+        """Use AI to extract hospital names and LOB from main header line."""
+        try:
+            prompt = f"""
+Extract hospital names and Line of Business (LOB) from this main header:
+
+"{line}"
+
+Extract:
+- Hospital Names: All hospital facility names (ignore system names like "Mercy Health")
+- LOB: Line of Business type (Commercial, Medicare, Medicaid, etc.)
+
+Return in this exact format:
+Hospital Names: [list of hospital names]
+LOB: [business line type]
+"""
+            
+            response = self.client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=[prompt]
+            )
+            
+            # Parse the response
+            lines = response.text.strip().split('\n')
+            hospital_names = []
+            lob = None
+            
+            for line in lines:
+                if line.startswith('Hospital Names:'):
+                    names_text = line.replace('Hospital Names:', '').strip()
+                    # Split multiple names
+                    hospital_names = [name.strip() for name in names_text.split(',') if name.strip()]
+                elif line.startswith('LOB:'):
+                    lob = line.replace('LOB:', '').strip()
+            
+            return {
+                'hospital_names': hospital_names,
+                'lob': lob
+            }
+                
+        except Exception as e:
+            print(f"Error extracting from header: {e}")
+            return {'hospital_names': [], 'lob': None}
     
     def extract_effective_date(self, line: str) -> Optional[str]:
-        """Extract effective date from line."""
+        """Extract effective date from line using simple patterns."""
         # Look for date patterns
         date_patterns = [
             r'effective date[:\s]+(\d{1,2}/\d{1,2}/\d{4})',
@@ -326,15 +323,15 @@ Rates: [rate information]
             
             # Check for main header
             if self.is_main_header(line):
-                hospital_names = self.extract_hospital_names(line)
-                if hospital_names:
-                    self.context.update_hospital_names(hospital_names)
-                    print(f"  NEW HOSPITAL HEADER: {hospital_names}")
+                header_data = self.extract_hospital_and_lob(line)
                 
-                lob = self.extract_lob(line)
-                if lob:
-                    self.context.update_lob(lob)
-                    print(f"  LOB: {lob}")
+                if header_data['hospital_names']:
+                    self.context.update_hospital_names(header_data['hospital_names'])
+                    print(f"  NEW HOSPITAL HEADER: {header_data['hospital_names']}")
+                
+                if header_data['lob']:
+                    self.context.update_lob(header_data['lob'])
+                    print(f"  LOB: {header_data['lob']}")
                 
                 effective_date = self.extract_effective_date(line)
                 if effective_date:
@@ -413,3 +410,4 @@ if __name__ == "__main__":
     results = extractor.extract_from_pdf(pdf_file)
     
     print("Line-by-line extraction completed!")
+
