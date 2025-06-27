@@ -64,7 +64,7 @@ class PageExtraction(BaseModel):
     has_new_document_section: bool = Field(description="Whether page starts new hospital/LOB section")
     metadata: Optional[DocumentMetadata] = Field(default=None, description="Document metadata if new section")
     service_sections: List[ServiceSection] = Field(description="All Place of Service sections found on this page")
-    continuation_codes: Optional[str] = Field(default=None, description="Billing codes that continue from previous page")
+    is_continuation: bool = Field(default=False, description="Whether this continues tables from previous page")
 
 class DocumentContext:
     """Tracks document-level context across pages."""
@@ -72,7 +72,6 @@ class DocumentContext:
         self.current_effective_date = None
         self.current_hospital_names = []
         self.current_lob = None
-        self.last_incomplete_row = None  # Track row that might continue to next page
         
     def update_context(self, metadata: DocumentMetadata):
         """Update context with new metadata."""
@@ -85,7 +84,7 @@ class DocumentContext:
                 self.current_lob = metadata.lob_type
 
 class HospitalRateExtractor:
-    """Main extractor class with simple continuation handling."""
+    """Main extractor class with improved multi-section detection."""
     
     def __init__(self, client, output_dir: str = None):
         self.client = client
@@ -105,8 +104,8 @@ class HospitalRateExtractor:
             writer = csv.writer(csvfile)
             writer.writerow(self.csv_columns)
     
-    def create_extraction_prompt(self) -> tuple:
-        """Create prompt for extracting data with continuation awareness."""
+    def create_multi_section_prompt(self) -> tuple:
+        """Create prompt for extracting ALL sections from a page."""
         base_parser = PydanticOutputParser(pydantic_object=PageExtraction)
         
         class GeminiLLM:
@@ -127,41 +126,75 @@ class HospitalRateExtractor:
         parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
         
         template = """
-You are an expert at extracting ALL structured data from hospital rate schedules.
+You are an expert at extracting ALL structured data from hospital rate schedule documents.
+
+CRITICAL: This must work for ANY hospital PDF, not just specific examples!
 
 STEP 1 - DETECT NEW DOCUMENT SECTION:
-Look for NEW MAIN DOCUMENT HEADER with hospital names like:
-- "Sistersville General Hospital"
-- "Marietta Memorial and Selby General Hospital"
-NEVER extract random text like "MHS REFERENCE LAB" - only real hospital names from main headers.
+Look for a NEW MAIN DOCUMENT HEADER/TITLE (large, centered text in the middle of the page).
+
+HOSPITAL NAME EXTRACTION - VERY IMPORTANT:
+- ALWAYS IGNORE the top right corner first line completely
+- Look at the MAIN CENTERED HEADER and extract ANY organization names that could be hospitals
+- Be VERY LIBERAL in extraction - if you see ANY proper names in the main header, extract them
+- Don't be too strict about requiring "Hospital" or "Medical Center" - many facilities have different naming patterns
+
+EXTRACTION RULES:
+1. Extract ALL proper names/organization names from the main header
+2. Include names even if they don't have obvious hospital words
+3. Look for patterns like:
+   - Any organization name + location (e.g., "Springfield Regional", "Metro Health")
+   - Names with acronyms or abbreviations
+   - Names that appear to be facility identifiers
+   - Multiple names listed together
+   - Names with TIN numbers or other identifiers
+
+EXAMPLES of what to extract from main headers:
+- Traditional: "General Hospital", "Medical Center", "Healthcare System"
+- Non-traditional: "Springfield Regional", "Metro Health", "Community Care"
+- Multiple: "Hospital A and Hospital B"
+- With identifiers: "Facility Name TIN 123456789"
+- Abbreviated: "SMH", "RMC", "CCH"
+
+BE AGGRESSIVE: If you see ANY organization name in the main header that could possibly be a healthcare facility, extract it. It's better to over-extract than miss hospital names.
 
 STEP 2 - EXTRACT METADATA (only if NEW MAIN HEADER detected):
-- Hospital Names: Only from main document title
-- Effective Date: Date ranges in header
-- LOB Type: Business line from header
+Extract BOTH hospital names AND LOB from the SAME main header:
 
-STEP 3 - CHECK FOR CONTINUATION CODES:
-Look at the TOP of the page for billing codes that continue from previous page.
-These appear as codes without a service name, like:
-"A9536, A9537, A9538, A9539, A9540, A9541, A9542, A9546, A9547, A9548, A9550, A9551..."
+- Hospital Names: Extract ALL hospital/facility names from the main header
+- LOB Type: Extract business line from the SAME main header:
+  * Look for "COMMERCIAL" → "Commercial"
+  * Look for "MEDICARE" → "Medicare" 
+  * Look for "MEDICAID" → "Medicaid"
+  * Look for "GATEKEEPER" or "NON-GATEKEEPER" → "Commercial"
+  * Look for "HMO" → "HMO"
+  * Look for "PPO" → "PPO"
+- Effective Date: Extract any dates from the main header area
 
-If you see such codes, extract them as continuation_codes.
+IMPORTANT: Both hospital names AND LOB come from the main centered header, not from different locations.
 
-STEP 4 - EXTRACT ALL COMPLETE TABLE ROWS:
-For each Place of Service section, extract ALL complete rows:
+STEP 3 - IDENTIFY ALL PLACE OF SERVICE SECTIONS:
+Find ALL section headers on the page:
+- "INPATIENT RATES:" → "INPATIENT"
+- "OUTPATIENT RATES:" → "OUTPATIENT"
+- "INPATIENT CARVE OUT RATES:" → "INPATIENT CARVE OUT"
+- "OUTPATIENT CARVE OUT RATES:" → "OUTPATIENT CARVE OUT"
+
+STEP 4 - EXTRACT EVERY SINGLE TABLE ROW:
+For each Place of Service section, extract ALL rows:
 - service: Exact text from Service column
-- billing_codes: Complete text from Billing Codes column
+- billing_codes: Complete text from Billing Codes column  
 - rates: Complete text from Rates column
 
 CRITICAL RULES:
-- Extract EVERY row you can see
-- Copy text exactly as it appears
-- If billing codes continue to next page, that's fine - just extract what's on this page
-- Don't miss any complete rows
+1. IGNORE top right corner completely - never extract hospital names from there
+2. Extract EVERY row from EVERY table
+3. Only look at main centered document headers for hospital names
+4. Copy all text exactly as it appears in tables
 
 {format_instructions}
 
-Extract all data from this page:
+Extract all data from this page (remember: ignore top right corner):
 """
         
         prompt = PromptTemplate(
@@ -173,7 +206,7 @@ Extract all data from this page:
         return prompt, parser
     
     def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
-        """Process a single page with simple continuation handling."""
+        """Process a single page extracting ALL sections."""
         print(f"Processing page {page_num}: {Path(image_path).name}")
         
         try:
@@ -182,7 +215,8 @@ Extract all data from this page:
             
             mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
             
-            prompt, parser = self.create_extraction_prompt()
+            # Extract ALL sections using AI with error checking
+            prompt, parser = self.create_multi_section_prompt()
             prompt_text = prompt.format()
             
             response = self.client.models.generate_content(
@@ -193,71 +227,100 @@ Extract all data from this page:
                 ]
             )
             
+            print(f"Raw AI response for page {page_num}:")
+            print(response.text[:500] + "..." if len(response.text) > 500 else response.text)
+            
             parsed_data = parser.parse(response.text.strip())
             
-            # Handle continuation codes
-            if parsed_data.continuation_codes and self.context.last_incomplete_row:
-                print(f"  Found continuation codes: {parsed_data.continuation_codes[:100]}...")
-                # Merge with previous incomplete row
-                self.context.last_incomplete_row['billing_codes'] += " " + parsed_data.continuation_codes
-                # Save the completed row
-                self.save_single_row(self.context.last_incomplete_row)
-                self.context.last_incomplete_row = None
-                print(f"  Merged continuation with previous row")
-            
-            # Update context if new document section
+            # Update context ONLY if new document section with valid hospital names
             if parsed_data.has_new_document_section and parsed_data.metadata:
-                # Simple hospital name validation
+                # More aggressive hospital name validation - accept more names
                 if parsed_data.metadata.hospital_names:
                     valid_hospitals = []
                     for hospital in parsed_data.metadata.hospital_names:
-                        hospital_lower = hospital.lower()
-                        if not any(invalid in hospital_lower for invalid in ['reference lab', 'lab', 'mhs']):
-                            if any(valid in hospital_lower for valid in ['hospital', 'medical center', 'general']):
-                                valid_hospitals.append(hospital)
+                        hospital_clean = hospital.strip()
+                        hospital_lower = hospital_clean.lower()
+                        
+                        # Only reject obvious non-hospital terms
+                        obvious_rejects = [
+                            'reference lab', 'billing', 'admin', 'department',
+                            'page', 'document', 'schedule', 'rate', 'service'
+                        ]
+                        
+                        is_obvious_reject = any(reject in hospital_lower for reject in obvious_rejects)
+                        
+                        # Accept if it's not an obvious reject and has reasonable length
+                        if not is_obvious_reject and len(hospital_clean) >= 3:
+                            # Additional check - if it has any healthcare-related terms, definitely include
+                            healthcare_terms = [
+                                'hospital', 'medical', 'health', 'clinic', 'care',
+                                'memorial', 'general', 'regional', 'center', 'system',
+                                'university', 'community', 'metro', 'county'
+                            ]
+                            
+                            has_healthcare_term = any(term in hospital_lower for term in healthcare_terms)
+                            
+                            # Be very liberal - accept if has healthcare term OR if it's a proper name-looking string
+                            if has_healthcare_term or (len(hospital_clean) > 5 and hospital_clean[0].isupper()):
+                                valid_hospitals.append(hospital_clean)
                     
                     if valid_hospitals:
-                        parsed_data.metadata.hospital_names = valid_hospitals
-                        self.context.update_context(parsed_data.metadata)
-                        print(f"New section - Hospitals: {self.context.current_hospital_names}")
+                        old_metadata = parsed_data.metadata
+                        old_metadata.hospital_names = valid_hospitals
+                        self.context.update_context(old_metadata)
+                        print(f"New section detected - Hospitals: {self.context.current_hospital_names}, LOB: {self.context.current_lob}")
+                    else:
+                        print(f"No valid hospitals found in extraction '{parsed_data.metadata.hospital_names}', keeping current context: {self.context.current_hospital_names}")
+                else:
+                    # Update other metadata but keep existing hospital names
+                    if parsed_data.metadata.lob_type:
+                        self.context.current_lob = parsed_data.metadata.lob_type
+                    if parsed_data.metadata.effective_date:
+                        self.context.current_effective_date = parsed_data.metadata.effective_date
             
-            # Process all service sections
+            # Process ALL service sections with detailed logging
             total_rows_added = 0
             sections_processed = []
             
-            for section in parsed_data.service_sections:
-                for row in section.service_rows:
-                    # Check if this row might continue to next page (very long billing codes)
-                    billing_codes = row.get('billing_codes', '')
-                    if len(billing_codes) > 300 and billing_codes.rstrip().endswith(','):
-                        print(f"  Row might continue to next page: {row.get('service', 'Unknown')}")
-                        self.context.last_incomplete_row = {
-                            'service': row.get('service', ''),
-                            'billing_codes': billing_codes,
-                            'rates': row.get('rates', ''),
-                            'place_of_service': section.place_of_service
-                        }
-                    else:
-                        # Complete row - save it
-                        self.save_single_row({
-                            'service': row.get('service', ''),
-                            'billing_codes': billing_codes,
-                            'rates': row.get('rates', ''),
-                            'place_of_service': section.place_of_service
-                        })
-                        total_rows_added += 1
+            if not parsed_data.service_sections:
+                print(f"  CRITICAL ERROR: No service sections found on page {page_num}")
+                print(f"  This indicates the AI failed to extract the table data!")
+            else:
+                print(f"  Found {len(parsed_data.service_sections)} service sections")
+            
+            for i, section in enumerate(parsed_data.service_sections):
+                print(f"  Processing section {i+1}: {section.place_of_service}")
                 
+                if not section.service_rows:
+                    print(f"    CRITICAL ERROR: Section has 0 rows - this is likely wrong!")
+                else:
+                    print(f"    Found {len(section.service_rows)} rows")
+                
+                # Log ALL rows for verification
+                for j, row in enumerate(section.service_rows):
+                    service_text = row.get('service', 'MISSING')
+                    billing_text = row.get('billing_codes', 'MISSING')
+                    rates_text = row.get('rates', 'MISSING')
+                    
+                    print(f"    Row {j+1}:")
+                    print(f"      Service: '{service_text}'")
+                    print(f"      Billing: '{billing_text[:100]}{'...' if len(billing_text) > 100 else ''}'")
+                    print(f"      Rates: '{rates_text}'")
+                
+                rows_added = self.save_section_data(section)
+                total_rows_added += rows_added
                 sections_processed.append({
                     'place_of_service': section.place_of_service,
-                    'rows_added': len(section.service_rows)
+                    'rows_added': rows_added
                 })
-                print(f"  - {section.place_of_service}: {len(section.service_rows)} rows")
+                print(f"  - {section.place_of_service}: {rows_added} rows added to CSV")
             
             return {
                 'page_num': page_num,
                 'has_new_section': parsed_data.has_new_document_section,
                 'sections_found': [s['place_of_service'] for s in sections_processed],
                 'total_rows_added': total_rows_added,
+                'sections_detail': sections_processed,
                 'current_context': {
                     'hospitals': self.context.current_hospital_names,
                     'lob': self.context.current_lob,
@@ -270,36 +333,50 @@ Extract all data from this page:
             return {
                 'page_num': page_num,
                 'error': str(e),
-                'total_rows_added': 0
+                'total_rows_added': 0,
+                'sections_found': []
             }
     
-    def save_single_row(self, row_data: Dict[str, str]) -> None:
-        """Save a single row to CSV."""
-        csv_row = [
-            '; '.join(self.context.current_hospital_names) if self.context.current_hospital_names else 'N/A',
-            self.context.current_lob or 'N/A',
-            row_data.get('place_of_service', 'N/A'),
-            row_data.get('service', 'N/A'),
-            row_data.get('billing_codes', 'N/A'),
-            row_data.get('rates', 'N/A'),
-            self.context.current_effective_date or 'N/A'
-        ]
+    def save_section_data(self, section: ServiceSection) -> int:
+        """Save extracted section data to CSV exactly as extracted."""
+        if not section.service_rows:
+            return 0
+            
+        rows_to_write = []
         
+        for row_data in section.service_rows:
+            csv_row = [
+                '; '.join(self.context.current_hospital_names) if self.context.current_hospital_names else 'N/A',
+                self.context.current_lob or 'N/A',
+                section.place_of_service,
+                row_data.get('service', 'N/A'),
+                row_data.get('billing_codes', 'N/A'),
+                row_data.get('rates', 'N/A'),
+                self.context.current_effective_date or 'N/A'
+            ]
+            rows_to_write.append(csv_row)
+        
+        # Append to main CSV
         with open(self.csv_path, 'a', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(csv_row)
+            writer.writerows(rows_to_write)
+        
+        return len(rows_to_write)
     
     def extract_from_pdf(self, pdf_path: str, dpi: int = 300) -> Dict[str, Any]:
-        """Extract all data from PDF."""
+        """Extract all data from PDF with multi-section awareness."""
         print(f"Starting extraction for: {pdf_path}")
         
+        # Convert PDF to images
         image_paths = pdf_to_images(pdf_path, self.output_dir, dpi, 'png')
         
+        # Process each page
         results = {
             'pdf_path': pdf_path,
             'total_pages': len(image_paths),
             'pages_processed': [],
             'total_rows_extracted': 0,
+            'sections_summary': {},
             'csv_file': str(self.csv_path)
         }
         
@@ -307,22 +384,71 @@ Extract all data from this page:
             page_result = self.process_page(image_path, page_num)
             results['pages_processed'].append(page_result)
             results['total_rows_extracted'] += page_result.get('total_rows_added', 0)
+            
+            # Track sections found
+            for section in page_result.get('sections_found', []):
+                if section not in results['sections_summary']:
+                    results['sections_summary'][section] = 0
+                results['sections_summary'][section] += 1
         
+        # Summary
         print(f"\n=== EXTRACTION COMPLETE ===")
         print(f"Total pages processed: {results['total_pages']}")
         print(f"Total rows extracted: {results['total_rows_extracted']}")
+        print(f"Sections found: {results['sections_summary']}")
         print(f"Output CSV: {results['csv_file']}")
         
         return results
 
-# Usage
+# Usage example
 if __name__ == "__main__":
-    pdf_file = "path/to/your/hospital_rates.pdf"
+    # Example usage
+    pdf_file = "path/to/your/hospital_rates.pdf"  # Replace with your PDF file path
     
+    # Initialize Google AI client
     from google import genai
     client = genai.Client(vertexai=True, project="your-project", location="us-central1")
     
+    # Create extractor and process PDF
     extractor = HospitalRateExtractor(client, output_dir="extracted_data")
     results = extractor.extract_from_pdf(pdf_file)
     
     print("Extraction completed successfully!")
+
+# Alternative usage with specific parameters
+def extract_hospital_rates(pdf_path: str, project_id: str, location: str = "us-central1", 
+                          output_dir: str = "extracted_data", dpi: int = 300):
+    """
+    Main function to extract hospital rates from PDF.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        project_id: Google Cloud project ID
+        location: Google Cloud location
+        output_dir: Directory to save extracted data
+        dpi: Image resolution for PDF conversion
+    
+    Returns:
+        Dictionary with extraction results
+    """
+    try:
+        # Initialize client
+        from google import genai
+        client = genai.Client(vertexai=True, project=project_id, location=location)
+        
+        # Create extractor
+        extractor = HospitalRateExtractor(client, output_dir=output_dir)
+        
+        # Extract data
+        results = extractor.extract_from_pdf(pdf_path, dpi=dpi)
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error in extraction: {e}")
+        return None
+
+# Simple usage function
+def simple_extract(pdf_path: str, project_id: str):
+    """Simple extraction function with default parameters."""
+    return extract_hospital_rates(pdf_path, project_id)
