@@ -1,15 +1,19 @@
 import fitz  # PyMuPDF
 import os
 import csv
+import json
+import uuid
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Union, Dict, Any
 from google.genai import types
 import google.genai as genai
 from langchain.prompts import PromptTemplate
 from langchain.output_parsers import PydanticOutputParser, OutputFixingParser
+from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, Field
+import pandas as pd
 
-def pdf_to_images(pdf_path, output_dir=None, dpi=300, image_format='png'):
+def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
     """Convert each page of a PDF to individual images."""
     pdf_path = Path(pdf_path)
     
@@ -44,57 +48,67 @@ def pdf_to_images(pdf_path, output_dir=None, dpi=300, image_format='png'):
     doc.close()
     return image_paths
 
-class PageData(BaseModel):
-    """Data structure for extracted page information."""
-    has_new_main_header: bool = Field(description="Whether page has a new main document header")
-    hospital_names: Optional[List[str]] = Field(default=None, description="Hospital names from main header")
-    lob_type: Optional[str] = Field(default=None, description="Line of Business type from main header")
+class PageAnalysis(BaseModel):
+    """Analysis of page content with clear hierarchy detection."""
     effective_date: Optional[str] = Field(default=None, description="Effective date from top right corner")
-    place_of_service: Optional[str] = Field(default=None, description="Current place of service section")
-    table_rows: List[Dict[str, str]] = Field(description="Table rows with service, billing_codes, rates")
+    
+    # Main header detection
+    has_new_main_header: bool = Field(description="Whether page has new main document header in center")
+    hospital_names: Optional[List[str]] = Field(default=None, description="Hospital names from main centered header")
+    lob_type: Optional[str] = Field(default=None, description="Line of Business from main header")
+    
+    # Place of service detection
+    current_place_of_service: Optional[str] = Field(default=None, description="Current place of service section")
+    
+    # Table data
+    table_rows: List[Dict[str, str]] = Field(description="All table rows with service, billing_codes, rates")
 
-class DocumentContext:
-    """Tracks current document state across pages."""
+class DocumentState:
+    """Maintains document state across pages."""
     def __init__(self):
-        self.current_hospitals = []
+        self.effective_date = None
+        self.current_hospital_names = []
         self.current_lob = None
         self.current_place_of_service = None
-        self.effective_date = None
         
-    def update_from_page(self, page_data: PageData):
-        """Update context based on page data."""
-        if page_data.has_new_main_header and page_data.hospital_names:
-            self.current_hospitals = page_data.hospital_names
-        if page_data.lob_type:
-            self.current_lob = page_data.lob_type
-        if page_data.place_of_service:
-            self.current_place_of_service = page_data.place_of_service
-        if page_data.effective_date:
-            self.effective_date = page_data.effective_date
+    def update_effective_date(self, date: str):
+        if date and date != "N/A":
+            self.effective_date = date
+            
+    def update_main_header(self, hospital_names: List[str], lob: str):
+        if hospital_names:
+            self.current_hospital_names = hospital_names
+        if lob and lob != "N/A":
+            self.current_lob = lob
+            
+    def update_place_of_service(self, place_of_service: str):
+        if place_of_service and place_of_service != "N/A":
+            self.current_place_of_service = place_of_service
 
 class HospitalRateExtractor:
-    """Main extractor class for hospital rate schedules."""
+    """Customized extractor for hospital rate schedules."""
     
     def __init__(self, client, output_dir: str = None):
         self.client = client
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.context = DocumentContext()
+        self.state = DocumentState()
         
-        # CSV setup
+        # CSV columns
         self.csv_columns = [
             'Hospital_Names', 'LOB', 'Place_of_Service', 'Service_Category', 
             'Billing_Codes', 'Rates', 'Effective_Date'
         ]
         
+        # Initialize CSV file
         self.csv_path = self.output_dir / "hospital_rates_extracted.csv"
         with open(self.csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(self.csv_columns)
     
     def create_extraction_prompt(self) -> tuple:
-        """Create prompt for page data extraction."""
-        base_parser = PydanticOutputParser(pydantic_object=PageData)
+        """Create prompt for page analysis and extraction."""
+        base_parser = PydanticOutputParser(pydantic_object=PageAnalysis)
         
         class GeminiLLM:
             def __init__(self, client):
@@ -114,49 +128,48 @@ class HospitalRateExtractor:
         parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
         
         template = """
-You are an expert at extracting hospital rate schedule data. Follow these EXACT rules:
+You are an expert at analyzing hospital rate schedule documents with strict hierarchy detection.
 
-STEP 1 - CHECK FOR NEW MAIN HEADER:
-Look for a large, centered document title that contains hospital names like:
-- "Sistersville General Hospital"
-- "Mercy Springfield and Urbana Hospitals"
-- "Advocate Condell Medical Center and Advocate Sherman Hospital"
+CRITICAL INSTRUCTIONS:
 
-If you find this, set has_new_main_header: true and extract:
-- hospital_names: ALL hospital names from this main title (as a list)
-- lob_type: Look for LOB indicators like "COMMERCIAL", "MEDICARE", "MEDICAID"
+1. EFFECTIVE DATE EXTRACTION:
+   - Look ONLY in the top right corner for "Effective Date:" followed by a date
+   - Extract the complete date (e.g., "09/01/2024", "06/01/2025", "6/1/2025 through 5/31/2026")
+   - IGNORE all other text in the top right corner
 
-STEP 2 - EXTRACT EFFECTIVE DATE ONLY:
-Look at TOP RIGHT CORNER and ONLY extract the effective date
-- IGNORE the system name (like "Mercy Health", "Memorial Health System")
-- ONLY extract: "Effective Date: MM/DD/YYYY" or similar date format
-- IGNORE everything else in the top right corner
+2. MAIN HEADER DETECTION:
+   - Look for LARGE CENTERED TEXT that contains hospital names
+   - Examples: "Sistersville General Hospital", "Mercy Springfield and Urbana Hospitals"
+   - These appear as document titles, not in corners or footers
+   - If found, extract hospital names and LOB type from this main header
+   - LOB examples: "COMMERCIAL", "MEDICARE", "MEDICAID", "ACOP COMMERCIAL"
 
-STEP 3 - IDENTIFY PLACE OF SERVICE:
-Look for section headers like:
-- "INPATIENT RATES"
-- "OUTPATIENT RATES" 
-- "INPATIENT CARVE OUT RATES"
-- "OUTPATIENT CARVE OUT RATES"
+3. PLACE OF SERVICE DETECTION:
+   - Look for section headers like:
+     * "INPATIENT RATES:" → "INPATIENT"
+     * "OUTPATIENT RATES:" → "OUTPATIENT"
+     * "INPATIENT CARVE OUT RATES:" → "INPATIENT CARVE OUT"
+     * "OUTPATIENT CARVE OUT RATES:" → "OUTPATIENT CARVE OUT"
+   - Extract the current place of service for this page
 
-Extract as: "INPATIENT", "OUTPATIENT", "INPATIENT CARVE OUT", "OUTPATIENT CARVE OUT"
+4. TABLE DATA EXTRACTION:
+   - Extract ALL rows from tables under the current place of service
+   - For each row extract:
+     * service: Service name/description (first column)
+     * billing_codes: Complete billing codes (second column)
+     * rates: Complete rate information (third column)
+   - Count rows visually and ensure you extract ALL of them
+   - DO NOT miss any rows
 
-STEP 4 - EXTRACT TABLE DATA:
-For each table row, extract exactly as shown:
-- service: Service description
-- billing_codes: Billing codes/ranges
-- rates: Rate amounts and descriptions
-
-CRITICAL RULES:
-- Hospital names come ONLY from main document headers, NEVER from top right corner
-- From top right corner, extract ONLY the effective date, ignore system names
-- Extract text exactly as it appears
-- If no new header/section found, set fields to null
-- Extract ALL visible table rows
+VALIDATION CHECKLIST:
+- Did I find the effective date in top right corner?
+- Did I detect any new main headers with hospital names?
+- Did I identify the current place of service section?
+- Did I extract every single table row I can see?
 
 {format_instructions}
 
-Extract data from this page:
+Analyze this page and extract all information:
 """
         
         prompt = PromptTemplate(
@@ -168,7 +181,7 @@ Extract data from this page:
         return prompt, parser
     
     def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
-        """Process a single page and extract data."""
+        """Process a single page with state management."""
         print(f"Processing page {page_num}: {Path(image_path).name}")
         
         try:
@@ -177,6 +190,7 @@ Extract data from this page:
             
             mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
             
+            # Extract page content
             prompt, parser = self.create_extraction_prompt()
             prompt_text = prompt.format()
             
@@ -188,40 +202,48 @@ Extract data from this page:
                 ]
             )
             
-            page_data = parser.parse(response.text.strip())
+            parsed_data = parser.parse(response.text.strip())
             
-            # Update context with new information
-            self.context.update_from_page(page_data)
+            # Update document state
+            if parsed_data.effective_date:
+                self.state.update_effective_date(parsed_data.effective_date)
+                print(f"  Effective Date: {parsed_data.effective_date}")
             
-            # Save table rows to CSV
-            rows_saved = 0
-            for row in page_data.table_rows:
-                self.save_row_to_csv(row)
-                rows_saved += 1
+            if parsed_data.has_new_main_header:
+                self.state.update_main_header(
+                    parsed_data.hospital_names or [], 
+                    parsed_data.lob_type or ""
+                )
+                print(f"  New Main Header - Hospitals: {self.state.current_hospital_names}")
+                print(f"  LOB: {self.state.current_lob}")
             
-            # Log findings
-            if page_data.has_new_main_header:
-                print(f"  New main header found")
-                print(f"  Hospitals: {page_data.hospital_names}")
-                print(f"  LOB: {page_data.lob_type}")
+            if parsed_data.current_place_of_service:
+                self.state.update_place_of_service(parsed_data.current_place_of_service)
+                print(f"  Place of Service: {self.state.current_place_of_service}")
             
-            if page_data.place_of_service:
-                print(f"  Place of Service: {page_data.place_of_service}")
-            
-            if page_data.effective_date:
-                print(f"  Effective Date: {page_data.effective_date}")
-            
-            print(f"  Rows extracted: {rows_saved}")
+            # Process table data
+            rows_added = 0
+            if parsed_data.table_rows:
+                rows_added = self.save_table_data(parsed_data.table_rows)
+                print(f"  Extracted {rows_added} table rows")
+                
+                # Log first few rows for verification
+                for i, row in enumerate(parsed_data.table_rows[:3]):
+                    print(f"    Row {i+1}: {row.get('service', 'N/A')[:50]}...")
+            else:
+                print(f"  No table data found")
             
             return {
                 'page_num': page_num,
-                'has_new_header': page_data.has_new_main_header,
-                'rows_extracted': rows_saved,
-                'current_context': {
-                    'hospitals': self.context.current_hospitals,
-                    'lob': self.context.current_lob,
-                    'place_of_service': self.context.current_place_of_service,
-                    'effective_date': self.context.effective_date
+                'effective_date_found': bool(parsed_data.effective_date),
+                'new_main_header': parsed_data.has_new_main_header,
+                'place_of_service_updated': bool(parsed_data.current_place_of_service),
+                'rows_extracted': rows_added,
+                'current_state': {
+                    'hospitals': self.state.current_hospital_names,
+                    'lob': self.state.current_lob,
+                    'place_of_service': self.state.current_place_of_service,
+                    'effective_date': self.state.effective_date
                 }
             }
             
@@ -233,33 +255,46 @@ Extract data from this page:
                 'rows_extracted': 0
             }
     
-    def save_row_to_csv(self, row_data: Dict[str, str]):
-        """Save a single row to the CSV file."""
-        csv_row = [
-            '; '.join(self.context.current_hospitals) if self.context.current_hospitals else 'N/A',
-            self.context.current_lob or 'N/A',
-            self.context.current_place_of_service or 'N/A',
-            row_data.get('service', 'N/A'),
-            row_data.get('billing_codes', 'N/A'),
-            row_data.get('rates', 'N/A'),
-            self.context.effective_date or 'N/A'
-        ]
+    def save_table_data(self, table_rows: List[Dict[str, str]]) -> int:
+        """Save table data to CSV with current document state."""
+        if not table_rows:
+            return 0
+            
+        rows_to_write = []
         
+        for row_data in table_rows:
+            csv_row = [
+                '; '.join(self.state.current_hospital_names) if self.state.current_hospital_names else 'N/A',
+                self.state.current_lob or 'N/A',
+                self.state.current_place_of_service or 'N/A',
+                row_data.get('service', 'N/A'),
+                row_data.get('billing_codes', 'N/A'),
+                row_data.get('rates', 'N/A'),
+                self.state.effective_date or 'N/A'
+            ]
+            rows_to_write.append(csv_row)
+        
+        # Append to CSV
         with open(self.csv_path, 'a', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(csv_row)
+            writer.writerows(rows_to_write)
+        
+        return len(rows_to_write)
     
     def extract_from_pdf(self, pdf_path: str, dpi: int = 300) -> Dict[str, Any]:
-        """Extract all data from PDF following the hierarchical structure."""
+        """Extract all data from PDF with state management."""
         print(f"Starting extraction for: {pdf_path}")
         
+        # Convert PDF to images
         image_paths = pdf_to_images(pdf_path, self.output_dir, dpi, 'png')
         
+        # Process each page
         results = {
             'pdf_path': pdf_path,
             'total_pages': len(image_paths),
             'pages_processed': [],
             'total_rows_extracted': 0,
+            'final_state': {},
             'csv_file': str(self.csv_path)
         }
         
@@ -268,19 +303,36 @@ Extract data from this page:
             results['pages_processed'].append(page_result)
             results['total_rows_extracted'] += page_result.get('rows_extracted', 0)
         
-        print(f"\n=== EXTRACTION COMPLETE ===")
+        # Final state
+        results['final_state'] = {
+            'hospitals': self.state.current_hospital_names,
+            'lob': self.state.current_lob,
+            'place_of_service': self.state.current_place_of_service,
+            'effective_date': self.state.effective_date
+        }
+        
+        # Summary
+        print(f"\n=== EXTRACTION SUMMARY ===")
         print(f"Total pages: {results['total_pages']}")
         print(f"Total rows extracted: {results['total_rows_extracted']}")
-        print(f"Output CSV: {results['csv_file']}")
+        print(f"Final hospitals: {self.state.current_hospital_names}")
+        print(f"Final LOB: {self.state.current_lob}")
+        print(f"Effective date: {self.state.effective_date}")
+        print(f"CSV file: {results['csv_file']}")
         
         return results
 
 # Usage
 if __name__ == "__main__":
-    pdf_file = "path/to/your/hospital_rates.pdf"
-    
+    # Initialize Google AI client
     from google import genai
-    client = genai.Client(vertexai=True, project="your-project", location="us-central1")
+    client = genai.Client(vertexai=True, project="your-project-id", location="us-central1")
     
+    # Create extractor
     extractor = HospitalRateExtractor(client, output_dir="extracted_data")
+    
+    # Process PDF
+    pdf_file = "path/to/your/hospital_rates.pdf"
     results = extractor.extract_from_pdf(pdf_file)
+    
+    print("Extraction completed!")
