@@ -126,9 +126,11 @@ If you find this, set has_new_main_header: true and extract:
 - hospital_names: ALL hospital names from this main title (as a list)
 - lob_type: Look for LOB indicators like "COMMERCIAL", "MEDICARE", "MEDICAID"
 
-STEP 2 - EXTRACT EFFECTIVE DATE:
-Look at TOP RIGHT CORNER for effective date (ignore everything else in corner)
-Format: "Effective Date: MM/DD/YYYY" or similar
+STEP 2 - EXTRACT EFFECTIVE DATE ONLY:
+Look at TOP RIGHT CORNER and ONLY extract the effective date
+- IGNORE the system name (like "Mercy Health", "Memorial Health System")
+- ONLY extract: "Effective Date: MM/DD/YYYY" or similar date format
+- IGNORE everything else in the top right corner
 
 STEP 3 - IDENTIFY PLACE OF SERVICE:
 Look for section headers like:
@@ -146,8 +148,9 @@ For each table row, extract exactly as shown:
 - rates: Rate amounts and descriptions
 
 CRITICAL RULES:
+- Hospital names come ONLY from main document headers, NEVER from top right corner
+- From top right corner, extract ONLY the effective date, ignore system names
 - Extract text exactly as it appears
-- Don't interpret or modify the content
 - If no new header/section found, set fields to null
 - Extract ALL visible table rows
 
