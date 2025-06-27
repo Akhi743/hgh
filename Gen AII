@@ -74,30 +74,32 @@ class HospitalExtractor:
         fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=llm_wrapper)
         
         template = """
-Extract data from this hospital rate schedule page following these EXACT rules:
+Extract data from this hospital rate schedule page following these rules:
 
-1. EFFECTIVE DATE: Look ONLY in top right corner below any system name. Extract just the date, ignore everything else in corners.
+1. EFFECTIVE DATE: Look in top right corner for any date. Ignore system/corporation names in corners.
 
-2. HOSPITAL NAMES: Look ONLY in the CENTER main header (not corners). Extract actual hospital names from the centered main title.
+2. HOSPITAL NAMES: Look for LARGE CENTERED MAIN TITLE that contains actual hospital facility names.
+   - Extract names that contain words like: Hospital, Medical Center, General, Regional, Memorial
+   - IGNORE system/corporation names like: "Health System", "Health Corporation", "Health And Hospital Corporation"
+   - Only extract if you find a centered main header with actual facility names
 
-3. LOB: Extract Line of Business from the CENTER main header (COMMERCIAL, MEDICARE, etc.)
+3. LOB: Extract Line of Business from main centered header (COMMERCIAL, MEDICARE, MEDICAID, etc.)
 
-4. PLACE OF SERVICE: Find section headers like:
-   - INPATIENT RATES
-   - OUTPATIENT RATES  
-   - INPATIENT CARVE OUT RATES
-   - OUTPATIENT CARVE OUT RATES
+4. PLACE OF SERVICE: Find section headers indicating service type:
+   - Look for: INPATIENT, OUTPATIENT, CARVE OUT variations
+   - Extract the current section type
 
-5. TABLE ROWS: Extract ALL table rows with:
-   - service: Service name/category
-   - billing_codes: Billing codes
-   - rates: Rate information
+5. TABLE ROWS: Extract ALL visible table rows with:
+   - service: Service name/description
+   - billing_codes: Any billing codes, code ranges, or code types
+   - rates: Rate amounts, percentages, or rate descriptions
 
-IMPORTANT: 
-- Only extract hospital names from CENTER main header, NOT from corners
-- Only extract effective date from top right corner
+RULES:
+- Only extract hospital names from centered main headers, never from corners
+- Only extract effective date from corners
 - If no new main header found, return empty hospital_names and lob
-- If no new place of service found, return empty place_of_service
+- If no new place of service section found, return empty place_of_service
+- Extract all table data visible on the page
 
 {format_instructions}
 """
