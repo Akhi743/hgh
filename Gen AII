@@ -195,6 +195,12 @@ IMPORTANT:
 if __name__ == "__main__":
     from google import genai
     
+    # Initialize client with your project details
     client = genai.Client(vertexai=True, project="your-project-id", location="us-central1")
-    extractor = HospitalExtractor(client)
-    results = extractor.extract_pdf("your_file.pdf")
+    
+    # Create extractor
+    extractor = HospitalExtractor(client, output_dir="extracted_data")
+    
+    # Process your PDF file - UPDATE THIS PATH
+    pdf_file_path = r"C:\path\to\your\hospital_rates.pdf"
+    results = extractor.extract_pdf(pdf_file_path)
