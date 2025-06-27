@@ -133,52 +133,44 @@ class HospitalRateExtractor:
         template = """
 You are an expert at extracting ALL structured data from hospital rate schedule documents.
 
-CRITICAL CONTEXT RULES:
-1. Hospital names should ONLY change when you see a NEW MAIN DOCUMENT HEADER
-2. Place of Service should ONLY change when you see a NEW section header
-3. Be VERY conservative about detecting "new sections" - most pages are continuations
+STEP 1 - DETECT NEW DOCUMENT SECTION:
+Look for NEW MAIN DOCUMENT HEADER/TITLE (large, centered text in the middle of the page).
+- ALWAYS IGNORE top right corner text completely
+- Look for main document headers with hospital names
+- Extract hospital names from main centered headers only
 
-STEP 1 - DETECT NEW DOCUMENT SECTION (BE VERY STRICT):
-Only set has_new_document_section = true if you see:
-- A completely NEW MAIN DOCUMENT HEADER in large, centered text
-- A clear new hospital name that's different from any previous hospital
-- NOT just "Mercy Health" in corner - this is system name, ignore it completely
+STEP 2 - EXTRACT METADATA (if main header found):
+- Hospital Names: Extract ALL hospital/facility names from main header
+  * Include any names with: Hospital, Medical Center, Health Center, Healthcare
+  * Include proper facility names even without these terms
+  * NEVER extract "Mercy Health", "Memorial Health System" etc. from corners
+- LOB Type: Extract from main header (COMMERCIAL, MEDICARE, MEDICAID, etc.)
+- Effective Date: Extract from main header area
 
-HOSPITAL NAME RULES:
-- ALWAYS IGNORE top right corner (system names like "Mercy Health")
-- ONLY extract from NEW main centered headers
-- If you don't see a clear NEW main header, do NOT extract hospital names
-- Most pages are continuations and should NOT have hospital names extracted
+STEP 3 - IDENTIFY PLACE OF SERVICE SECTIONS:
+Look for section headers and extract the EXACT text:
+- "INPATIENT RATES:" → extract as "INPATIENT"
+- "OUTPATIENT RATES:" → extract as "OUTPATIENT"
+- "INPATIENT CARVE OUT RATES:" → extract as "INPATIENT CARVE OUT"
+- "OUTPATIENT CARVE OUT RATES:" → extract as "OUTPATIENT CARVE OUT"
 
-STEP 2 - EXTRACT METADATA (ONLY if genuine NEW MAIN HEADER):
-- Hospital Names: Only from clear new main headers
-- LOB Type: Only from new main headers  
-- Effective Date: Only from new main headers
+CRITICAL: Extract the COMPLETE place of service name including "CARVE OUT" when present.
 
-STEP 3 - PLACE OF SERVICE DETECTION:
-Look for NEW section headers like:
-- "INPATIENT RATES:" → "INPATIENT"
-- "OUTPATIENT RATES:" → "OUTPATIENT"
-- "INPATIENT CARVE OUT RATES:" → "INPATIENT CARVE OUT"
-- "OUTPATIENT CARVE OUT RATES:" → "OUTPATIENT CARVE OUT"
-
-IMPORTANT: If you see tables without these headers, use the CURRENT place of service context.
-
-STEP 4 - EXTRACT TABLE ROWS:
-For each table row:
+STEP 4 - EXTRACT ALL TABLE ROWS:
+For each table, extract ALL rows:
 - service: Exact text from Service column
 - billing_codes: Complete text from Billing Codes column
 - rates: Complete text from Rates column
 
-CRITICAL RULES:
-1. Be VERY conservative about new sections - most pages are continuations
-2. NEVER extract "Mercy Health" or similar system names as hospital names
-3. ONLY extract hospital names from clear new main document headers
-4. If no place of service header visible, assume continuation of current context
+IMPORTANT RULES:
+1. Extract hospital names from main headers (not corners)
+2. Extract COMPLETE place of service names including "CARVE OUT"
+3. Extract ALL table rows
+4. Be thorough and accurate
 
 {format_instructions}
 
-Analyze this page (remember: be conservative about new sections):
+Extract all data from this page:
 """
         
         prompt = PromptTemplate(
@@ -216,94 +208,65 @@ Analyze this page (remember: be conservative about new sections):
             
             parsed_data = parser.parse(response.text.strip())
             
-            # Be MUCH more conservative about new document sections
+            # Hospital name extraction - be more flexible but smart
             if parsed_data.has_new_document_section and parsed_data.metadata:
-                # ONLY update if we have clearly valid NEW hospital names
                 if parsed_data.metadata.hospital_names:
                     valid_hospitals = []
                     for hospital in parsed_data.metadata.hospital_names:
                         hospital_clean = hospital.strip()
                         hospital_lower = hospital_clean.lower()
                         
-                        # REJECT system names and corner text
-                        system_rejects = [
-                            'mercy health', 'memorial health system', 'health system',
-                            'reference lab', 'billing', 'admin', 'department'
-                        ]
+                        # Skip obvious system names but accept real hospital names
+                        skip_terms = ['mercy health', 'memorial health system', 'health system']
+                        is_system_name = hospital_lower in skip_terms
                         
-                        is_system_name = any(reject in hospital_lower for reject in system_rejects)
-                        
-                        # Only accept if it's clearly a hospital facility name
-                        if not is_system_name and len(hospital_clean) > 8:
-                            # Must have clear hospital indicators
-                            hospital_indicators = ['hospital', 'medical center', 'healthcare center']
-                            has_hospital_indicator = any(indicator in hospital_lower for indicator in hospital_indicators)
-                            
-                            if has_hospital_indicator:
-                                valid_hospitals.append(hospital_clean)
+                        # Accept if not a system name and has reasonable length
+                        if not is_system_name and len(hospital_clean) > 3:
+                            valid_hospitals.append(hospital_clean)
                     
-                    # ONLY update if we found valid hospitals AND they're different from current
-                    if valid_hospitals and valid_hospitals != self.context.current_hospital_names:
-                        old_metadata = parsed_data.metadata
-                        old_metadata.hospital_names = valid_hospitals
-                        self.context.update_context(old_metadata)
-                        print(f"NEW HOSPITAL SECTION detected - Hospitals: {self.context.current_hospital_names}, LOB: {self.context.current_lob}")
+                    if valid_hospitals:
+                        self.context.update_context(parsed_data.metadata)
+                        print(f"Hospital names extracted: {self.context.current_hospital_names}")
                     else:
-                        print(f"Keeping existing hospital context: {self.context.current_hospital_names} (rejected: {parsed_data.metadata.hospital_names})")
-                else:
-                    print(f"No hospital names extracted, keeping current context: {self.context.current_hospital_names}")
+                        print(f"Rejected system names: {parsed_data.metadata.hospital_names}")
+                
+                # Always update LOB and effective date if provided
+                if parsed_data.metadata.lob_type:
+                    self.context.current_lob = parsed_data.metadata.lob_type
+                if parsed_data.metadata.effective_date:
+                    self.context.current_effective_date = parsed_data.metadata.effective_date
             
-            # Update Place of Service context
-            for section in parsed_data.service_sections:
-                if section.place_of_service:
-                    # Update context with new place of service
-                    if section.place_of_service != self.context.current_place_of_service:
-                        self.context.update_place_of_service(section.place_of_service)
-                        print(f"Place of Service changed to: {self.context.current_place_of_service}")
-                    break  # Use first section's place of service
-            
-            # If no explicit place of service found, use current context
-            if not parsed_data.service_sections and self.context.current_place_of_service:
-                print(f"No sections found, continuing with place of service: {self.context.current_place_of_service}")
-            
-            # Process ALL service sections with context
+            # Process service sections and update place of service context
             total_rows_added = 0
             sections_processed = []
             
-            if not parsed_data.service_sections:
-                print(f"  No service sections found on page {page_num}")
-            else:
-                print(f"  Found {len(parsed_data.service_sections)} service sections")
-            
             for i, section in enumerate(parsed_data.service_sections):
-                # Use detected place of service or fall back to current context
-                effective_place_of_service = section.place_of_service or self.context.current_place_of_service or "UNKNOWN"
+                # Update place of service context when we see a new section
+                if section.place_of_service:
+                    self.context.update_place_of_service(section.place_of_service)
+                    print(f"Place of service: {self.context.current_place_of_service}")
                 
-                print(f"  Processing section {i+1}: {effective_place_of_service}")
+                # Use current context place of service if section doesn't have one
+                effective_pos = section.place_of_service or self.context.current_place_of_service or "UNKNOWN"
+                section.place_of_service = effective_pos
                 
-                if not section.service_rows:
-                    print(f"    Section has 0 rows")
-                else:
-                    print(f"    Found {len(section.service_rows)} rows")
+                print(f"  Processing section {i+1}: {effective_pos}")
+                print(f"    Found {len(section.service_rows)} rows")
                 
                 # Log sample rows
-                for j, row in enumerate(section.service_rows[:3]):  # Show first 3 rows
+                for j, row in enumerate(section.service_rows[:2]):
                     service_text = row.get('service', 'MISSING')
                     billing_text = row.get('billing_codes', 'MISSING')
                     rates_text = row.get('rates', 'MISSING')
                     
-                    print(f"    Row {j+1}: Service='{service_text}', Billing='{billing_text[:50]}...', Rates='{rates_text[:50]}...'")
-                
-                # Override section's place of service with effective one
-                section.place_of_service = effective_place_of_service
+                    print(f"    Row {j+1}: {service_text} | {billing_text[:30]}... | {rates_text[:30]}...")
                 
                 rows_added = self.save_section_data(section)
                 total_rows_added += rows_added
                 sections_processed.append({
-                    'place_of_service': effective_place_of_service,
+                    'place_of_service': effective_pos,
                     'rows_added': rows_added
                 })
-                print(f"  - {effective_place_of_service}: {rows_added} rows added to CSV")
             
             return {
                 'page_num': page_num,
@@ -404,3 +367,4 @@ if __name__ == "__main__":
     results = extractor.extract_from_pdf(pdf_file)
     
     print("Extraction completed successfully!")
+
