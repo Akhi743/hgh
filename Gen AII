@@ -248,55 +248,65 @@ class SimpleExtractor:
         template = """
 You are a hospital rate schedule data extraction specialist. Follow a strict TOP-TO-BOTTOM approach and extract EVERYTHING visible on this page. There must be ZERO data loss.
 
-EXTRACTION APPROACH: Scan the entire page from TOP to BOTTOM and extract ALL content systematically.
+BASED ON SAMPLE DOCUMENTS ANALYSIS:
+- Hospital names can be complex: "Mercy Springfield and Urbana Hospital Qualified Health Plan rates"
+- LOB may be embedded in titles or not clearly labeled
+- Sections include "INPATIENT RATES:", "INPATIENT CARVE OUT RATES:", "OUTPATIENT RATES:", "OUTPATIENT CARVE OUT RATES:"
+- Tables have complex merged cells and variable structures
+- Rate information can be in various formats (Case Rate, Per Diem, percentages)
 
 TOP-TO-BOTTOM EXTRACTION PROCESS:
 
 1. TOP RIGHT CORNER:
-   - IGNORE first line (system name)
-   - EXTRACT second line (effective date)
+   - IGNORE first line (system name like "Mercy Health", "Memorial Health System")
+   - EXTRACT second line (effective date like "Effective Date: 09/01/2024")
 
-2. MAIN TITLE AREA (if present):
-   - Hospital name(s): Extract ALL hospital names exactly as written
-   - LOB type: Extract complete Line of Business description
+2. MAIN TITLE AREA (scan carefully):
+   - Extract hospital facility names (hospitals NEVER end with "plan", "rates", "schedule")
+   - Examples: "Mercy Springfield and Urbana Hospital", "Sistersville General Hospital"
+   - LOB comes AFTER hospital names: "Qualified Health Plan", "Commercial", "Medicare" 
+   - Common sense: If it says "Hospital XYZ Plan", then "Hospital" = facility, "XYZ Plan" = LOB
 
-3. ALL SECTION HEADERS (scan entire page):
-   - INPATIENT RATES
-   - OUTPATIENT RATES
-   - INPATIENT CARVE OUT RATES  
-   - OUTPATIENT CARVE OUT RATES
-   - ANY other section headers found
-   - Extract the MOST RECENT section header visible on this page
+3. ALL SECTION HEADERS (scan entire page for ANY of these):
+   - "INPATIENT RATES" or "INPATIENT RATES:"
+   - "OUTPATIENT RATES" or "OUTPATIENT RATES:"
+   - "INPATIENT CARVE OUT RATES" or "INPATIENT CARVE OUT RATES:"
+   - "OUTPATIENT CARVE OUT RATES" or "OUTPATIENT CARVE OUT RATES:"
+   - ANY other rate section headers
+   - Extract the CURRENT section context for this page
 
-4. ALL TABLES (scan entire page):
-   - Extract EVERY single table row visible
-   - Do NOT skip any rows
-   - Do NOT filter by section
-   - Extract from ALL tables found on the page
+4. ALL TABLES (extract from EVERY table structure found):
+   - Handle merged cells by extracting the most complete information
+   - Extract from tables with ANY column structure
+   - Include tables with: Service/Billing Codes/Rates, Categories/Groupers/Rates, DRG/Revenue Codes/Rates
+   - Do NOT skip rows because of formatting differences
 
-FOR EACH TABLE ROW FOUND:
-- service: Complete service name/description
-- billing_codes: ALL billing codes exactly as shown
-- rates: Complete rate text exactly as displayed
+FOR EACH TABLE ROW EXTRACT:
+- service: Complete service description (DRG, Ambulatory Surgery, specific procedures, etc.)
+- billing_codes: ALL codes exactly as shown (DRG Codes: 880-887, Revenue Codes: 190-192, etc.)
+- rates: Complete rate information ($1,800.00 Per Diem, $9,600.00 Base Rate, 33% of Billed Charges, etc.)
+
+HANDLE COMPLEX STRUCTURES:
+- For merged cells: Extract the full merged content
+- For nested information: Include all details
+- For rate conditions: Include full text like "Applied based upon Medicare Weights"
+- For percentage rates: Include complete text like "33% of Billed Charges"
 
 PAGE CLASSIFICATION:
-- is_new_section: True ONLY if this page contains a NEW main title with different hospital names OR different LOB
-- is_continuation: True if this page continues table data from previous page
-- has_table: True if ANY table data exists on this page
+- is_new_section: True if NEW hospital name OR NEW LOB appears
+- is_continuation: True if continuing tables from previous page
+- has_table: True if ANY structured data table exists
 
-ZERO DATA LOSS RULES:
-1. Extract EVERY piece of structured data visible
-2. Do NOT skip any table rows regardless of section
-3. Do NOT assume what should or shouldn't be extracted
-4. If you see data in a table format, extract it
-5. Include ALL rate sections: standard rates AND carve out rates
-6. Scan the ENTIRE page from top to bottom
-
-CRITICAL: Your goal is 100% data capture. If there is ANY tabular data visible anywhere on the page, extract it ALL.
+CRITICAL SUCCESS FACTORS:
+1. Extract EVERY visible table row regardless of format
+2. Handle different table structures (3-column, 4-column, merged cells)
+3. Capture ALL rate sections including carve out rates
+4. Include complete rate descriptions with conditions
+5. Don't lose data due to formatting variations
 
 {format_instructions}
 
-Perform complete top-to-bottom extraction of ALL visible data:
+Perform complete extraction ensuring ZERO data loss from this specific hospital rate schedule format:
 """
         
         prompt = PromptTemplate(
