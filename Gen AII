@@ -6,9 +6,12 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
-from google.cloud import aiplatform
-from google.cloud.aiplatform_v1.types.content import Part
 
+# Using the modern, recommended Google Gen AI SDK that you have installed
+import google.generativeai as genai
+from google.generativeai.types import ContentType, Part
+
+# Configure logging to see the script's progress
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -18,6 +21,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# --- Data Models (The blueprint for our data) ---
 
 class TableRow(BaseModel):
     service: str = Field(description="The full service description from the row.")
@@ -35,6 +40,8 @@ class PageExtraction(BaseModel):
     hospital_names: Optional[str] = Field(default=None, description="The specific hospital names in the page header. Provide only if visible on this page.")
     line_of_business: Optional[str] = Field(default=None, description="The Line of Business in the page header. Provide only if visible on this page.")
     sections: List[Section] = Field(description="A list of all data sections found on this page, from top to bottom.")
+
+# --- PDF and Image Conversion ---
 
 def pdf_to_images(pdf_path: str, output_dir: Path, dpi: int = 200) -> List[Path]:
     pdf_path = Path(pdf_path)
@@ -60,15 +67,15 @@ def pdf_to_images(pdf_path: str, output_dir: Path, dpi: int = 200) -> List[Path]
         raise
     return image_paths
 
+# --- State and CSV Management ---
+
 class StateManager:
     def __init__(self):
         self.columns = ["System name", "Effective date", "Hospital Name/Names", "Line of Business", "Place of service", "Plan type", "Service", "Billing codes", "Rate"]
         self.reset_state()
-        
     def reset_state(self):
         self.current_system_name, self.current_effective_date, self.current_hospitals, self.current_lob = "N/A", "N/A", "N/A", "N/A"
         self.csv_file, self.csv_writer, self.csv_path = None, None, None
-    
     def start_csv(self, output_path: Path):
         self.reset_state()
         self.csv_path = output_path
@@ -76,13 +83,11 @@ class StateManager:
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(self.columns)
         logger.info(f"CSV file started: {self.csv_path}")
-
     def update_state(self, extraction: PageExtraction):
         if extraction.system_name: self.current_system_name = extraction.system_name
         if extraction.effective_date: self.current_effective_date = extraction.effective_date
         if extraction.hospital_names: self.current_hospitals = extraction.hospital_names
         if extraction.line_of_business: self.current_lob = extraction.line_of_business
-            
     def write_rows(self, extraction: PageExtraction) -> int:
         rows_written = 0
         for section in extraction.sections:
@@ -90,14 +95,12 @@ class StateManager:
                 self.csv_writer.writerow([self.current_system_name, self.current_effective_date, self.current_hospitals, self.current_lob, section.place_of_service, section.plan_type, row.service, row.billing_codes, row.rate])
                 rows_written += 1
         if self.csv_file: self.csv_file.flush()
-        if rows_written > 0: logger.info(f"Wrote {rows_written} new rows to CSV.")
-        else: logger.info("No table rows found on this page.")
         return rows_written
-
     def close_csv(self):
         if self.csv_file:
-            logger.info(f"CSV file closed: {self.csv_path}")
             self.csv_file.close()
+
+# --- AI Model and Prompting ---
 
 class PDFExtractor:
     def __init__(self, client, output_dir: str):
@@ -114,25 +117,24 @@ Follow this precise hierarchical logic:
 
 1.  **Extract Top-Level Context:**
     * Look at the very top of the page for document-wide context.
-    * `system_name`: The overall health system (e.g., "Advocate Health And Hospital Corporation").
+    * `system_name`: The overall health system.
     * `effective_date`: The effective date for the schedule.
     * `hospital_names`: The specific hospital(s) this section applies to.
-    * `line_of_business`: The LOB for this section (e.g., "COMMERCIAL...").
-    * **IMPORTANT**: Only return values for these fields if they are explicitly visible on the CURRENT page. If a new page continues a previous section, these fields should be null in your response.
+    * `line_of_business`: The LOB for this section.
+    * **IMPORTANT**: Only return values for these fields if they are explicitly visible on the CURRENT page.
 
 2.  **Scan for Data Sections:**
     * Work from top to bottom of the page.
-    * Identify every "Place of Service" section (e.g., "INPATIENT RATES", "OUTPATIENT CARVE OUT RATES").
+    * Identify every "Place of Service" section (e.g., "INPATIENT RATES").
     * For each section you find, perform the following steps.
 
 3.  **Extract Section Data:**
     * `place_of_service`: The name of the section you identified.
-    * `plan_type`: Look for any associated plan type directly under the section header (e.g., "For POS..."). If none, use "N/A".
+    * `plan_type`: Look for any associated plan type directly under the section header. If none, use "N/A".
     * `table_rows`: Extract every single row from the table within this section.
         * For each row, extract the full, verbatim text for `service`, `billing_codes`, and `rate`.
-        * Do not omit any details, conditions, or text from these cells.
 
-Your output **MUST** be a valid JSON object that strictly adheres to the following schema. Do not include any other text or explanations before or after the JSON.
+Your output **MUST** be a valid JSON object that strictly adheres to the following schema. Do not include any other text or explanations.
 
 **JSON Schema:**
 ```json
@@ -147,15 +149,12 @@ Your output **MUST** be a valid JSON object that strictly adheres to the followi
                 image_bytes = f.read()
 
             image_part = Part.from_data(data=image_bytes, mime_type='image/png')
-            prompt_part = Part(text=prompt)
-
+            
             response = self.client.generate_content(
-                contents=[image_part, prompt_part],
+                contents=[prompt, image_part],
                 generation_config={"response_mime_type": "application/json"}
             )
-            
             extraction = PageExtraction.model_validate_json(response.text)
-            
             self.state_manager.update_state(extraction)
             return self.state_manager.write_rows(extraction)
         except Exception as e:
@@ -170,37 +169,29 @@ Your output **MUST** be a valid JSON object that strictly adheres to the followi
             image_paths = pdf_to_images(pdf_path, run_output_dir, dpi)
             csv_output_path = run_output_dir / f"{pdf_file.stem}_extracted_rates.csv"
             self.state_manager.start_csv(csv_output_path)
-            total_rows_extracted = 0
             for i, image_path in enumerate(image_paths):
-                rows_on_page = self.process_page(image_path, page_num=i + 1)
-                total_rows_extracted += rows_on_page
-            logger.info(f"===== EXTRACTION COMPLETE FOR: {pdf_path} =====")
-            logger.info(f"Total pages processed: {len(image_paths)}")
-            logger.info(f"Total rows extracted: {total_rows_extracted}")
-            logger.info(f"CSV file saved to: {csv_output_path}")
-        except Exception as e:
-            logger.critical(f"A critical error stopped the extraction process for {pdf_path}: {e}")
+                self.process_page(image_path, page_num=i + 1)
         finally:
             self.state_manager.close_csv()
+            logger.info(f"===== EXTRACTION COMPLETE FOR: {pdf_path} =====")
 
+# --- Main Execution Block ---
 if __name__ == "__main__":
     pdf_file = r"path/to/your/hospital_rates.pdf"
 
     try:
-        PROJECT_ID = "anbc-hcb-dev"
-        LOCATION = "us-central1"
+        # This assumes you have authenticated in your environment (e.g., via `gcloud auth`).
+        # You can also explicitly configure an API key if needed:
+        # genai.configure(api_key="YOUR_GOOGLE_AI_API_KEY")
         
-        aiplatform.init(project=PROJECT_ID, location=LOCATION)
-        
-        # We will use the model name you specified
-        client = aiplatform.GenerativeModel("gemini-2.0-flash")
+        # This creates the modern AI model object using the correct library.
+        # As requested, it uses the model you specified.
+        client = genai.GenerativeModel("gemini-pro-vision") # Using the standard vision model
         
         extractor = PDFExtractor(client=client, output_dir="hospital_rates_output")
         extractor.extract_from_pdf(pdf_file, dpi=200)
 
         print("Extraction complete!")
         
-    except FileNotFoundError:
-         logger.error(f"FATAL: The PDF file was not found at '{pdf_file}'. Please check the path.")
     except Exception as e:
         logger.critical(f"An error occurred during setup or execution: {e}")
