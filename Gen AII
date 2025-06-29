@@ -1,15 +1,36 @@
-import fitz
+import fitz  # PyMuPDF
+import os
 import csv
+import json
+import uuid
+import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Optional, Union, Dict, Any
 from google.genai import types
 import google.genai as genai
 from langchain.prompts import PromptTemplate
 from langchain.output_parsers import PydanticOutputParser, OutputFixingParser
 from pydantic import BaseModel, Field
+import pandas as pd
 
-def pdf_to_images(pdf_path, output_dir=None, dpi=300):
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('hospital_extraction.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
+    """Convert each page of a PDF to individual images."""
     pdf_path = Path(pdf_path)
+    
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    
     if output_dir is None:
         output_dir = pdf_path.parent
     else:
@@ -24,185 +45,411 @@ def pdf_to_images(pdf_path, output_dir=None, dpi=300):
         mat = fitz.Matrix(dpi/72, dpi/72)
         pix = page.get_pixmap(matrix=mat)
         
-        output_filename = f"{pdf_path.stem}_page_{page_num + 1:03d}.png"
+        output_filename = f"{pdf_path.stem}_page_{page_num + 1:03d}.{image_format}"
         output_path = output_dir / output_filename
+        
         pix.save(str(output_path))
         image_paths.append(str(output_path))
         
-        if page_num == 50:
+        print(f"Saved page {page_num + 1} to {output_path}")
+        if page_num == 20:
+            print("Limiting to first 20 pages for large PDFs")
             break
     
     doc.close()
     return image_paths
 
-class PageData(BaseModel):
-    effective_date: Optional[str] = Field(description="Effective date from top right corner only")
-    hospital_names: Optional[List[str]] = Field(description="Hospital names from CENTER main header only")
-    lob: Optional[str] = Field(description="Line of business from CENTER main header")
-    place_of_service: Optional[str] = Field(description="Place of service section header")
-    table_rows: List[Dict[str, str]] = Field(description="All table rows: service, billing_codes, rates")
-
-class HospitalExtractor:
-    def __init__(self, client, output_dir="extracted_data"):
-        self.client = client
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        
-        # Document state - persist until found new ones
-        self.effective_date = ""
-        self.hospital_names = []
-        self.current_lob = ""
-        self.current_place_of_service = ""
-        
-        # CSV setup
-        self.csv_path = self.output_dir / "hospital_rates.csv"
-        with open(self.csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Hospital_Names', 'LOB', 'Place_of_Service', 'Service_Category', 'Billing_Codes', 'Rates', 'Effective_Date'])
+class PageExtraction(BaseModel):
+    """Model for extracting all data from a page."""
+    has_table: bool = Field(description="Whether this page contains table data")
     
-    def create_prompt(self):
-        parser = PydanticOutputParser(pydantic_object=PageData)
+    # Document context
+    effective_date: Optional[str] = Field(default=None, description="Effective date from top corner")
+    hospital_names: Optional[str] = Field(default=None, description="Hospital names as single string")
+    lob_type: Optional[str] = Field(default=None, description="Line of Business")
+    place_of_service: Optional[str] = Field(default=None, description="INPATIENT, OUTPATIENT, INPATIENT CARVE OUT, OUTPATIENT CARVE OUT")
+    
+    # Table data - extract as-is
+    table_rows: Optional[List[Dict[str, str]]] = Field(default=None, description="Raw table data with service, billing_codes, rates")
+    
+    # Page classification
+    is_new_section: bool = Field(default=False, description="Whether this starts a new hospital/LOB section")
+    is_continuation: bool = Field(default=False, description="Whether this continues previous table")
+
+def validate_extraction(extraction: PageExtraction, page_num: int) -> List[str]:
+    """Validate extracted data and return list of issues."""
+    issues = []
+    
+    if extraction.is_new_section:
+        if not extraction.hospital_names:
+            issues.append(f"Page {page_num}: New section missing hospital names")
+        if not extraction.lob_type:
+            issues.append(f"Page {page_num}: New section missing LOB type")
+    
+    if extraction.has_table and not extraction.table_rows:
+        issues.append(f"Page {page_num}: has_table=True but no table_rows found")
+    
+    if extraction.table_rows:
+        for i, row in enumerate(extraction.table_rows):
+            if not row.get('service'):
+                issues.append(f"Page {page_num}, Row {i+1}: Missing service")
+            if not row.get('rates'):
+                issues.append(f"Page {page_num}, Row {i+1}: Missing rates")
+    
+    return issues
+
+class DocumentState:
+    """Track current document context."""
+    
+    def __init__(self):
+        self.current_effective_date = None
+        self.current_hospitals = None
+        self.current_lob = None
+        self.current_place_of_service = None
+        self.current_csv_file = None
+        self.current_csv_writer = None
+        self.current_csv_path = None
+
+class StateManager:
+    """Manage document state and CSV output."""
+    
+    def __init__(self, output_dir: Path):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.state = DocumentState()
+        self.csv_files_created = []
+        
+        # Simple columns - extract as-is
+        self.columns = [
+            'Hospital_Names', 'LOB', 'Place_of_Service', 'Service', 
+            'Billing_Codes', 'Rates', 'Effective_Date'
+        ]
+    
+    def needs_new_csv(self, hospitals: str, lob: str) -> bool:
+        """Check if we need to start a new CSV file."""
+        return (hospitals != self.state.current_hospitals or 
+                lob != self.state.current_lob)
+    
+    def start_new_csv(self, hospitals: str, lob: str, effective_date: str):
+        """Start new CSV file for new hospital/LOB combination."""
+        logger.info(f"Starting new CSV for: {hospitals} - {lob}")
+        
+        # Close current CSV
+        self.close_current_csv()
+        
+        # Update state
+        self.state.current_hospitals = hospitals
+        self.state.current_lob = lob
+        self.state.current_effective_date = effective_date
+        
+        # Create CSV filename
+        safe_hospitals = hospitals.replace(" ", "_").replace(",", "").replace("/", "_")[:50]
+        safe_lob = lob.replace(" ", "_")
+        csv_filename = f"{safe_hospitals}_{safe_lob}.csv"
+        
+        try:
+            self.state.current_csv_path = self.output_dir / csv_filename
+            self.state.current_csv_file = open(self.state.current_csv_path, 'w', newline='', encoding='utf-8')
+            self.state.current_csv_writer = csv.writer(self.state.current_csv_file)
+            self.state.current_csv_writer.writerow(self.columns)
+            
+            self.csv_files_created.append(str(self.state.current_csv_path))
+            logger.info(f"Created CSV file: {csv_filename}")
+            
+        except Exception as e:
+            logger.error(f"Failed to create CSV file {csv_filename}: {e}")
+            raise
+    
+    def update_place_of_service(self, place_of_service: str):
+        """Update current place of service."""
+        self.state.current_place_of_service = place_of_service
+        logger.info(f"Updated place of service: {place_of_service}")
+    
+    def add_table_rows(self, table_rows: List[Dict[str, str]]):
+        """Add table rows to current CSV."""
+        if not self.state.current_csv_writer:
+            logger.warning("No active CSV file - cannot add data")
+            return
+        
+        try:
+            rows_added = 0
+            for row in table_rows:
+                csv_row = [
+                    self.state.current_hospitals or "N/A",
+                    self.state.current_lob or "N/A", 
+                    self.state.current_place_of_service or "N/A",
+                    row.get('service', 'N/A'),
+                    row.get('billing_codes', 'N/A'),
+                    row.get('rates', 'N/A'),
+                    self.state.current_effective_date or "N/A"
+                ]
+                self.state.current_csv_writer.writerow(csv_row)
+                rows_added += 1
+            
+            if self.state.current_csv_file:
+                self.state.current_csv_file.flush()
+            
+            logger.info(f"Added {rows_added} rows to CSV")
+            
+        except Exception as e:
+            logger.error(f"Failed to add table rows: {e}")
+            raise
+    
+    def close_current_csv(self):
+        """Close current CSV file."""
+        if self.state.current_csv_file:
+            try:
+                self.state.current_csv_file.close()
+                self.state.current_csv_file = None
+                self.state.current_csv_writer = None
+                logger.info(f"Closed CSV: {self.state.current_csv_path}")
+            except Exception as e:
+                logger.error(f"Error closing CSV file: {e}")
+
+class SimpleExtractor:
+    """Simplified extractor focused on data extraction."""
+    
+    def __init__(self, client, output_dir: str = None):
+        self.client = client
+        self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+        self.state_manager = StateManager(self.output_dir)
+    
+    def create_extraction_prompt(self) -> tuple:
+        """Create prompt for data extraction."""
+        base_parser = PydanticOutputParser(pydantic_object=PageExtraction)
         
         class GeminiLLM:
             def __init__(self, client):
                 self.client = client
+            
             def __call__(self, prompt: str) -> str:
-                response = self.client.models.generate_content(model='gemini-2.0-flash', contents=[prompt])
-                return response.text
+                try:
+                    response = self.client.models.generate_content(
+                        model='gemini-2.0-flash',
+                        contents=[prompt]
+                    )
+                    return response.text
+                except Exception as e:
+                    return f"Error: {e}"
         
         llm_wrapper = GeminiLLM(self.client)
-        fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=llm_wrapper)
+        parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
         
         template = """
-Extract data from this hospital rate schedule page following these rules:
+You are a hospital rate schedule data extraction specialist. Analyze this image and extract structured data.
 
-1. EFFECTIVE DATE: Look in top right corner for any date. Ignore system/corporation names in corners.
+DOCUMENT STRUCTURE TO IDENTIFY:
+1. Top corner: System name (ignore) + Effective Date (extract)
+2. Main title: Hospital Name(s) + "Hospital Service and Rate Schedule" + LOB type
+3. Section headers: INPATIENT, OUTPATIENT, INPATIENT CARVE OUT, OUTPATIENT CARVE OUT
+4. Tables: Service descriptions, Billing codes, Rate information
 
-2. HOSPITAL NAMES: Look for LARGE CENTERED MAIN TITLE that contains actual hospital facility names.
-   - Extract names that contain words like: Hospital, Medical Center, General, Regional, Memorial
-   - IGNORE system/corporation names like: "Health System", "Health Corporation", "Health And Hospital Corporation"
-   - Only extract if you find a centered main header with actual facility names
+EXTRACTION INSTRUCTIONS:
 
-3. LOB: Extract Line of Business from main centered header (COMMERCIAL, MEDICARE, MEDICAID, etc.)
+EFFECTIVE DATE: Look for date in top right corner. ALWAYS IGNORE the first line in top right corner (this is system name). Extract only the second line which contains the effective date.
 
-4. PLACE OF SERVICE: Find section headers indicating service type:
-   - Look for: INPATIENT, OUTPATIENT, CARVE OUT variations
-   - Extract the current section type
+HOSPITAL NAMES: Extract actual facility names from main title
+- Extract specific hospital names like "Springfield General Hospital" 
+- NOT generic system names like "Memorial Health System"
+- May be multiple hospitals listed together
+- Keep as single combined string
 
-5. TABLE ROWS: Extract ALL visible table rows with:
-   - service: Service name/description
-   - billing_codes: Any billing codes, code ranges, or code types
-   - rates: Rate amounts, percentages, or rate descriptions
+LOB (Line of Business): Identify from main title or header area
+- Look for: "Commercial", "Medicare", "Medicaid", "ACOP Commercial"
+- Often appears with "Gatekeeper", "Non-Gatekeeper" modifiers
 
-RULES:
-- Only extract hospital names from centered main headers, never from corners
-- Only extract effective date from corners
-- If no new main header found, return empty hospital_names and lob
-- If no new place of service section found, return empty place_of_service
-- Extract all table data visible on the page
+PLACE OF SERVICE: Current section being processed
+- "INPATIENT" for inpatient services
+- "OUTPATIENT" for outpatient services  
+- "INPATIENT CARVE OUT" for inpatient carve-out rates
+- "OUTPATIENT CARVE OUT" for outpatient carve-out rates
+
+TABLE DATA EXTRACTION:
+For each table row, extract:
+- service: Complete service description
+- billing_codes: All billing codes as they appear (do not separate)
+- rates: Complete rate information as shown (do not parse)
+
+PAGE TYPE CLASSIFICATION:
+- is_new_section: True if page shows NEW main title with different hospital names or LOB
+- is_continuation: True if page continues previous table without new section headers
+
+IMPORTANT: Extract text exactly as shown, maintain original formatting and completeness.
 
 {format_instructions}
+
+Analyze the image and extract the structured data:
 """
         
-        return PromptTemplate(
+        prompt = PromptTemplate(
             template=template,
             input_variables=[],
-            partial_variables={"format_instructions": fixing_parser.get_format_instructions()}
-        ), fixing_parser
-    
-    def process_page(self, image_path: str, page_num: int):
-        with open(image_path, 'rb') as f:
-            image_bytes = f.read()
-        
-        prompt, parser = self.create_prompt()
-        
-        response = self.client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type='image/png'),
-                prompt.format()
-            ]
+            partial_variables={"format_instructions": parser.get_format_instructions()}
         )
         
-        data = parser.parse(response.text.strip())
-        
-        # Update state only when new values found
-        if data.effective_date:
-            self.effective_date = data.effective_date
-        
-        if data.hospital_names:
-            self.hospital_names = data.hospital_names
-            print(f"Page {page_num}: New hospital names: {self.hospital_names}")
-        
-        if data.lob:
-            self.current_lob = data.lob
-            print(f"Page {page_num}: New LOB: {self.current_lob}")
-        
-        if data.place_of_service:
-            self.current_place_of_service = data.place_of_service
-            print(f"Page {page_num}: New place of service: {self.current_place_of_service}")
-        
-        # Save table data
-        rows_saved = 0
-        if data.table_rows:
-            self.save_data(data.table_rows)
-            rows_saved = len(data.table_rows)
-            print(f"Page {page_num}: Saved {rows_saved} rows")
-        
-        return rows_saved
+        return prompt, parser
     
-    def save_data(self, table_rows: List[Dict[str, str]]):
-        with open(self.csv_path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            for row in table_rows:
-                writer.writerow([
-                    '; '.join(self.hospital_names) if self.hospital_names else '',
-                    self.current_lob,
-                    self.current_place_of_service,
-                    row.get('service', ''),
-                    row.get('billing_codes', ''),
-                    row.get('rates', ''),
-                    self.effective_date
-                ])
-    
-    def extract_pdf(self, pdf_path: str):
-        print(f"Processing: {pdf_path}")
+    def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
+        """Process single page with error recovery."""
+        logger.info(f"Processing page {page_num}: {Path(image_path).name}")
         
-        image_paths = pdf_to_images(pdf_path, self.output_dir)
-        total_rows = 0
+        max_retries = 3
+        retry_count = 0
         
-        for page_num, image_path in enumerate(image_paths, 1):
+        while retry_count < max_retries:
             try:
-                rows = self.process_page(image_path, page_num)
-                total_rows += rows
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+                
+                mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
+                
+                # Extract data from page
+                prompt, parser = self.create_extraction_prompt()
+                prompt_text = prompt.format()
+                
+                response = self.client.models.generate_content(
+                    model='gemini-2.0-flash',
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        prompt_text
+                    ]
+                )
+                
+                extraction = parser.parse(response.text.strip())
+                
+                # Validate extraction
+                validation_issues = validate_extraction(extraction, page_num)
+                if validation_issues:
+                    logger.warning(f"Validation issues on page {page_num}: {validation_issues}")
+                
+                # Process extraction
+                result = self.handle_extraction(extraction, page_num)
+                logger.info(f"Successfully processed page {page_num}")
+                return result
+                
             except Exception as e:
-                print(f"Error on page {page_num}: {e}")
+                retry_count += 1
+                logger.error(f"Attempt {retry_count} failed for page {page_num}: {e}")
+                
+                if retry_count >= max_retries:
+                    logger.error(f"Failed to process page {page_num} after {max_retries} attempts")
+                    return {
+                        'page_num': page_num,
+                        'success': False,
+                        'error': str(e),
+                        'retry_attempts': retry_count
+                    }
+                else:
+                    logger.info(f"Retrying page {page_num} (attempt {retry_count + 1})")
+                    continue
+    
+    def handle_extraction(self, extraction: PageExtraction, page_num: int) -> Dict[str, Any]:
+        """Handle extracted data with validation."""
         
-        print(f"\nExtraction Complete:")
-        print(f"Total pages: {len(image_paths)}")
-        print(f"Total rows: {total_rows}")
-        print(f"Final hospital names: {self.hospital_names}")
-        print(f"Final LOB: {self.current_lob}")
-        print(f"Final place of service: {self.current_place_of_service}")
-        print(f"Effective date: {self.effective_date}")
-        print(f"CSV file: {self.csv_path}")
+        try:
+            # Check if we need new CSV file
+            if extraction.is_new_section and extraction.hospital_names and extraction.lob_type:
+                logger.info(f"Page {page_num}: Starting new section - {extraction.hospital_names}, {extraction.lob_type}")
+                self.state_manager.start_new_csv(
+                    extraction.hospital_names,
+                    extraction.lob_type, 
+                    extraction.effective_date
+                )
+            
+            # Update place of service if provided
+            if extraction.place_of_service:
+                self.state_manager.update_place_of_service(extraction.place_of_service)
+            
+            # Add table data if present
+            rows_added = 0
+            if extraction.has_table and extraction.table_rows:
+                self.state_manager.add_table_rows(extraction.table_rows)
+                rows_added = len(extraction.table_rows)
+                logger.info(f"Page {page_num}: Added {rows_added} table rows")
+            
+            return {
+                'page_num': page_num,
+                'success': True,
+                'has_table': extraction.has_table,
+                'is_new_section': extraction.is_new_section,
+                'hospital_names': extraction.hospital_names,
+                'lob': extraction.lob_type,
+                'place_of_service': extraction.place_of_service,
+                'rows_added': rows_added
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to handle extraction for page {page_num}: {e}")
+            return {
+                'page_num': page_num,
+                'success': False,
+                'error': f"Handling failed: {e}"
+            }
+    
+    def extract_from_pdf(self, pdf_path: str, dpi: int = 150) -> Dict[str, Any]:
+        """Extract from entire PDF with comprehensive logging."""
+        logger.info(f"Starting extraction for PDF: {pdf_path}")
         
-        return {
-            'total_pages': len(image_paths),
-            'total_rows': total_rows,
-            'csv_file': str(self.csv_path)
-        }
+        try:
+            # Convert PDF to images
+            image_paths = pdf_to_images(pdf_path, self.output_dir, dpi)
+            logger.info(f"Converted PDF to {len(image_paths)} images")
+            
+            # Process each page
+            results = {
+                'pdf_path': pdf_path,
+                'total_pages': len(image_paths),
+                'processed_pages': [],
+                'failed_pages': [],
+                'total_rows_extracted': 0
+            }
+            
+            for page_num, image_path in enumerate(image_paths, 1):
+                page_result = self.process_page(image_path, page_num)
+                results['processed_pages'].append(page_result)
+                
+                if page_result.get('success', False):
+                    results['total_rows_extracted'] += page_result.get('rows_added', 0)
+                else:
+                    results['failed_pages'].append(page_num)
+                    logger.error(f"Page {page_num} failed: {page_result.get('error', 'Unknown error')}")
+            
+            # Close final CSV
+            self.state_manager.close_current_csv()
+            
+            # Add summary
+            results['csv_files_created'] = self.state_manager.csv_files_created
+            results['total_csv_files'] = len(self.state_manager.csv_files_created)
+            results['success_rate'] = (len(image_paths) - len(results['failed_pages'])) / len(image_paths) * 100
+            
+            # Log final summary
+            logger.info(f"Extraction completed for {pdf_path}")
+            logger.info(f"Total pages: {results['total_pages']}")
+            logger.info(f"Failed pages: {len(results['failed_pages'])}")
+            logger.info(f"Success rate: {results['success_rate']:.1f}%")
+            logger.info(f"Total rows extracted: {results['total_rows_extracted']}")
+            logger.info(f"CSV files created: {results['total_csv_files']}")
+            
+            if results['failed_pages']:
+                logger.warning(f"Failed pages: {results['failed_pages']}")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Critical error during PDF extraction: {e}")
+            return {
+                'pdf_path': pdf_path,
+                'success': False,
+                'error': str(e)
+            }
 
 # Usage
 if __name__ == "__main__":
+    pdf_file = r"path/to/your/hospital_rates.pdf"
+    
     from google import genai
+    client = genai.Client(vertexai=True, project="your-project", location="us-central1")
     
-    # Initialize client with your project details
-    client = genai.Client(vertexai=True, project="your-project-id", location="us-central1")
-    
-    # Create extractor
-    extractor = HospitalExtractor(client, output_dir="extracted_data")
-    
-    # Process your PDF file - UPDATE THIS PATH
-    pdf_file_path = r"C:\path\to\your\hospital_rates.pdf"
-    results = extractor.extract_pdf(pdf_file_path)
+    extractor = SimpleExtractor(client, output_dir="extracted_rates")
+    results = extractor.extract_from_pdf(pdf_file, dpi=300)
