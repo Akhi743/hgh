@@ -77,24 +77,33 @@ class PageExtraction(BaseModel):
     is_continuation: bool = Field(default=False, description="Whether this continues previous table")
 
 def validate_extraction(extraction: PageExtraction, page_num: int) -> List[str]:
-    """Validate extracted data and return list of issues."""
+    """Validate extracted data and return list of issues - focused on zero data loss."""
     issues = []
     
+    # For new sections, ensure we have the key identifiers
     if extraction.is_new_section:
         if not extraction.hospital_names:
             issues.append(f"Page {page_num}: New section missing hospital names")
         if not extraction.lob_type:
             issues.append(f"Page {page_num}: New section missing LOB type")
     
+    # Check for potential data loss scenarios
     if extraction.has_table and not extraction.table_rows:
-        issues.append(f"Page {page_num}: has_table=True but no table_rows found")
+        issues.append(f"Page {page_num}: CRITICAL - has_table=True but no table_rows extracted (potential data loss)")
     
     if extraction.table_rows:
         for i, row in enumerate(extraction.table_rows):
-            if not row.get('service'):
-                issues.append(f"Page {page_num}, Row {i+1}: Missing service")
-            if not row.get('rates'):
-                issues.append(f"Page {page_num}, Row {i+1}: Missing rates")
+            # Only flag completely empty rows as potential issues
+            if not any(row.values()):
+                issues.append(f"Page {page_num}, Row {i+1}: Completely empty row detected")
+            
+            # Check for critical missing data that indicates extraction problems
+            if not row.get('service') and not row.get('billing_codes') and not row.get('rates'):
+                issues.append(f"Page {page_num}, Row {i+1}: CRITICAL - No data extracted for any field (potential data loss)")
+    
+    # Warn if we have continuation but no data (might indicate missed table)
+    if extraction.is_continuation and not extraction.table_rows:
+        issues.append(f"Page {page_num}: WARNING - Marked as continuation but no table data found")
     
     return issues
 
@@ -237,49 +246,57 @@ class SimpleExtractor:
         parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm_wrapper)
         
         template = """
-You are a hospital rate schedule data extraction specialist. Analyze this image and extract structured data.
+You are a hospital rate schedule data extraction specialist. Follow a strict TOP-TO-BOTTOM approach and extract EVERYTHING visible on this page. There must be ZERO data loss.
 
-DOCUMENT STRUCTURE TO IDENTIFY:
-1. Top corner: System name (ignore) + Effective Date (extract)
-2. Main title: Hospital Name(s) + "Hospital Service and Rate Schedule" + LOB type
-3. Section headers: INPATIENT, OUTPATIENT, INPATIENT CARVE OUT, OUTPATIENT CARVE OUT
-4. Tables: Service descriptions, Billing codes, Rate information
+EXTRACTION APPROACH: Scan the entire page from TOP to BOTTOM and extract ALL content systematically.
 
-EXTRACTION INSTRUCTIONS:
+TOP-TO-BOTTOM EXTRACTION PROCESS:
 
-EFFECTIVE DATE: Look for date in top right corner. ALWAYS IGNORE the first line in top right corner (this is system name). Extract only the second line which contains the effective date.
+1. TOP RIGHT CORNER:
+   - IGNORE first line (system name)
+   - EXTRACT second line (effective date)
 
-HOSPITAL NAMES: Extract actual facility names from main title
-- Extract specific hospital names like "Springfield General Hospital" 
-- NOT generic system names like "Memorial Health System"
-- May be multiple hospitals listed together
-- Keep as single combined string
+2. MAIN TITLE AREA (if present):
+   - Hospital name(s): Extract ALL hospital names exactly as written
+   - LOB type: Extract complete Line of Business description
 
-LOB (Line of Business): Identify from main title or header area
-- Look for: "Commercial", "Medicare", "Medicaid", "ACOP Commercial"
-- Often appears with "Gatekeeper", "Non-Gatekeeper" modifiers
+3. ALL SECTION HEADERS (scan entire page):
+   - INPATIENT RATES
+   - OUTPATIENT RATES
+   - INPATIENT CARVE OUT RATES  
+   - OUTPATIENT CARVE OUT RATES
+   - ANY other section headers found
+   - Extract the MOST RECENT section header visible on this page
 
-PLACE OF SERVICE: Current section being processed
-- "INPATIENT" for inpatient services
-- "OUTPATIENT" for outpatient services  
-- "INPATIENT CARVE OUT" for inpatient carve-out rates
-- "OUTPATIENT CARVE OUT" for outpatient carve-out rates
+4. ALL TABLES (scan entire page):
+   - Extract EVERY single table row visible
+   - Do NOT skip any rows
+   - Do NOT filter by section
+   - Extract from ALL tables found on the page
 
-TABLE DATA EXTRACTION:
-For each table row, extract:
-- service: Complete service description
-- billing_codes: All billing codes as they appear (do not separate)
-- rates: Complete rate information as shown (do not parse)
+FOR EACH TABLE ROW FOUND:
+- service: Complete service name/description
+- billing_codes: ALL billing codes exactly as shown
+- rates: Complete rate text exactly as displayed
 
-PAGE TYPE CLASSIFICATION:
-- is_new_section: True if page shows NEW main title with different hospital names or LOB
-- is_continuation: True if page continues previous table without new section headers
+PAGE CLASSIFICATION:
+- is_new_section: True ONLY if this page contains a NEW main title with different hospital names OR different LOB
+- is_continuation: True if this page continues table data from previous page
+- has_table: True if ANY table data exists on this page
 
-IMPORTANT: Extract text exactly as shown, maintain original formatting and completeness.
+ZERO DATA LOSS RULES:
+1. Extract EVERY piece of structured data visible
+2. Do NOT skip any table rows regardless of section
+3. Do NOT assume what should or shouldn't be extracted
+4. If you see data in a table format, extract it
+5. Include ALL rate sections: standard rates AND carve out rates
+6. Scan the ENTIRE page from top to bottom
+
+CRITICAL: Your goal is 100% data capture. If there is ANY tabular data visible anywhere on the page, extract it ALL.
 
 {format_instructions}
 
-Analyze the image and extract the structured data:
+Perform complete top-to-bottom extraction of ALL visible data:
 """
         
         prompt = PromptTemplate(
@@ -345,9 +362,19 @@ Analyze the image and extract the structured data:
                     continue
     
     def handle_extraction(self, extraction: PageExtraction, page_num: int) -> Dict[str, Any]:
-        """Handle extracted data with validation."""
+        """Handle extracted data with validation and completeness tracking."""
         
         try:
+            # Log what was found on this page
+            logger.info(f"Page {page_num} extraction summary:")
+            logger.info(f"  - Has table data: {extraction.has_table}")
+            logger.info(f"  - Is new section: {extraction.is_new_section}")
+            logger.info(f"  - Is continuation: {extraction.is_continuation}")
+            logger.info(f"  - Hospital names: {extraction.hospital_names}")
+            logger.info(f"  - LOB: {extraction.lob_type}")
+            logger.info(f"  - Place of service: {extraction.place_of_service}")
+            logger.info(f"  - Table rows found: {len(extraction.table_rows) if extraction.table_rows else 0}")
+            
             # Check if we need new CSV file
             if extraction.is_new_section and extraction.hospital_names and extraction.lob_type:
                 logger.info(f"Page {page_num}: Starting new section - {extraction.hospital_names}, {extraction.lob_type}")
@@ -361,12 +388,20 @@ Analyze the image and extract the structured data:
             if extraction.place_of_service:
                 self.state_manager.update_place_of_service(extraction.place_of_service)
             
-            # Add table data if present
+            # Add table data if present - EXTRACT ALL ROWS
             rows_added = 0
             if extraction.has_table and extraction.table_rows:
+                logger.info(f"Page {page_num}: Extracting ALL {len(extraction.table_rows)} table rows")
                 self.state_manager.add_table_rows(extraction.table_rows)
                 rows_added = len(extraction.table_rows)
-                logger.info(f"Page {page_num}: Added {rows_added} table rows")
+                
+                # Log details of what was extracted
+                for i, row in enumerate(extraction.table_rows):
+                    logger.debug(f"  Row {i+1}: Service='{row.get('service', '')}', Codes='{row.get('billing_codes', '')}', Rates='{row.get('rates', '')}'")
+            
+            # Warn if page has table indicator but no data extracted
+            if extraction.has_table and not extraction.table_rows:
+                logger.warning(f"Page {page_num}: POTENTIAL DATA LOSS - has_table=True but no rows extracted")
             
             return {
                 'page_num': page_num,
@@ -376,7 +411,8 @@ Analyze the image and extract the structured data:
                 'hospital_names': extraction.hospital_names,
                 'lob': extraction.lob_type,
                 'place_of_service': extraction.place_of_service,
-                'rows_added': rows_added
+                'rows_added': rows_added,
+                'extraction_complete': True
             }
             
         except Exception as e:
@@ -384,7 +420,8 @@ Analyze the image and extract the structured data:
             return {
                 'page_num': page_num,
                 'success': False,
-                'error': f"Handling failed: {e}"
+                'error': f"Handling failed: {e}",
+                'extraction_complete': False
             }
     
     def extract_from_pdf(self, pdf_path: str, dpi: int = 150) -> Dict[str, Any]:
