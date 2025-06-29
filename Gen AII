@@ -64,11 +64,11 @@ class StateManager:
     def __init__(self):
         self.columns = ["System name", "Effective date", "Hospital Name/Names", "Line of Business", "Place of service", "Plan type", "Service", "Billing codes", "Rate"]
         self.reset_state()
-
+        
     def reset_state(self):
         self.current_system_name, self.current_effective_date, self.current_hospitals, self.current_lob = "N/A", "N/A", "N/A", "N/A"
         self.csv_file, self.csv_writer, self.csv_path = None, None, None
-
+    
     def start_csv(self, output_path: Path):
         self.reset_state()
         self.csv_path = output_path
@@ -82,7 +82,7 @@ class StateManager:
         if extraction.effective_date: self.current_effective_date = extraction.effective_date
         if extraction.hospital_names: self.current_hospitals = extraction.hospital_names
         if extraction.line_of_business: self.current_lob = extraction.line_of_business
-
+            
     def write_rows(self, extraction: PageExtraction) -> int:
         rows_written = 0
         for section in extraction.sections:
@@ -112,32 +112,31 @@ You are an expert data extraction specialist. Your task is to analyze an image o
 
 Follow this precise hierarchical logic:
 
-1. **Extract Top-Level Context:**
-* Look at the very top of the page for document-wide context.
-* `system_name`: The overall health system (e.g., "Advocate Health And Hospital Corporation").
-* `effective_date`: The effective date for the schedule.
-* `hospital_names`: The specific hospital(s) this section applies to.
-* `line_of_business`: The LOB for this section (e.g., "COMMERCIAL...").
-* **IMPORTANT**: Only return values for these fields if they are explicitly visible on the CURRENT page. If a new page continues a previous section, these fields should be null in your response.
+1.  **Extract Top-Level Context:**
+    * Look at the very top of the page for document-wide context.
+    * `system_name`: The overall health system (e.g., "Advocate Health And Hospital Corporation").
+    * `effective_date`: The effective date for the schedule.
+    * `hospital_names`: The specific hospital(s) this section applies to.
+    * `line_of_business`: The LOB for this section (e.g., "COMMERCIAL...").
+    * **IMPORTANT**: Only return values for these fields if they are explicitly visible on the CURRENT page. If a new page continues a previous section, these fields should be null in your response.
 
-2. **Scan for Data Sections:**
-* Work from top to bottom of the page.
-* Identify every "Place of Service" section (e.g., "INPATIENT RATES", "OUTPATIENT CARVE OUT RATES").
-* For each section you find, perform the following steps.
+2.  **Scan for Data Sections:**
+    * Work from top to bottom of the page.
+    * Identify every "Place of Service" section (e.g., "INPATIENT RATES", "OUTPATIENT CARVE OUT RATES").
+    * For each section you find, perform the following steps.
 
-3. **Extract Section Data:**
-* `place_of_service`: The name of the section you identified.
-* `plan_type`: Look for any associated plan type directly under the section header (e.g., "For POS..."). If none, use "N/A".
-* `table_rows`: Extract every single row from the table within this section.
-* For each row, extract the full, verbatim text for `service`, `billing_codes`, and `rate`.
-* Do not omit any details, conditions, or text from these cells.
+3.  **Extract Section Data:**
+    * `place_of_service`: The name of the section you identified.
+    * `plan_type`: Look for any associated plan type directly under the section header (e.g., "For POS..."). If none, use "N/A".
+    * `table_rows`: Extract every single row from the table within this section.
+        * For each row, extract the full, verbatim text for `service`, `billing_codes`, and `rate`.
+        * Do not omit any details, conditions, or text from these cells.
 
 Your output **MUST** be a valid JSON object that strictly adheres to the following schema. Do not include any other text or explanations before or after the JSON.
 
 **JSON Schema:**
 ```json
 {json_schema_str}
-```
 """
 
     def process_page(self, image_path: Path, page_num: int) -> int:
@@ -154,15 +153,15 @@ Your output **MUST** be a valid JSON object that strictly adheres to the followi
                 contents=[image_part, prompt_part],
                 generation_config={"response_mime_type": "application/json"}
             )
-
+            
             extraction = PageExtraction.model_validate_json(response.text)
-
+            
             self.state_manager.update_state(extraction)
             return self.state_manager.write_rows(extraction)
         except Exception as e:
             logger.error(f"CRITICAL FAILURE on page {page_num}. Error: {e}")
             return 0
-
+        
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200):
         logger.info(f"===== STARTING EXTRACTION FOR PDF: {pdf_path} =====")
         pdf_file = Path(pdf_path)
@@ -190,17 +189,18 @@ if __name__ == "__main__":
     try:
         PROJECT_ID = "anbc-hcb-dev"
         LOCATION = "us-central1"
-
+        
         aiplatform.init(project=PROJECT_ID, location=LOCATION)
-
-        client = aiplatform.GenerativeModel("gemini-1.5-flash-001")
-
+        
+        # We will use the model name you specified
+        client = aiplatform.GenerativeModel("gemini-2.0-flash")
+        
         extractor = PDFExtractor(client=client, output_dir="hospital_rates_output")
         extractor.extract_from_pdf(pdf_file, dpi=200)
 
         print("Extraction complete!")
-
+        
     except FileNotFoundError:
-        logger.error(f"FATAL: The PDF file was not found at '{pdf_file}'. Please check the path.")
+         logger.error(f"FATAL: The PDF file was not found at '{pdf_file}'. Please check the path.")
     except Exception as e:
         logger.critical(f"An error occurred during setup or execution: {e}")
