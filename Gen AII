@@ -132,24 +132,35 @@ class HierarchicalStateManager:
                 self.effective_date = extraction.effective_date_found
                 logger.info(f"Stored effective date: '{self.effective_date}'")
         
-        # 2. Header-level: Update when new header appears
+        # 2. Header-level: Update when new header appears  
         if extraction.hospital_names_found:
+            # ALWAYS update hospital names when found - this indicates a NEW section
+            old_hospitals = self.current_hospitals
             self.current_hospitals = extraction.hospital_names_found
-            logger.info(f"NEW HEADER - Updated hospital names: '{self.current_hospitals}'")
+            logger.info(f"NEW HEADER DETECTED - Changed hospital names from '{old_hospitals}' to '{self.current_hospitals}'")
             
         if extraction.line_of_business_found:
+            # ALWAYS update LOB when found - this indicates a NEW section
+            old_lob = self.current_lob
             self.current_lob = extraction.line_of_business_found
-            logger.info(f"NEW HEADER - Updated LOB: '{self.current_lob}'")
+            logger.info(f"NEW HEADER DETECTED - Changed LOB from '{old_lob}' to '{self.current_lob}'")
         
         # 3. Sub-header-level: Update when new section appears
         for section in extraction.sections:
             if section.place_of_service_found:
-                self.current_place_of_service = section.place_of_service_found
-                logger.info(f"NEW SECTION - Updated place of service: '{self.current_place_of_service}'")
+                # Validate it's a real section header, not a column name
+                valid_sections = ["INPATIENT RATES", "OUTPATIENT RATES", "INPATIENT CARVE OUT RATES", "OUTPATIENT CARVE OUT RATES"]
+                if any(valid in section.place_of_service_found.upper() for valid in valid_sections):
+                    old_pos = self.current_place_of_service
+                    self.current_place_of_service = section.place_of_service_found
+                    logger.info(f"NEW SECTION DETECTED - Changed place of service from '{old_pos}' to '{self.current_place_of_service}'")
+                else:
+                    logger.warning(f"INVALID place_of_service ignored: '{section.place_of_service_found}' (not a valid section header)")
                 
             if section.plan_type_found:
+                old_plan = self.current_plan_type
                 self.current_plan_type = section.plan_type_found
-                logger.info(f"NEW SECTION - Updated plan type: '{self.current_plan_type}'")
+                logger.info(f"NEW SECTION - Changed plan type from '{old_plan}' to '{self.current_plan_type}'")
     
     def write_rows(self, extraction: PageExtraction) -> int:
         """Write extracted rows using current stored context"""
@@ -248,9 +259,12 @@ For each section, look for:
 
 **CRITICAL RULES:**
 - Only extract system_name_found/effective_date_found if you SEE them on this page
-- Only extract hospital_names_found/line_of_business_found if you see a NEW main header section
+- ALWAYS extract hospital_names_found/line_of_business_found if you see a NEW main header section (even if similar to previous)
+- ONLY extract place_of_service_found if you see a NEW section header like "INPATIENT RATES", "OUTPATIENT RATES", etc.
+- Extract table_rows ONLY from actual data tables - STOP at table borders
+- Do NOT extract from "TERMS AND CONDITIONS", footnotes, or text sections
+- Do NOT extract "Billing" as place_of_service - it's a column header, not a section
 - Preserve ALL text exactly as written - do not modify or shorten
-- Extract every single table row you find
 
 **JSON Schema:**
 {json_schema}
