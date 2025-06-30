@@ -163,30 +163,63 @@ class HierarchicalStateManager:
                 logger.info(f"NEW SECTION - Changed plan type from '{old_plan}' to '{self.current_plan_type}'")
     
     def write_rows(self, extraction: PageExtraction) -> int:
-        """Write extracted rows using current stored context"""
+        """Write extracted rows processing each section individually"""
         if not self.csv_writer:
             return 0
         
         rows_written = 0
-        for section in extraction.sections:
+        
+        # Process each section separately
+        for section_num, section in enumerate(extraction.sections, 1):
+            logger.info(f"Processing section {section_num} on this page")
+            
+            # Update place of service for this section
+            section_place_of_service = self.current_place_of_service  # Default to current
+            section_plan_type = self.current_plan_type  # Default to current
+            
+            # Check if this section has new place of service
+            if section.place_of_service_found:
+                valid_sections = ["INPATIENT RATES", "OUTPATIENT RATES", "INPATIENT CARVE OUT RATES", "OUTPATIENT CARVE OUT RATES"]
+                if any(valid in section.place_of_service_found.upper() for valid in valid_sections):
+                    # Update the state for this and subsequent sections
+                    old_pos = self.current_place_of_service
+                    self.current_place_of_service = section.place_of_service_found
+                    section_place_of_service = self.current_place_of_service
+                    logger.info(f"Section {section_num}: Changed place of service from '{old_pos}' to '{self.current_place_of_service}'")
+                else:
+                    logger.warning(f"Section {section_num}: Invalid place_of_service ignored: '{section.place_of_service_found}'")
+            
+            # Check if this section has new plan type
+            if section.plan_type_found:
+                old_plan = self.current_plan_type
+                self.current_plan_type = section.plan_type_found
+                section_plan_type = self.current_plan_type
+                logger.info(f"Section {section_num}: Changed plan type from '{old_plan}' to '{self.current_plan_type}'")
+            
+            # Write all rows for this section
+            section_rows = 0
             for row in section.table_rows:
                 csv_row = [
                     self.system_name,                    # Stored once for PDF
                     self.effective_date,                 # Stored once for PDF
                     self.current_hospitals,              # Sticky until new header
                     self.current_lob,                   # Sticky until new header
-                    self.current_place_of_service,      # Sticky until new section
-                    self.current_plan_type,             # Sticky until new section
+                    section_place_of_service,           # Current section's place of service
+                    section_plan_type,                  # Current section's plan type
                     row.service,                        # From current row
                     row.billing_codes,                  # From current row
                     row.rate                            # From current row
                 ]
                 self.csv_writer.writerow(csv_row)
+                section_rows += 1
                 rows_written += 1
+            
+            logger.info(f"Section {section_num}: Wrote {section_rows} rows with place_of_service='{section_place_of_service}'")
         
         if self.csv_file:
             self.csv_file.flush()
         
+        logger.info(f"Total rows written from this page: {rows_written}")
         return rows_written
     
     def get_current_state(self):
@@ -229,16 +262,15 @@ You are an expert data extraction specialist. Extract data from this hospital ra
 - system_name_found: Look at the very top corner for system names like "Mercy Health", "Memorial Health System", "Advocate Health And Hospital Corporation"
 - effective_date_found: Look for "Effective Date:" followed by a date like "09/01/2024", "06/01/2025"
 
-**2. Header-Level Info (extract only if NEW main header appears):**
-- hospital_names_found: Look for specific hospital names in main titles like:
-  * "Mercy Springfield and Urbana Hospitals"
-  * "Sistersville General Hospital" 
-  * "Advocate Condell Medical Center and Advocate Sherman Hospital"
-  * NOT system names like "Mercy Health" or "Memorial Health System"
-- line_of_business_found: Look for LOB in main headers like:
-  * "COMMERCIAL GATEKEEPER AND NON-GATEKEEPER PRODUCTS"
-  * "Qualified Health Plan rates"
-  * Extract the full LOB text
+**2. Header-Level Info (extract when you see a MAIN HEADER):**
+- hospital_names_found: When you see a MAIN HEADER section, ALWAYS extract the hospital names
+  * Examples: "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital"
+  * A MAIN HEADER is a new document section with hospital names and LOB
+  * ALWAYS extract this - do NOT reuse previous hospital names
+- line_of_business_found: When you see a MAIN HEADER section, ALWAYS extract the LOB
+  * Examples: "Qualified Health Plan rates", "COMMERCIAL GATEKEEPER AND NON-GATEKEEPER PRODUCTS"
+  * This comes with the hospital names in the MAIN HEADER
+  * ALWAYS extract this - do NOT reuse previous LOB
 
 **3. Table Sections (extract when NEW section headers appear):**
 For each section, look for:
@@ -258,9 +290,11 @@ For each section, look for:
   * rate: Complete rate text (e.g., "$9,600.00 Base Rate - Applied based upon Medicare Weights")
 
 **CRITICAL RULES:**
-- Only extract system_name_found/effective_date_found if you SEE them on this page
-- ALWAYS extract hospital_names_found/line_of_business_found if you see a NEW main header section (even if similar to previous)
-- ONLY extract place_of_service_found if you see a NEW section header like "INPATIENT RATES", "OUTPATIENT RATES", etc.
+- MAIN HEADER = New section with hospital names + LOB together
+- When you see a MAIN HEADER: ALWAYS extract both hospital_names_found AND line_of_business_found
+- NEVER reuse previous hospital names or LOB when a MAIN HEADER appears
+- A MAIN HEADER means this is a completely new section for different hospitals
+- Only extract place_of_service_found if you see a NEW section header like "INPATIENT RATES", "OUTPATIENT RATES", etc.
 - Extract table_rows ONLY from actual data tables - STOP at table borders
 - Do NOT extract from "TERMS AND CONDITIONS", footnotes, or text sections
 - Do NOT extract "Billing" as place_of_service - it's a column header, not a section
