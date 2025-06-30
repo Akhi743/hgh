@@ -284,7 +284,13 @@ For each section, look for:
   * "For POS (Point of Service)..."
   * "For EPO (Exclusive Provider Organization)..."
   Extract only if found under NEW section
-- table_rows: Extract ALL rows from tables with:
+- table_rows: Extract ONLY from PROPER TABLES that have:
+  * Clear table structure with borders/lines
+  * Column headers: Service | Billing Codes | Rates (or similar)
+  * Multiple organized rows in table format
+  * DO NOT extract from scattered data or lists
+  * DO NOT extract if data is not in a structured table
+  For each valid table row extract:
   * service: Full service description (e.g., "DRG With Transfer Rate of 60% Of Eligible Billed Charges")
   * billing_codes: Complete codes (e.g., "All Active DRG Codes", "DRG Codes: 880-887")
   * rate: Complete rate text (e.g., "$9,600.00 Base Rate - Applied based upon Medicare Weights")
@@ -295,7 +301,10 @@ For each section, look for:
 - NEVER reuse previous hospital names or LOB when a MAIN HEADER appears
 - A MAIN HEADER means this is a completely new section for different hospitals
 - Only extract place_of_service_found if you see a NEW section header like "INPATIENT RATES", "OUTPATIENT RATES", etc.
-- Extract table_rows ONLY from actual data tables - STOP at table borders
+- ONLY extract table_rows from PROPER STRUCTURED TABLES with clear borders and column headers
+- DO NOT extract from scattered data, lists, or unstructured content
+- DO NOT extract if you don't see a clear table with Service|Billing Codes|Rates columns
+- Extract table_rows ONLY from tables that look like organized data tables - STOP at table borders
 - Do NOT extract from "TERMS AND CONDITIONS", footnotes, or text sections
 - Do NOT extract "Billing" as place_of_service - it's a column header, not a section
 - Preserve ALL text exactly as written - do not modify or shorten
