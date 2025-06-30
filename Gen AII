@@ -25,15 +25,21 @@ class TableRow(BaseModel):
     rate: str = Field(description="The full, verbatim text of the rate, including all conditions.")
 
 class Section(BaseModel):
-    place_of_service: str = Field(description="The title of this section (e.g., 'INPATIENT RATES', 'OUTPATIENT CARVE OUT RATES').")
-    plan_type: Optional[str] = Field(default="N/A", description="The plan type associated with this section. Defaults to 'N/A' if not present.")
-    table_rows: List[TableRow] = Field(description="A list of all table rows extracted from this specific section.")
+    # Only extract if this is a NEW section header
+    place_of_service_found: Optional[str] = Field(default=None, description="Place of service if NEW section header found on this page.")
+    plan_type_found: Optional[str] = Field(default=None, description="Plan type if found under NEW section header.")
+    
+    # Always extract table rows
+    table_rows: List[TableRow] = Field(description="A list of all table rows extracted from this section.")
 
 class PageExtraction(BaseModel):
-    system_name: Optional[str] = Field(default=None, description="The main system name for the entire document.")
-    effective_date: Optional[str] = Field(default=None, description="The effective date for the document.")
-    hospital_names: Optional[str] = Field(default=None, description="The specific hospital names mentioned in the page header.")
-    line_of_business: Optional[str] = Field(default=None, description="The Line of Business mentioned in the page header.")
+    # Only extract if found on this page
+    system_name_found: Optional[str] = Field(default=None, description="System name if found on THIS page only.")
+    effective_date_found: Optional[str] = Field(default=None, description="Effective date if found on THIS page only.")
+    hospital_names_found: Optional[str] = Field(default=None, description="Hospital names if found on THIS page only.")
+    line_of_business_found: Optional[str] = Field(default=None, description="Line of Business if found on THIS page only.")
+    
+    # Always extract sections
     sections: List[Section] = Field(description="A list of all data sections found on this page.")
 
 def pdf_to_images(pdf_path: str, output_dir: str = None, dpi: int = 200) -> List[Path]:
@@ -72,8 +78,8 @@ def pdf_to_images(pdf_path: str, output_dir: str = None, dpi: int = 200) -> List
     
     return image_paths
 
-class StateManager:
-    """Manages sticky context across pages and writes to CSV"""
+class HierarchicalStateManager:
+    """Manages hierarchical context following top-to-bottom, store-and-reuse approach"""
     
     def __init__(self):
         self.columns = [
@@ -81,17 +87,28 @@ class StateManager:
             "Line of Business", "Place of service", "Plan type", 
             "Service", "Billing codes", "Rate"
         ]
-        self.reset_state()
+        self.reset_document_state()
     
-    def reset_state(self):
+    def reset_document_state(self):
         """Reset state for new document"""
-        self.current_system_name = "N/A"
-        self.current_effective_date = "N/A"
+        # Document-level (stored once for entire PDF)
+        self.system_name = "N/A"
+        self.effective_date = "N/A"
+        
+        # Header-level (sticky until new header)
         self.current_hospitals = "N/A"
         self.current_lob = "N/A"
+        
+        # Sub-header-level (sticky until new sub-header)
+        self.current_place_of_service = "N/A"
+        self.current_plan_type = "N/A"
+        
+        # CSV management
         self.csv_file = None
         self.csv_writer = None
         self.csv_path = None
+        
+        logger.info("Reset document state")
     
     def start_csv(self, output_path: Path):
         """Start new CSV file"""
@@ -101,19 +118,41 @@ class StateManager:
         self.csv_writer.writerow(self.columns)
         logger.info(f"Started CSV: {self.csv_path}")
     
-    def update_state(self, extraction: PageExtraction):
-        """Update sticky context"""
-        if extraction.system_name:
-            self.current_system_name = extraction.system_name
-        if extraction.effective_date:
-            self.current_effective_date = extraction.effective_date
-        if extraction.hospital_names:
-            self.current_hospitals = extraction.hospital_names
-        if extraction.line_of_business:
-            self.current_lob = extraction.line_of_business
+    def update_from_page(self, extraction: PageExtraction):
+        """Update state from page extraction - hierarchical store and reuse"""
+        
+        # 1. Document-level: Store once for entire PDF
+        if extraction.system_name_found:
+            if self.system_name == "N/A" or len(extraction.system_name_found) > len(self.system_name):
+                self.system_name = extraction.system_name_found
+                logger.info(f"Stored system name: '{self.system_name}'")
+            
+        if extraction.effective_date_found:
+            if self.effective_date == "N/A":
+                self.effective_date = extraction.effective_date_found
+                logger.info(f"Stored effective date: '{self.effective_date}'")
+        
+        # 2. Header-level: Update when new header appears
+        if extraction.hospital_names_found:
+            self.current_hospitals = extraction.hospital_names_found
+            logger.info(f"NEW HEADER - Updated hospital names: '{self.current_hospitals}'")
+            
+        if extraction.line_of_business_found:
+            self.current_lob = extraction.line_of_business_found
+            logger.info(f"NEW HEADER - Updated LOB: '{self.current_lob}'")
+        
+        # 3. Sub-header-level: Update when new section appears
+        for section in extraction.sections:
+            if section.place_of_service_found:
+                self.current_place_of_service = section.place_of_service_found
+                logger.info(f"NEW SECTION - Updated place of service: '{self.current_place_of_service}'")
+                
+            if section.plan_type_found:
+                self.current_plan_type = section.plan_type_found
+                logger.info(f"NEW SECTION - Updated plan type: '{self.current_plan_type}'")
     
     def write_rows(self, extraction: PageExtraction) -> int:
-        """Write extracted rows to CSV"""
+        """Write extracted rows using current stored context"""
         if not self.csv_writer:
             return 0
         
@@ -121,15 +160,15 @@ class StateManager:
         for section in extraction.sections:
             for row in section.table_rows:
                 csv_row = [
-                    self.current_system_name,
-                    self.current_effective_date,
-                    self.current_hospitals,
-                    self.current_lob,
-                    section.place_of_service,
-                    section.plan_type,
-                    row.service,
-                    row.billing_codes,
-                    row.rate
+                    self.system_name,                    # Stored once for PDF
+                    self.effective_date,                 # Stored once for PDF
+                    self.current_hospitals,              # Sticky until new header
+                    self.current_lob,                   # Sticky until new header
+                    self.current_place_of_service,      # Sticky until new section
+                    self.current_plan_type,             # Sticky until new section
+                    row.service,                        # From current row
+                    row.billing_codes,                  # From current row
+                    row.rate                            # From current row
                 ]
                 self.csv_writer.writerow(csv_row)
                 rows_written += 1
@@ -139,6 +178,17 @@ class StateManager:
         
         return rows_written
     
+    def get_current_state(self):
+        """Get current state for debugging"""
+        return {
+            'system_name': self.system_name,
+            'effective_date': self.effective_date,
+            'hospitals': self.current_hospitals,
+            'lob': self.current_lob,
+            'place_of_service': self.current_place_of_service,
+            'plan_type': self.current_plan_type
+        }
+    
     def close_csv(self):
         """Close CSV file"""
         if self.csv_file:
@@ -147,53 +197,72 @@ class StateManager:
             self.csv_writer = None
 
 class PDFExtractor:
-    """PDF extractor for testing single PDFs"""
+    """PDF extractor using hierarchical store-and-reuse approach"""
     
     def __init__(self, client, output_dir: str = "extraction_output"):
         self.client = client
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.state_manager = StateManager()
+        self.state_manager = HierarchicalStateManager()
     
     def get_extraction_prompt(self) -> str:
-        """Generate extraction prompt following the 4-part hierarchy"""
+        """Generate extraction prompt based on real PDF examples"""
         json_schema = json.dumps(PageExtraction.model_json_schema(), indent=2)
         
         return f"""
-You are an expert data extraction specialist. Analyze this hospital rate schedule page and extract data following this exact hierarchy:
+You are an expert data extraction specialist. Extract data from this hospital rate schedule page using a hierarchical approach.
 
-**Part 1: Document-Level Context**
-- system_name: Main system name (e.g., "Memorial Health System") 
-- effective_date: Document effective date
+**EXTRACTION STRATEGY - Top to Bottom:**
 
-**Part 2: Header-Level Context (Sticky)**
-- hospital_names: Specific hospital names (not system names)
-- line_of_business: LOB from headers (e.g., "Commercial Gatekeeper", "Qualified Health Plan Rates")
+**1. Document-Level Info (extract only if visible on THIS page):**
+- system_name_found: Look at the very top corner for system names like "Mercy Health", "Memorial Health System", "Advocate Health And Hospital Corporation"
+- effective_date_found: Look for "Effective Date:" followed by a date like "09/01/2024", "06/01/2025"
 
-**Part 3: Sub-Header-Level Context (Sticky)**
-- place_of_service: Service location (e.g., "INPATIENT RATES", "OUTPATIENT CARVE OUT RATES")  
-- plan_type: Plan type if present, otherwise "N/A"
+**2. Header-Level Info (extract only if NEW main header appears):**
+- hospital_names_found: Look for specific hospital names in main titles like:
+  * "Mercy Springfield and Urbana Hospitals"
+  * "Sistersville General Hospital" 
+  * "Advocate Condell Medical Center and Advocate Sherman Hospital"
+  * NOT system names like "Mercy Health" or "Memorial Health System"
+- line_of_business_found: Look for LOB in main headers like:
+  * "COMMERCIAL GATEKEEPER AND NON-GATEKEEPER PRODUCTS"
+  * "Qualified Health Plan rates"
+  * Extract the full LOB text
 
-**Part 4: Row-Level Extraction**
-For each table row, extract verbatim text for:
-- service: Full service description
-- billing_codes: Complete billing codes text  
-- rate: Complete rate text with all conditions
+**3. Table Sections (extract when NEW section headers appear):**
+For each section, look for:
+- place_of_service_found: NEW section titles like:
+  * "INPATIENT RATES"
+  * "OUTPATIENT RATES" 
+  * "INPATIENT CARVE OUT RATES"
+  * "OUTPATIENT CARVE OUT RATES"
+  Extract only if this is a NEW section header
+- plan_type_found: Sub-headers under place_of_service like:
+  * "For POS (Point of Service)..."
+  * "For EPO (Exclusive Provider Organization)..."
+  Extract only if found under NEW section
+- table_rows: Extract ALL rows from tables with:
+  * service: Full service description (e.g., "DRG With Transfer Rate of 60% Of Eligible Billed Charges")
+  * billing_codes: Complete codes (e.g., "All Active DRG Codes", "DRG Codes: 880-887")
+  * rate: Complete rate text (e.g., "$9,600.00 Base Rate - Applied based upon Medicare Weights")
 
-**EXTRACTION RULES:**
-- Only return values if visible on THIS page
-- Extract ALL table rows found
-- Preserve exact text - do not modify or parse
-- Use "N/A" when values are not present
-- Return valid JSON only
+**CRITICAL RULES:**
+- Only extract system_name_found/effective_date_found if you SEE them on this page
+- Only extract hospital_names_found/line_of_business_found if you see a NEW main header section
+- Preserve ALL text exactly as written - do not modify or shorten
+- Extract every single table row you find
 
 **JSON Schema:**
 {json_schema}
 """
     
     def process_page(self, image_path: Path, page_num: int) -> Tuple[int, bool]:
-        """Process single page"""
+        """Process single page with hierarchical approach"""
         logger.info(f"Processing page {page_num}: {image_path.name}")
+        
+        # Show current state before processing
+        current_state = self.state_manager.get_current_state()
+        logger.info(f"Current state: {current_state}")
         
         try:
             with open(image_path, 'rb') as f:
@@ -202,9 +271,8 @@ For each table row, extract verbatim text for:
             mime_type = 'image/png' if image_path.suffix.lower() == '.png' else 'image/jpeg'
             prompt = self.get_extraction_prompt()
             
-            # Try different API call patterns for compatibility
+            # API call with fallback
             try:
-                # Vertex AI style
                 response = self.client.models.generate_content(
                     model='gemini-2.0-flash',
                     contents=[
@@ -213,7 +281,6 @@ For each table row, extract verbatim text for:
                     ]
                 )
             except (AttributeError, TypeError):
-                # Standard client style
                 response = self.client.generate_content(
                     contents=[
                         types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
@@ -221,7 +288,7 @@ For each table row, extract verbatim text for:
                     ]
                 )
             
-            # Clean response text
+            # Clean response
             response_text = response.text.strip()
             if response_text.startswith('```json'):
                 response_text = response_text.split('```json')[1]
@@ -229,12 +296,21 @@ For each table row, extract verbatim text for:
                 response_text = response_text.rsplit('```', 1)[0]
             response_text = response_text.strip()
             
-            # Parse and process
+            # Parse and update state
             extraction = PageExtraction.model_validate_json(response_text)
-            self.state_manager.update_state(extraction)
+            
+            # Update hierarchical state (store and reuse)
+            self.state_manager.update_from_page(extraction)
+            
+            # Write rows using stored context
             rows_written = self.state_manager.write_rows(extraction)
             
             logger.info(f"Page {page_num}: {rows_written} rows extracted")
+            
+            # Show updated state after processing
+            updated_state = self.state_manager.get_current_state()
+            logger.info(f"Updated state: {updated_state}")
+            
             return rows_written, True
             
         except Exception as e:
@@ -242,13 +318,13 @@ For each table row, extract verbatim text for:
             return 0, False
     
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
-        """Extract data from single PDF - main testing function"""
+        """Extract data from single PDF using store-and-reuse approach"""
         pdf_path = Path(pdf_path)
-        logger.info(f"Starting extraction: {pdf_path.name}")
+        logger.info(f"Starting hierarchical extraction: {pdf_path.name}")
         
         try:
             # Reset state for new PDF
-            self.state_manager.reset_state()
+            self.state_manager.reset_document_state()
             
             # Convert to images
             image_output_dir = self.output_dir / pdf_path.stem / "images"
@@ -259,29 +335,36 @@ For each table row, extract verbatim text for:
             csv_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_manager.start_csv(csv_path)
             
-            # Process each page
+            # Process pages sequentially (top to bottom)
             total_rows = 0
             successful_pages = 0
             
+            logger.info("Processing pages sequentially (top to bottom)...")
+            
             for i, image_path in enumerate(image_paths, 1):
+                logger.info(f"\n--- PAGE {i} ---")
                 rows, success = self.process_page(image_path, i)
                 total_rows += rows
                 if success:
                     successful_pages += 1
             
-            # Results
+            # Final state
+            final_state = self.state_manager.get_current_state()
+            
             results = {
                 'pdf_name': pdf_path.name,
                 'total_pages': len(image_paths),
                 'successful_pages': successful_pages,
                 'total_rows': total_rows,
                 'csv_path': str(csv_path),
+                'final_state': final_state,
                 'success_rate': f"{successful_pages}/{len(image_paths)}"
             }
             
-            logger.info(f"Extraction complete: {pdf_path.name}")
+            logger.info(f"\nExtraction complete: {pdf_path.name}")
+            logger.info(f"Final state: {final_state}")
             logger.info(f"Pages: {successful_pages}/{len(image_paths)} successful")
-            logger.info(f"Rows extracted: {total_rows}")
+            logger.info(f"Total rows: {total_rows}")
             logger.info(f"CSV saved: {csv_path}")
             
             return results
@@ -296,7 +379,6 @@ For each table row, extract verbatim text for:
 def create_client():
     """Create client with your setup"""
     try:
-        # Using your Vertex AI setup
         client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
         logger.info("Created Vertex AI client")
         return client
@@ -305,7 +387,7 @@ def create_client():
         raise
 
 if __name__ == "__main__":
-    # Test single PDF
+    # Test single PDF with hierarchical approach
     pdf_file = r"path/to/your/test.pdf"  # Change this to your test PDF
     
     try:
@@ -313,20 +395,21 @@ if __name__ == "__main__":
         client = create_client()
         
         # Create extractor
-        extractor = PDFExtractor(client=client, output_dir="test_extraction")
+        extractor = PDFExtractor(client=client, output_dir="hierarchical_extraction")
         
-        # Extract from single PDF
+        # Extract using store-and-reuse approach
         results = extractor.extract_from_pdf(pdf_file, dpi=200)
         
         # Print results
-        print("\n" + "="*50)
-        print("EXTRACTION RESULTS")
-        print("="*50)
+        print("\n" + "="*60)
+        print("HIERARCHICAL EXTRACTION RESULTS")
+        print("="*60)
         print(f"PDF: {results['pdf_name']}")
         print(f"Pages processed: {results['success_rate']}")
         print(f"Total rows: {results['total_rows']}")
+        print(f"Final state: {results['final_state']}")
         print(f"CSV output: {results['csv_path']}")
-        print("="*50)
+        print("="*60)
         
     except Exception as e:
         logger.critical(f"Extraction failed: {e}")
