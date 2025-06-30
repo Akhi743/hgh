@@ -250,81 +250,79 @@ class PDFExtractor:
         self.state_manager = HierarchicalStateManager()
     
     def get_extraction_prompt(self) -> str:
-        """Generate extraction prompt based on real PDF examples"""
+        """Generate robust extraction prompt following systematic methodology"""
         json_schema = json.dumps(PageExtraction.model_json_schema(), indent=2)
         
         return f"""
-You are an expert data extraction specialist. Extract data from this hospital rate schedule page using a hierarchical approach.
+You are an expert data extraction specialist. Follow this systematic approach to extract data from hospital rate schedule pages:
 
-**EXTRACTION STRATEGY - Top to Bottom:**
+**STEP 1: SYSTEMATIC PAGE SCAN**
+Scan the ENTIRE page from top to bottom looking for:
+1. System names (top corner areas)
+2. Effective dates (top corner areas) 
+3. Hospital/facility names (anywhere on page containing "Hospital", "Medical Center", "Clinic", "Health Center")
+4. Business line information (anywhere near hospital names)
+5. Section headers for place of service
+6. Structured data tables
 
-**1. Document-Level Info (extract only if visible on THIS page):**
-- system_name_found: Look at the very top corner for system names like "Mercy Health", "Memorial Health System", "Advocate Health And Hospital Corporation"
-- effective_date_found: Look for "Effective Date:" followed by a date like "09/01/2024", "06/01/2025"
+**STEP 2: HOSPITAL NAME DETECTION (CRITICAL)**
+Search for these patterns ANYWHERE on the page:
+- [Name] Hospital
+- [Name] Medical Center  
+- [Name] Clinic
+- [Name] Health Center
+- [Name] General Hospital
+- [Name] Memorial Hospital
 
-**2. Header-Level Info (extract when you see a MAIN HEADER):**
-- hospital_names_found: When you see a MAIN HEADER section, ALWAYS extract the hospital names
-  * Look for hospital names in main document titles/headers
-  * Extract ANY hospital names you see, regardless of health system
-  * Examples: "Hospital Name", "Medical Center Name", "Health System Hospital"
-  * Can be single hospital or multiple hospitals
-  * ALWAYS extract this - do NOT reuse previous hospital names
-- line_of_business_found: When you see a MAIN HEADER section, ALWAYS extract the LOB
-  * Look for business line information in main headers
-  * Examples: "Qualified Health Plan rates", "Commercial", "Medicare", "Medicaid"
-  * Extract whatever LOB text you find
-  * ALWAYS extract this - do NOT reuse previous LOB
+EXTRACTION RULES:
+- Extract the complete facility name
+- Remove TIN numbers, tax IDs, or other identifiers
+- If you find multiple hospitals, extract all of them
+- NEVER skip hospital names - this is MANDATORY
 
-**3. Table Sections (extract when NEW section headers appear):**
-For each section, look for:
-- place_of_service_found: NEW section titles like:
-  * "INPATIENT RATES"
-  * "OUTPATIENT RATES" 
-  * "INPATIENT CARVE OUT RATES"
-  * "OUTPATIENT CARVE OUT RATES"
-  Extract only if this is a NEW section header
-- plan_type_found: Sub-headers under place_of_service like:
-  * "For POS (Point of Service)..."
-  * "For EPO (Exclusive Provider Organization)..."
-  Extract only if found under NEW section
-- table_rows: Extract ONLY from PROPER TABLES that have:
-  * Clear table structure with borders/lines
-  * Column headers: Service | Billing Codes | Rates (or similar)
-  * Multiple organized rows in table format
-  * DO NOT extract from scattered data or lists
-  * DO NOT extract if data is not in a structured table
-  For each valid table row extract:
-  * service: Full service description (e.g., "DRG With Transfer Rate of 60% Of Eligible Billed Charges")
-  * billing_codes: Complete codes (e.g., "All Active DRG Codes", "DRG Codes: 880-887")
-  * rate: Complete rate text (e.g., "$9,600.00 Base Rate - Applied based upon Medicare Weights")
+**STEP 3: BUSINESS LINE DETECTION**
+Look for these terms near hospital names:
+- Commercial, Medicare, Medicaid
+- Qualified Health Plan, Health Plan Rates
+- Gatekeeper, Non-Gatekeeper
+- Any insurance or plan type mentioned
 
-**CRITICAL RULES:**
-- MAIN HEADER = New section with hospital names + LOB together
-- When you see ANY hospital name in a main header: ALWAYS extract hospital_names_found
-- When you see ANY LOB information in a main header: ALWAYS extract line_of_business_found  
-- NEVER reuse previous hospital names or LOB when a MAIN HEADER appears
-- A MAIN HEADER means this is a completely new section for different hospitals
-- Extract hospital names from titles like "Hospital Service and Rate Schedule" sections
-- Look for hospital names anywhere in main document headers, regardless of health system
-- Only extract place_of_service_found if you see a NEW section header like "INPATIENT RATES", "OUTPATIENT RATES", etc.
-- ONLY extract table_rows from PROPER STRUCTURED TABLES with clear borders and column headers
-- DO NOT extract from scattered data, lists, or unstructured content
-- DO NOT extract if you don't see a clear table with Service|Billing Codes|Rates columns
-- Extract table_rows ONLY from tables that look like organized data tables - STOP at table borders
-- Do NOT extract from "TERMS AND CONDITIONS", footnotes, or text sections
-- Preserve ALL text exactly as written - do not modify or shorten
+**STEP 4: SECTION HEADER DETECTION**
+Identify place of service sections:
+- INPATIENT RATES, OUTPATIENT RATES
+- INPATIENT CARVE OUT RATES, OUTPATIENT CARVE OUT RATES
+- Any section with "RATES" in the title
+
+**STEP 5: TABLE VALIDATION**
+Only extract from tables that have:
+- Clear structure with borders/lines
+- Column headers (Service, Billing Codes, Rates)
+- Multiple organized data rows
+- NOT scattered text or lists
+
+**STEP 6: DATA EXTRACTION**
+For valid tables, extract each row with:
+- service: Complete service description
+- billing_codes: All billing codes as written
+- rate: Complete rate information with conditions
+
+**OUTPUT REQUIREMENTS:**
+- Return valid JSON matching the schema
+- Only extract fields visible on THIS page
+- Use null for fields not found on current page
+- Preserve all text exactly as written
 
 **JSON Schema:**
 {json_schema}
 """
     
     def process_page(self, image_path: Path, page_num: int) -> Tuple[int, bool]:
-        """Process single page with hierarchical approach"""
-        logger.info(f"Processing page {page_num}: {image_path.name}")
+        """Process single page with systematic methodology and debugging"""
+        logger.info(f"=== PROCESSING PAGE {page_num}: {image_path.name} ===")
         
         # Show current state before processing
         current_state = self.state_manager.get_current_state()
-        logger.info(f"Current state: {current_state}")
+        logger.info(f"Current state before processing: {current_state}")
         
         try:
             with open(image_path, 'rb') as f:
@@ -332,6 +330,8 @@ For each section, look for:
             
             mime_type = 'image/png' if image_path.suffix.lower() == '.png' else 'image/jpeg'
             prompt = self.get_extraction_prompt()
+            
+            logger.info("Sending extraction request to AI...")
             
             # API call with fallback
             try:
@@ -350,6 +350,8 @@ For each section, look for:
                     ]
                 )
             
+            logger.info("Received response from AI, parsing...")
+            
             # Clean response
             response_text = response.text.strip()
             if response_text.startswith('```json'):
@@ -358,25 +360,49 @@ For each section, look for:
                 response_text = response_text.rsplit('```', 1)[0]
             response_text = response_text.strip()
             
-            # Parse and update state
+            # Debug: Log raw response
+            logger.info(f"Cleaned AI response: {response_text[:500]}...")
+            
+            # Parse and validate
             extraction = PageExtraction.model_validate_json(response_text)
             
-            # Update hierarchical state (store and reuse)
+            # Debug: Log what was extracted
+            logger.info(f"Extracted fields:")
+            logger.info(f"  - system_name_found: {extraction.system_name_found}")
+            logger.info(f"  - effective_date_found: {extraction.effective_date_found}")
+            logger.info(f"  - hospital_names_found: {extraction.hospital_names_found}")
+            logger.info(f"  - line_of_business_found: {extraction.line_of_business_found}")
+            logger.info(f"  - sections found: {len(extraction.sections)}")
+            
+            # Update hierarchical state
             self.state_manager.update_from_page(extraction)
             
             # Write rows using stored context
             rows_written = self.state_manager.write_rows(extraction)
             
-            logger.info(f"Page {page_num}: {rows_written} rows extracted")
-            
             # Show updated state after processing
             updated_state = self.state_manager.get_current_state()
-            logger.info(f"Updated state: {updated_state}")
+            logger.info(f"Updated state after processing: {updated_state}")
+            logger.info(f"Page {page_num}: {rows_written} rows extracted")
+            
+            # Validation checks
+            if extraction.hospital_names_found:
+                logger.info(f"✅ SUCCESS: Hospital name extracted on page {page_num}")
+            else:
+                logger.warning(f"⚠️  WARNING: No hospital name extracted on page {page_num}")
+                
+            if extraction.sections:
+                logger.info(f"✅ SUCCESS: {len(extraction.sections)} sections found on page {page_num}")
+            else:
+                logger.warning(f"⚠️  WARNING: No sections found on page {page_num}")
             
             return rows_written, True
             
         except Exception as e:
-            logger.error(f"Failed to process page {page_num}: {e}")
+            logger.error(f"❌ CRITICAL ERROR on page {page_num}: {e}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return 0, False
     
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
