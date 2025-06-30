@@ -265,10 +265,12 @@ You are an expert data extraction specialist. Extract data from this hospital ra
 **2. Header-Level Info (SCAN EVERY PAGE FOR HOSPITAL NAMES):**
 - hospital_names_found: SCAN THE ENTIRE PAGE for hospital/medical facility names. Finding these names is the most important step for context.
   * Look in page headers, footers, main document titles, and any prominent text boxes.
-  * Hospital names often contain words like: "Hospital", "Medical Center", "Clinic", "Health Center"
+  * Hospital names must be COMPLETE facility names, not just the word "Hospital"
+  * Valid examples: "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital", "Sistersville General Hospital"
+  * INVALID examples: Just "Hospital" by itself - this is NOT a hospital name
   * Extract the complete facility name (without TIN numbers).
-  * Examples: "Mercy Tiffin Hospital", "Sistersville General Hospital", "St. Rita's Hospital"
-  * ALWAYS extract when found - this is MANDATORY
+  * ONLY extract when you find a COMPLETE hospital name - NEVER extract just "Hospital"
+  * DO NOT extract if you only see the word "Hospital" without the facility name
 - line_of_business_found: Look for the overall business line. This describes the general insurance category.
   * Words like: "Commercial", "Medicare", "Medicaid", "Health Plan", "Qualified"
   * Often appears near hospital names in headers.
@@ -295,9 +297,12 @@ For each section, look for:
 **CRITICAL RULES:**
 - A document title like "Rate Schedule" or "Hospital Rates" is NOT a line_of_business_found. A Line of Business describes the general insurance category (e.g., Commercial, Medicare).
 - Plan Types (PPO, HMO, etc.) are found *within* a Place of Service section and should be extracted as plan_type_found.
-- SCAN EVERY PAGE for words "Hospital", "Medical Center", etc. When found, IMMEDIATELY extract as hospital_names_found.
+- SCAN EVERY PAGE for COMPLETE hospital names, NOT just the word "Hospital" by itself.
+- DO NOT extract hospital_names_found if you only see "Hospital" without the facility name.
+- ONLY extract hospital_names_found when you see COMPLETE facility names like "Mercy Springfield and Urbana Hospitals".
 - Remove TIN numbers but keep the hospital name.
-- EVERY hospital name must be extracted - NO EXCEPTIONS
+- EVERY COMPLETE hospital name must be extracted - NO EXCEPTIONS
+- If you only see "Hospital" in a table cell, DO NOT extract it as hospital_names_found
 - Preserve ALL text in table rows exactly as written.
 
 **JSON Schema:**
