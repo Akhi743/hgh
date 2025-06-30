@@ -133,12 +133,10 @@ Follow this precise hierarchical logic:
 
 3. **Extract Section Data:** For each section, extract place_of_service, plan_type (if any, else "N/A"), and all table_rows. For each row, extract service, billing_codes, and rate.
 
-Your output **MUST** be a valid JSON object that strictly adheres to the following schema.
+**IMPORTANT**: Return ONLY valid JSON without any markdown formatting, code blocks, or explanatory text.
 
 **JSON Schema:**
-```json
 {json_schema_str}
-```
 """
     
     def process_page(self, image_path: Path, page_num: int) -> int:
@@ -155,8 +153,7 @@ Your output **MUST** be a valid JSON object that strictly adheres to the followi
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                     prompt
-                ],
-                generation_config={"response_mime_type": "application/json"}
+                ]
             )
             
             # Clean the response text to remove markdown formatting
