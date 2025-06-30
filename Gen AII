@@ -250,67 +250,55 @@ class PDFExtractor:
         self.state_manager = HierarchicalStateManager()
     
     def get_extraction_prompt(self) -> str:
-        """Generate robust extraction prompt following systematic methodology"""
+        """Generate extraction prompt based on real PDF examples"""
         json_schema = json.dumps(PageExtraction.model_json_schema(), indent=2)
         
         return f"""
-You are an expert data extraction specialist. Follow this systematic approach to extract data from hospital rate schedule pages:
+You are an expert data extraction specialist. Extract data from this hospital rate schedule page using a hierarchical approach.
 
-**STEP 1: SYSTEMATIC PAGE SCAN**
-Scan the ENTIRE page from top to bottom looking for:
-1. System names (top corner areas)
-2. Effective dates (top corner areas) 
-3. Hospital/facility names (anywhere on page containing "Hospital", "Medical Center", "Clinic", "Health Center")
-4. Business line information (anywhere near hospital names)
-5. Section headers for place of service
-6. Structured data tables
+**EXTRACTION STRATEGY - Top to Bottom:**
 
-**STEP 2: HOSPITAL NAME DETECTION (CRITICAL)**
-Search for these patterns ANYWHERE on the page:
-- [Name] Hospital
-- [Name] Medical Center  
-- [Name] Clinic
-- [Name] Health Center
-- [Name] General Hospital
-- [Name] Memorial Hospital
+**1. Document-Level Info (extract only if visible on THIS page):**
+- system_name_found: Look at the very top corner for system names like "Mercy Health", "Memorial Health System", "Advocate Health And Hospital Corporation"
+- effective_date_found: Look for "Effective Date:" followed by a date like "09/01/2024", "06/01/2025"
 
-EXTRACTION RULES:
-- Extract the complete facility name
-- Remove TIN numbers, tax IDs, or other identifiers
-- If you find multiple hospitals, extract all of them
-- NEVER skip hospital names - this is MANDATORY
+**2. Header-Level Info (SCAN EVERY PAGE FOR HOSPITAL NAMES):**
+- hospital_names_found: SCAN THE ENTIRE PAGE for hospital/medical facility names. Finding these names is the most important step for context.
+  * Look in page headers, footers, main document titles, and any prominent text boxes.
+  * Hospital names often contain words like: "Hospital", "Medical Center", "Clinic", "Health Center"
+  * Extract the complete facility name (without TIN numbers).
+  * Examples: "Mercy Tiffin Hospital", "Sistersville General Hospital", "St. Rita's Hospital"
+  * ALWAYS extract when found - this is MANDATORY
+- line_of_business_found: Look for the overall business line. This describes the general insurance category.
+  * Words like: "Commercial", "Medicare", "Medicaid", "Health Plan", "Qualified"
+  * Often appears near hospital names in headers.
+  * Extract the complete business line description.
 
-**STEP 3: BUSINESS LINE DETECTION**
-Look for these terms near hospital names:
-- Commercial, Medicare, Medicaid
-- Qualified Health Plan, Health Plan Rates
-- Gatekeeper, Non-Gatekeeper
-- Any insurance or plan type mentioned
+**3. Table Sections (extract when NEW section headers appear):**
+For each section, look for:
+- place_of_service_found: NEW section titles like:
+  * "INPATIENT RATES"
+  * "OUTPATIENT RATES"
+  * "INPATIENT CARVE OUT RATES"
+  * "OUTPATIENT CARVE OUT RATES"
+  Extract only if this is a NEW section header.
+- plan_type_found: Sub-headers under place_of_service that specify a plan variation.
+  * Look for keywords like: "PPO", "HMO", "EPO", "POS", "Point of Service", "Exclusive Provider Organization".
+  * Extract only if found under a NEW section header.
+- table_rows: Extract data from any content organized into clear columns and rows, even if visual borders or lines are faint or missing. Look for repeating row structures under headers like "Service", "Billing Codes", and "Rates".
+  * DO NOT extract from paragraphs or unstructured lists. The data must be in a grid-like or columnar format.
+  * For each valid table row extract:
+    * service: Full service description.
+    * billing_codes: Complete billing codes.
+    * rate: Complete rate text.
 
-**STEP 4: SECTION HEADER DETECTION**
-Identify place of service sections:
-- INPATIENT RATES, OUTPATIENT RATES
-- INPATIENT CARVE OUT RATES, OUTPATIENT CARVE OUT RATES
-- Any section with "RATES" in the title
-
-**STEP 5: TABLE VALIDATION**
-Only extract from tables that have:
-- Clear structure with borders/lines
-- Column headers (Service, Billing Codes, Rates)
-- Multiple organized data rows
-- NOT scattered text or lists
-
-**STEP 6: DATA EXTRACTION**
-For valid tables, extract each row with:
-- service: Complete service description
-- billing_codes: All billing codes as written
-- rate: Complete rate information with conditions
-
-**OUTPUT REQUIREMENTS:**
-- Return valid JSON matching the schema
-- Only extract fields visible on THIS page
-- Use null for fields not found on current page
-- Preserve all text exactly as written
+**CRITICAL RULES:**
+- A document title like "Rate Schedule" or "Hospital Rates" is NOT a line_of_business_found. A Line of Business describes the general insurance category (e.g., Commercial, Medicare).
+- Plan Types (PPO, HMO, etc.) are found *within* a Place of Service section and should be extracted as plan_type_found.
+- SCAN EVERY PAGE for words "Hospital", "Medical Center", etc. When found, IMMEDIATELY extract as hospital_names_found.
+- Remove TIN numbers but keep the hospital name.
+- EVERY hospital name must be extracted - NO EXCEPTIONS
+- Preserve ALL text in table rows exactly as written.
 
 **JSON Schema:**
 {json_schema}
