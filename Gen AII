@@ -138,17 +138,19 @@ class HierarchicalStateManager:
             # ALWAYS update hospital names when found - this indicates a NEW section
             old_hospitals = self.current_hospitals
             self.current_hospitals = extraction.hospital_names_found
-            # RESET place of service when new hospital section starts
+            # RESET place of service AND plan type when new hospital section starts
             self.current_place_of_service = "N/A"
-            logger.info(f"NEW HEADER DETECTED - Changed hospital names from '{old_hospitals}' to '{self.current_hospitals}' - Reset place of service to N/A")
+            self.current_plan_type = "N/A"
+            logger.info(f"NEW HEADER DETECTED - Changed hospital names from '{old_hospitals}' to '{self.current_hospitals}' - Reset place of service and plan type to N/A")
             
         if extraction.line_of_business_found:
             # ALWAYS update LOB when found - this indicates a NEW section
             old_lob = self.current_lob
             self.current_lob = extraction.line_of_business_found
-            # RESET place of service when new LOB section starts
+            # RESET place of service AND plan type when new LOB section starts
             self.current_place_of_service = "N/A"
-            logger.info(f"NEW HEADER DETECTED - Changed LOB from '{old_lob}' to '{self.current_lob}' - Reset place of service to N/A")
+            self.current_plan_type = "N/A"
+            logger.info(f"NEW HEADER DETECTED - Changed LOB from '{old_lob}' to '{self.current_lob}' - Reset place of service and plan type to N/A")
         
         # 3. Sub-header-level: Update when new section appears
         for section in extraction.sections:
@@ -158,7 +160,9 @@ class HierarchicalStateManager:
                 if any(valid in section.place_of_service_found.upper() for valid in valid_sections):
                     old_pos = self.current_place_of_service
                     self.current_place_of_service = section.place_of_service_found
-                    logger.info(f"NEW SECTION DETECTED - Changed place of service from '{old_pos}' to '{self.current_place_of_service}'")
+                    # RESET plan type when new place of service starts
+                    self.current_plan_type = "N/A"
+                    logger.info(f"NEW SECTION DETECTED - Changed place of service from '{old_pos}' to '{self.current_place_of_service}' - Reset plan type to N/A")
                 else:
                     logger.warning(f"INVALID place_of_service ignored: '{section.place_of_service_found}' (not a valid section header)")
                 
@@ -190,7 +194,10 @@ class HierarchicalStateManager:
                     old_pos = self.current_place_of_service
                     self.current_place_of_service = section.place_of_service_found
                     section_place_of_service = self.current_place_of_service
-                    logger.info(f"Section {section_num}: Changed place of service from '{old_pos}' to '{self.current_place_of_service}'")
+                    # RESET plan type when new place of service detected
+                    self.current_plan_type = "N/A"
+                    section_plan_type = "N/A"
+                    logger.info(f"Section {section_num}: Changed place of service from '{old_pos}' to '{self.current_place_of_service}' - Reset plan type to N/A")
                 else:
                     logger.warning(f"Section {section_num}: Invalid place_of_service ignored: '{section.place_of_service_found}'")
             
