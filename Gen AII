@@ -250,33 +250,42 @@ class PDFExtractor:
         self.state_manager = HierarchicalStateManager()
     
     def get_extraction_prompt(self) -> str:
-        """Generate extraction prompt based on real PDF examples"""
+        """Generate truly generic extraction prompt for any hospital system"""
         json_schema = json.dumps(PageExtraction.model_json_schema(), indent=2)
         
         return f"""
-You are an expert data extraction specialist. Extract data from this hospital rate schedule page using a hierarchical approach.
+You are an automated data extraction expert specializing in hospital rate schedules. Your task is to analyze the header of the provided document image and extract the following four key pieces of information.
 
-**EXTRACTION STRATEGY - Top to Bottom:**
+**1. system_name_found**
+* **What it is:** The name of the parent health system or corporation.
+* **Where to look:** Typically found in the top-right corner of the page.
+* **Examples:** "Advocate Health And Hospital Corporation", "Mercy Health (Ohio)", "Memorial Health System", "Henry Ford Health System".
 
-**1. Document-Level Info (extract only if visible on THIS page):**
-- system_name_found: Look at the very top corner for system names like "Mercy Health", "Memorial Health System", "Advocate Health And Hospital Corporation"
-- effective_date_found: Look for "Effective Date:" followed by a date like "09/01/2024", "06/01/2025"
+**2. hospital_names_found**
+* **What it is:** The specific name(s) of the hospital(s) covered by the rate schedule. This can be a single hospital or a list of several.
+* **Where to look:** Usually located in the center of the header, often in a large font.
+* **CRITICAL RULE:** If you see a Taxpayer Identification Number (TIN) next to a name, **extract the name only** and discard the TIN.
+* **Examples:**
+   * "Mercy Health Youngstown Hospital"
+   * "Mercy Tiffin Hospital"
+   * "Cleveland Clinic Foundation"
+   * "Marietta Memorial and Selby General Hospital" *(extracted from "Marietta Memorial TIN 314379509 and Selby General Hospital TIN 314413259")*
 
-**2. Header-Level Info (SCAN EVERY PAGE FOR HOSPITAL NAMES):**
-- hospital_names_found: SCAN THE ENTIRE PAGE for hospital/medical facility names. Finding these names is the most important step for context.
-  * Look in page headers, footers, main document titles, and any prominent text boxes.
-  * Hospital names must be COMPLETE facility names, not just the word "Hospital"
-  * Valid examples: "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital", "Sistersville General Hospital"
-  * INVALID examples: Just "Hospital" by itself - this is NOT a hospital name
-  * Extract the complete facility name (without TIN numbers).
-  * ONLY extract when you find a COMPLETE hospital name - NEVER extract just "Hospital"
-  * DO NOT extract if you only see the word "Hospital" without the facility name
-- line_of_business_found: Look for the overall business line. This describes the general insurance category.
-  * Words like: "Commercial", "Medicare", "Medicaid", "Health Plan", "Qualified"
-  * Often appears near hospital names in headers.
-  * Extract the complete business line description.
+**3. line_of_business_found**
+* **What it is:** The type of insurance plan or rate agreement. This is the most important field for categorizing the document.
+* **CRITICAL RULE:** Do NOT extract generic titles like "HOSPITAL SERVICE AND RATE SCHEDULE" or "RATE ADDENDA A-1". The Line of Business specifies the plan type.
+* **Keywords to look for:** "Commercial", "Gatekeeper", "Non-Gatekeeper", "Qualified Health Plan", "Medicare", "Medicaid".
+* **Examples:**
+   * "COMMERCIAL GATEKEEPER AND NON-GATEKEEPER PRODUCTS"
+   * "Qualified Health Plan Rates"
+   * "COMMERCIAL RATE SCHEDULE"
 
-**3. Table Sections (extract when NEW section headers appear):**
+**4. effective_date_found**
+* **What it is:** The date when the rates become effective.
+* **Where to look:** Look for the label "Effective Date:". It is almost always in the top-right corner.
+* **Examples:** "01/01/2025", "09/01/2024", "06/01/2025".
+
+**5. Place of Service Sections**
 For each section, look for:
 - place_of_service_found: NEW section titles like:
   * "INPATIENT RATES"
@@ -287,6 +296,8 @@ For each section, look for:
 - plan_type_found: Sub-headers under place_of_service that specify a plan variation.
   * Look for keywords like: "PPO", "HMO", "EPO", "POS", "Point of Service", "Exclusive Provider Organization".
   * Extract only if found under a NEW section header.
+
+**6. Table Data Extraction**
 - table_rows: Extract data from any content organized into clear columns and rows, even if visual borders or lines are faint or missing. Look for repeating row structures under headers like "Service", "Billing Codes", and "Rates".
   * DO NOT extract from paragraphs or unstructured lists. The data must be in a grid-like or columnar format.
   * For each valid table row extract:
@@ -294,16 +305,12 @@ For each section, look for:
     * billing_codes: Complete billing codes.
     * rate: Complete rate text.
 
-**CRITICAL RULES:**
-- A document title like "Rate Schedule" or "Hospital Rates" is NOT a line_of_business_found. A Line of Business describes the general insurance category (e.g., Commercial, Medicare).
-- Plan Types (PPO, HMO, etc.) are found *within* a Place of Service section and should be extracted as plan_type_found.
-- SCAN EVERY PAGE for COMPLETE hospital names, NOT just the word "Hospital" by itself.
-- DO NOT extract hospital_names_found if you only see "Hospital" without the facility name.
-- ONLY extract hospital_names_found when you see COMPLETE facility names like "Mercy Springfield and Urbana Hospitals".
-- Remove TIN numbers but keep the hospital name.
-- EVERY COMPLETE hospital name must be extracted - NO EXCEPTIONS
-- If you only see "Hospital" in a table cell, DO NOT extract it as hospital_names_found
-- Preserve ALL text in table rows exactly as written.
+**EXTRACTION RULES:**
+- Only extract fields that are visible on THIS page
+- Use null for fields not found on current page
+- Remove TIN numbers but keep hospital names
+- Preserve ALL text in table rows exactly as written
+- Extract complete facility names and business line descriptions
 
 **JSON Schema:**
 {json_schema}
