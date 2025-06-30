@@ -6,202 +6,186 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
+from google.genai import types
+import google.genai as genai
 
-# Using the modern, recommended Google Gen AI SDK that you have installed
-import google.generativeai as genai
-
-# Configure logging to see the script's progress
 logging.basicConfig(
-   level=logging.INFO,
-   format='%(asctime)s - %(levelname)s - %(message)s',
-   handlers=[
-       logging.FileHandler('hospital_extraction.log'),
-       logging.StreamHandler()
-   ]
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('hospital_extraction.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# --- Data Models (The blueprint for our data) ---
-
 class TableRow(BaseModel):
-   service: str = Field(description="The full service description from the row.")
-   billing_codes: str = Field(description="The full, verbatim text of all billing codes in the cell.")
-   rate: str = Field(description="The full, verbatim text of the rate, including all conditions.")
+    service: str = Field(description="The full service description from the row.")
+    billing_codes: str = Field(description="The full, verbatim text of all billing codes in the cell.")
+    rate: str = Field(description="The full, verbatim text of the rate, including all conditions.")
 
 class Section(BaseModel):
-   place_of_service: str = Field(description="The title of this section (e.g., 'INPATIENT RATES', 'OUTPATIENT CARVE OUT RATES').")
-   plan_type: Optional[str] = Field(default="N/A", description="The plan type associated with this section (e.g., 'For POS...'). Defaults to 'N/A' if not present.")
-   table_rows: List[TableRow] = Field(description="A list of all table rows extracted from this specific section.")
+    place_of_service: str = Field(description="The title of this section (e.g., 'INPATIENT RATES', 'OUTPATIENT CARVE OUT RATES').")
+    plan_type: Optional[str] = Field(default="N/A", description="The plan type associated with this section (e.g., 'For POS...'). Defaults to 'N/A' if not present.")
+    table_rows: List[TableRow] = Field(description="A list of all table rows extracted from this specific section.")
 
 class PageExtraction(BaseModel):
-   system_name: Optional[str] = Field(default=None, description="The top-level system name for the entire document. Provide only if visible on this page.")
-   effective_date: Optional[str] = Field(default=None, description="The effective date for the document. Provide only if visible on this page.")
-   hospital_names: Optional[str] = Field(default=None, description="The specific hospital names in the page header. Provide only if visible on this page.")
-   line_of_business: Optional[str] = Field(default=None, description="The Line of Business in the page header. Provide only if visible on this page.")
-   sections: List[Section] = Field(description="A list of all data sections found on this page, from top to bottom.")
-
-# --- PDF and Image Conversion ---
+    system_name: Optional[str] = Field(default=None, description="The top-level system name for the entire document. Provide only if visible on this page.")
+    effective_date: Optional[str] = Field(default=None, description="The effective date for the document. Provide only if visible on this page.")
+    hospital_names: Optional[str] = Field(default=None, description="The specific hospital names in the page header. Provide only if visible on this page.")
+    line_of_business: Optional[str] = Field(default=None, description="The Line of Business in the page header. Provide only if visible on this page.")
+    sections: List[Section] = Field(description="A list of all data sections found on this page, from top to bottom.")
 
 def pdf_to_images(pdf_path: str, output_dir: Path, dpi: int = 200) -> List[Path]:
-   pdf_path = Path(pdf_path)
-   if not pdf_path.exists():
-       logger.error(f"PDF file not found: {pdf_path}")
-       raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-   output_dir.mkdir(parents=True, exist_ok=True)
-   image_paths = []
-   try:
-       doc = fitz.open(pdf_path)
-       logger.info(f"PDF '{pdf_path.name}' has {len(doc)} pages. Starting conversion...")
-       for page_num in range(len(doc)):
-           page = doc.load_page(page_num)
-           mat = fitz.Matrix(dpi / 72, dpi / 72)
-           pix = page.get_pixmap(matrix=mat)
-           output_path = output_dir / f"{pdf_path.stem}_page_{page_num + 1:03d}.png"
-           pix.save(str(output_path))
-           image_paths.append(output_path)
-       doc.close()
-       logger.info(f"Successfully converted all {len(image_paths)} pages.")
-   except Exception as e:
-       logger.error(f"Failed to convert PDF '{pdf_path.name}'. The file may be corrupted. Error: {e}")
-       raise
-   return image_paths
-
-# --- State and CSV Management ---
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        logger.error(f"PDF file not found: {pdf_path}")
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_paths = []
+    try:
+        doc = fitz.open(pdf_path)
+        logger.info(f"PDF '{pdf_path.name}' has {len(doc)} pages. Starting conversion...")
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            output_path = output_dir / f"{pdf_path.stem}_page_{page_num + 1:03d}.png"
+            pix.save(str(output_path))
+            image_paths.append(output_path)
+        doc.close()
+        logger.info(f"Successfully converted all {len(image_paths)} pages.")
+    except Exception as e:
+        logger.error(f"Failed to convert PDF '{pdf_path.name}'. The file may be corrupted. Error: {e}")
+        raise
+    return image_paths
 
 class StateManager:
-   def __init__(self):
-       self.columns = ["System name", "Effective date", "Hospital Name/Names", "Line of Business", "Place of service", "Plan type", "Service", "Billing codes", "Rate"]
-       self.reset_state()
-       
-   def reset_state(self):
-       self.current_system_name, self.current_effective_date, self.current_hospitals, self.current_lob = "N/A", "N/A", "N/A", "N/A"
-       self.csv_file, self.csv_writer, self.csv_path = None, None, None
-   
-   def start_csv(self, output_path: Path):
-       self.reset_state()
-       self.csv_path = output_path
-       self.csv_file = open(self.csv_path, 'w', newline='', encoding='utf-8')
-       self.csv_writer = csv.writer(self.csv_file)
-       self.csv_writer.writerow(self.columns)
-       logger.info(f"CSV file started: {self.csv_path}")
-
-   def update_state(self, extraction: PageExtraction):
-       if extraction.system_name: self.current_system_name = extraction.system_name
-       if extraction.effective_date: self.current_effective_date = extraction.effective_date
-       if extraction.hospital_names: self.current_hospitals = extraction.hospital_names
-       if extraction.line_of_business: self.current_lob = extraction.line_of_business
-           
-   def write_rows(self, extraction: PageExtraction) -> int:
-       rows_written = 0
-       for section in extraction.sections:
-           for row in section.table_rows:
-               self.csv_writer.writerow([self.current_system_name, self.current_effective_date, self.current_hospitals, self.current_lob, section.place_of_service, section.plan_type, row.service, row.billing_codes, row.rate])
-               rows_written += 1
-       if self.csv_file: self.csv_file.flush()
-       if rows_written > 0: logger.info(f"Wrote {rows_written} new rows to CSV.")
-       else: logger.info("No table rows found on this page.")
-       return rows_written
-
-   def close_csv(self):
-       if self.csv_file:
-           logger.info(f"CSV file closed: {self.csv_path}")
-           self.csv_file.close()
-
-# --- AI Model and Prompting ---
+    def __init__(self):
+        self.columns = ["System name", "Effective date", "Hospital Name/Names", "Line of Business", "Place of service", "Plan type", "Service", "Billing codes", "Rate"]
+        self.reset_state()
+    
+    def reset_state(self):
+        self.current_system_name, self.current_effective_date, self.current_hospitals, self.current_lob = "N/A", "N/A", "N/A", "N/A"
+        self.csv_file, self.csv_writer, self.csv_path = None, None, None
+    
+    def start_csv(self, output_path: Path):
+        self.reset_state()
+        self.csv_path = output_path
+        self.csv_file = open(self.csv_path, 'w', newline='', encoding='utf-8')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(self.columns)
+    
+    def update_state(self, extraction: PageExtraction):
+        if extraction.system_name: 
+            self.current_system_name = extraction.system_name
+        if extraction.effective_date: 
+            self.current_effective_date = extraction.effective_date
+        if extraction.hospital_names: 
+            self.current_hospitals = extraction.hospital_names
+        if extraction.line_of_business: 
+            self.current_lob = extraction.line_of_business
+    
+    def write_rows(self, extraction: PageExtraction) -> int:
+        rows_written = 0
+        for section in extraction.sections:
+            for row in section.table_rows:
+                self.csv_writer.writerow([
+                    self.current_system_name, 
+                    self.current_effective_date, 
+                    self.current_hospitals, 
+                    self.current_lob, 
+                    section.place_of_service, 
+                    section.plan_type, 
+                    row.service, 
+                    row.billing_codes, 
+                    row.rate
+                ])
+                rows_written += 1
+        if self.csv_file: 
+            self.csv_file.flush()
+        return rows_written
+    
+    def close_csv(self):
+        if self.csv_file:
+            self.csv_file.close()
 
 class PDFExtractor:
-   def __init__(self, client, output_dir: str):
-       self.client = client
-       self.output_dir = Path(output_dir)
-       self.state_manager = StateManager()
-
-   def get_extraction_prompt(self) -> str:
-       json_schema_str = json.dumps(PageExtraction.model_json_schema(), indent=2)
-       return f"""
+    def __init__(self, client, output_dir: str):
+        self.client = client
+        self.output_dir = Path(output_dir)
+        self.state_manager = StateManager()
+    
+    def get_extraction_prompt(self) -> str:
+        json_schema_str = json.dumps(PageExtraction.model_json_schema(), indent=2)
+        return f"""
 You are an expert data extraction specialist. Your task is to analyze an image of a hospital rate schedule PDF page and convert it into a structured JSON object.
 
 Follow this precise hierarchical logic:
 
-1.  **Extract Top-Level Context:**
-   * Look at the very top of the page for document-wide context.
-   * `system_name`: The overall health system.
-   * `effective_date`: The effective date for the schedule.
-   * `hospital_names`: The specific hospital(s) this section applies to.
-   * `line_of_business`: The LOB for this section.
-   * **IMPORTANT**: Only return values for these fields if they are explicitly visible on the CURRENT page.
+1. **Extract Top-Level Context:** Look for system name (ignore), effective_date (extract), hospital_names (specific hospital names, not system names), line_of_business (LOB from main title). **IMPORTANT**: Only return values if explicitly visible on the CURRENT page.
 
-2.  **Scan for Data Sections:**
-   * Work from top to bottom of the page.
-   * Identify every "Place of Service" section (e.g., "INPATIENT RATES").
-   * For each section you find, perform the following steps.
+2. **Scan for Data Sections:** Identify every "Place of Service" section:
+   - INPATIENT RATES
+   - OUTPATIENT RATES  
+   - INPATIENT CARVE OUT RATES
+   - OUTPATIENT CARVE OUT RATES
 
-3.  **Extract Section Data:**
-   * `place_of_service`: The name of the section you identified.
-   * `plan_type`: Look for any associated plan type directly under the section header. If none, use "N/A".
-   * `table_rows`: Extract every single row from the table within this section.
-       * For each row, extract the full, verbatim text for `service`, `billing_codes`, and `rate`.
+3. **Extract Section Data:** For each section, extract place_of_service, plan_type (if any, else "N/A"), and all table_rows. For each row, extract service, billing_codes, and rate.
 
-Your output **MUST** be a valid JSON object that strictly adheres to the following schema. Do not include any other text or explanations.
+Your output **MUST** be a valid JSON object that strictly adheres to the following schema.
 
 **JSON Schema:**
 ```json
 {json_schema_str}
+```
 """
+    
+    def process_page(self, image_path: Path, page_num: int) -> int:
+        logger.info(f"--- Processing page {page_num}: {image_path.name} ---")
+        prompt = self.get_extraction_prompt()
+        try:
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            mime_type = 'image/png' if image_path.suffix.lower() == '.png' else 'image/jpeg'
+            
+            response = self.client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    prompt
+                ]
+            )
+            
+            extraction = PageExtraction.model_validate_json(response.text.strip())
+            self.state_manager.update_state(extraction)
+            return self.state_manager.write_rows(extraction)
+        except Exception as e:
+            logger.error(f"CRITICAL FAILURE on page {page_num}. Error: {e}")
+            return 0
+    
+    def extract_from_pdf(self, pdf_path: str, dpi: int = 200):
+        logger.info(f"===== STARTING EXTRACTION FOR PDF: {pdf_path} =====")
+        pdf_file = Path(pdf_path)
+        run_output_dir = self.output_dir / pdf_file.stem
+        try:
+            image_paths = pdf_to_images(pdf_path, run_output_dir, dpi)
+            csv_output_path = run_output_dir / f"{pdf_file.stem}_extracted_rates.csv"
+            self.state_manager.start_csv(csv_output_path)
+            for i, image_path in enumerate(image_paths):
+                self.process_page(image_path, page_num=i + 1)
+        finally:
+            self.state_manager.close_csv()
+        logger.info(f"===== EXTRACTION COMPLETE FOR: {pdf_path} =====")
 
-   def process_page(self, image_path: Path, page_num: int) -> int:
-       logger.info(f"--- Processing page {page_num}: {image_path.name} ---")
-       prompt = self.get_extraction_prompt()
-       try:
-           with open(image_path, 'rb') as f:
-               image_bytes = f.read()
-           
-           # This simplified format avoids the need for the broken 'Part' import.
-           image_for_model = {"mime_type": "image/png", "data": image_bytes}
-           
-           response = self.client.generate_content(
-               contents=[prompt, image_for_model],
-               generation_config={"response_mime_type": "application/json"}
-           )
-           extraction = PageExtraction.model_validate_json(response.text)
-           
-           self.state_manager.update_state(extraction)
-           return self.state_manager.write_rows(extraction)
-       except Exception as e:
-           logger.error(f"CRITICAL FAILURE on page {page_num}. Error: {e}")
-           return 0
-       
-   def extract_from_pdf(self, pdf_path: str, dpi: int = 200):
-       logger.info(f"===== STARTING EXTRACTION FOR PDF: {pdf_path} =====")
-       pdf_file = Path(pdf_path)
-       run_output_dir = self.output_dir / pdf_file.stem
-       try:
-           image_paths = pdf_to_images(pdf_path, run_output_dir, dpi)
-           csv_output_path = run_output_dir / f"{pdf_file.stem}_extracted_rates.csv"
-           self.state_manager.start_csv(csv_output_path)
-           for i, image_path in enumerate(image_paths):
-               self.process_page(image_path, page_num=i + 1)
-       finally:
-           self.state_manager.close_csv()
-           logger.info(f"===== EXTRACTION COMPLETE FOR: {pdf_path} =====")
-
-# --- Main Execution Block ---
 if __name__ == "__main__":
-   pdf_file = r"path/to/your/hospital_rates.pdf"
-
-   try:
-       # This assumes you have authenticated in your environment (e.g., via `gcloud auth`).
-       # You can also explicitly configure an API key if needed:
-       # genai.configure(api_key="YOUR_GOOGLE_AI_API_KEY")
-       
-       # This creates the modern AI model object using the correct library.
-       # As requested, it uses the model name you specified.
-       # Note: Public model names may differ, "gemini-1.5-flash" is the current standard name for the fast model.
-       client = genai.GenerativeModel("gemini-1.5-flash")
-       
-       extractor = PDFExtractor(client=client, output_dir="hospital_rates_output")
-       extractor.extract_from_pdf(pdf_file, dpi=200)
-
-       print("Extraction complete!")
-       
-   except Exception as e:
-       logger.critical(f"An error occurred during setup or execution: {e}")
+    pdf_file = r"C:\Your\Full\Path\To\Mercy_health.pdf"
+    
+    try:
+        client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+        extractor = PDFExtractor(client=client, output_dir="hospital_rates_output")
+        extractor.extract_from_pdf(pdf_file, dpi=200)
+        print("Extraction complete!")
+    except Exception as e:
+        logger.critical(f"An error occurred: {e}")
