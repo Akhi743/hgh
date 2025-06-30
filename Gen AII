@@ -264,12 +264,15 @@ You are an expert data extraction specialist. Extract data from this hospital ra
 
 **2. Header-Level Info (extract when you see a MAIN HEADER):**
 - hospital_names_found: When you see a MAIN HEADER section, ALWAYS extract the hospital names
-  * Examples: "Mercy Springfield and Urbana Hospitals", "Mercy Health Youngstown Hospital"
-  * A MAIN HEADER is a new document section with hospital names and LOB
+  * Look for hospital names in main document titles/headers
+  * Extract ANY hospital names you see, regardless of health system
+  * Examples: "Hospital Name", "Medical Center Name", "Health System Hospital"
+  * Can be single hospital or multiple hospitals
   * ALWAYS extract this - do NOT reuse previous hospital names
 - line_of_business_found: When you see a MAIN HEADER section, ALWAYS extract the LOB
-  * Examples: "Qualified Health Plan rates", "COMMERCIAL GATEKEEPER AND NON-GATEKEEPER PRODUCTS"
-  * This comes with the hospital names in the MAIN HEADER
+  * Look for business line information in main headers
+  * Examples: "Qualified Health Plan rates", "Commercial", "Medicare", "Medicaid"
+  * Extract whatever LOB text you find
   * ALWAYS extract this - do NOT reuse previous LOB
 
 **3. Table Sections (extract when NEW section headers appear):**
@@ -297,16 +300,18 @@ For each section, look for:
 
 **CRITICAL RULES:**
 - MAIN HEADER = New section with hospital names + LOB together
-- When you see a MAIN HEADER: ALWAYS extract both hospital_names_found AND line_of_business_found
+- When you see ANY hospital name in a main header: ALWAYS extract hospital_names_found
+- When you see ANY LOB information in a main header: ALWAYS extract line_of_business_found  
 - NEVER reuse previous hospital names or LOB when a MAIN HEADER appears
 - A MAIN HEADER means this is a completely new section for different hospitals
+- Extract hospital names from titles like "Hospital Service and Rate Schedule" sections
+- Look for hospital names anywhere in main document headers, regardless of health system
 - Only extract place_of_service_found if you see a NEW section header like "INPATIENT RATES", "OUTPATIENT RATES", etc.
 - ONLY extract table_rows from PROPER STRUCTURED TABLES with clear borders and column headers
 - DO NOT extract from scattered data, lists, or unstructured content
 - DO NOT extract if you don't see a clear table with Service|Billing Codes|Rates columns
 - Extract table_rows ONLY from tables that look like organized data tables - STOP at table borders
 - Do NOT extract from "TERMS AND CONDITIONS", footnotes, or text sections
-- Do NOT extract "Billing" as place_of_service - it's a column header, not a section
 - Preserve ALL text exactly as written - do not modify or shorten
 
 **JSON Schema:**
