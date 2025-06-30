@@ -23,6 +23,7 @@ class TableRow(BaseModel):
     service: str = Field(description="The full service description from the row.")
     billing_codes: Optional[str] = Field(description="The full, verbatim text of all billing codes in the cell.")
     rate: Optional[str] = Field(description="The full, verbatim text of the rate, including all conditions.")
+    row_type: Optional[str] = Field(default="complete", description="Type: 'complete', 'service_only', 'codes_only', 'continuation'")
 
 class Section(BaseModel):
     # Only extract if this is a NEW section header
@@ -167,7 +168,7 @@ class HierarchicalStateManager:
                 logger.info(f"NEW SECTION - Changed plan type from '{old_plan}' to '{self.current_plan_type}'")
     
     def write_rows(self, extraction: PageExtraction) -> int:
-        """Write extracted rows processing each section individually"""
+        """Write extracted rows processing each section individually with enhanced continuation handling"""
         if not self.csv_writer:
             return 0
         
@@ -200,19 +201,63 @@ class HierarchicalStateManager:
                 section_plan_type = self.current_plan_type
                 logger.info(f"Section {section_num}: Changed plan type from '{old_plan}' to '{self.current_plan_type}'")
             
-            # Write all rows for this section
+            # Enhanced row processing with continuation handling
             section_rows = 0
+            current_service = ""
+            accumulated_codes = ""
+            current_rate = ""
+            
             for row in section.table_rows:
+                # Determine if this is a continuation row or new service
+                if row.service and row.service.strip():
+                    # This is a new service - write previous accumulated data if exists
+                    if current_service and (accumulated_codes or current_rate):
+                        csv_row = [
+                            self.system_name,
+                            self.effective_date,
+                            self.current_hospitals,
+                            self.current_lob,
+                            section_place_of_service,
+                            section_plan_type,
+                            current_service,
+                            accumulated_codes.strip(),
+                            current_rate.strip()
+                        ]
+                        self.csv_writer.writerow(csv_row)
+                        section_rows += 1
+                        rows_written += 1
+                    
+                    # Start new service
+                    current_service = row.service
+                    accumulated_codes = row.billing_codes or ""
+                    current_rate = row.rate or ""
+                    
+                else:
+                    # This is a continuation row - accumulate codes/rates
+                    if row.billing_codes and row.billing_codes.strip():
+                        if accumulated_codes:
+                            accumulated_codes += " " + row.billing_codes.strip()
+                        else:
+                            accumulated_codes = row.billing_codes.strip()
+                    
+                    if row.rate and row.rate.strip():
+                        if current_rate:
+                            current_rate += " " + row.rate.strip()
+                        else:
+                            current_rate = row.rate.strip()
+            
+            # Write the last accumulated service
+            if current_service and (accumulated_codes or current_rate):
                 csv_row = [
-                    self.system_name,                    # Stored once for PDF
-                    self.effective_date,                 # Stored once for PDF
-                    self.current_hospitals,              # Sticky until new header
-                    self.current_lob,                   # Sticky until new header
-                    section_place_of_service,           # Current section's place of service
-                    section_plan_type,                  # Current section's plan type
-                    row.service,                        # From current row
-                    row.billing_codes or "",            # From current row (handle None)
-                    row.rate or ""                      # From current row (handle None)
+                    self.system_name,
+                    self.effective_date,
+                    self.current_hospitals,
+                    self.current_lob,
+                    section_place_of_service,
+                    section_plan_type,
+                    current_service,
+                    accumulated_codes.strip(),
+                    current_rate.strip()
                 ]
                 self.csv_writer.writerow(csv_row)
                 section_rows += 1
@@ -313,12 +358,20 @@ For each section, look for:
   * Extract any bold header above a table that describes plan types, product categories, or member types
 
 **6. Table Data Extraction**
-- table_rows: Extract data from any content organized into clear columns and rows, even if visual borders or lines are faint or missing. Look for repeating row structures under headers like "Service", "Billing Codes", and "Rates".
-  * DO NOT extract from paragraphs or unstructured lists. The data must be in a grid-like or columnar format.
+- table_rows: Extract EVERY SINGLE ROW from any content organized into clear columns and rows, even if visual borders or lines are faint or missing. Look for repeating row structures under headers like "Service", "Billing Codes", and "Rates".
+  * CRITICAL: DO NOT SKIP ANY ROWS - Extract every row you can see in the table
+  * CRITICAL: For continuation pages, extract ALL continuation rows even if they only contain codes or partial information
+  * Handle different row types:
+    - Complete rows: service + billing_codes + rate
+    - Service-only rows: just service name (billing_codes="", rate="")
+    - Code continuation rows: billing codes continuing from previous service (service="", billing_codes="continuation codes", rate="")
+    - Rate-only rows: just rate info (service="", billing_codes="", rate="rate info")
   * For each valid table row extract:
-    * service: Full service description.
-    * billing_codes: Complete billing codes (use empty string "" if empty, not null).
-    * rate: Complete rate text (use empty string "" if empty, not null).
+    * service: Full service description (use "" if this row only contains continuation codes)
+    * billing_codes: Complete billing codes (use "" if empty, not null) - INCLUDE ALL CODE CONTINUATIONS
+    * rate: Complete rate text (use "" if empty, not null)
+  * IMPORTANT: When codes span multiple lines or continue to next rows, capture ALL of them
+  * IMPORTANT: Maintain proper service-to-code relationships - codes that appear after a service belong to that service
 
 **EXTRACTION RULES:**
 - Only extract fields that are visible on THIS page
