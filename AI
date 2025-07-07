@@ -1,263 +1,379 @@
-import fitz  # PyMuPDF
+import fitz
 import os
 import csv
 import json
-import uuid
+import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict
+from pydantic import BaseModel, Field
 from google.genai import types
 import google.genai as genai
-from langchain.prompts import PromptTemplate
-from langchain.output_parsers import PydanticOutputParser, OutputFixingParser
-from pydantic import BaseModel, Field
-import pandas as pd
 
-def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='png'):
-    """Convert each page of a PDF to individual images."""
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('contract_extraction.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# DATA MODEL
+# ==========================================
+
+class ContractExtraction(BaseModel):
+    """Healthcare contract data extraction model"""
+    hospital_name: Optional[str] = Field(default=None, description="Hospital name or health system name")
+    charge_master_limit: Optional[str] = Field(default=None, description="Charge master limit percentage or cap")
+    charge_master_increase: Optional[str] = Field(default=None, description="Charge master increase percentage")
+    effective_date: Optional[str] = Field(default=None, description="Effective date when changes take effect")
+    contract_duration: Optional[str] = Field(default=None, description="Duration or term of the contract")
+    notification_received_date: Optional[str] = Field(default=None, description="Date when notification was received/sent")
+
+# ==========================================
+# PDF PROCESSING
+# ==========================================
+
+def pdf_to_images(pdf_path: str, output_dir: str = None, dpi: int = 200) -> List[Path]:
+    """Convert PDF pages to images using PyMuPDF"""
     pdf_path = Path(pdf_path)
-    
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
     
     if output_dir is None:
-        output_dir = pdf_path.parent
+        output_dir = pdf_path.parent / f"{pdf_path.stem}_images"
     else:
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
     
-    doc = fitz.open(pdf_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
     image_paths = []
     
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        mat = fitz.Matrix(dpi/72, dpi/72)
-        pix = page.get_pixmap(matrix=mat)
+    try:
+        doc = fitz.open(str(pdf_path))
+        logger.info(f"Converting PDF '{pdf_path.name}' ({len(doc)} pages)")
         
-        output_filename = f"{pdf_path.stem}_page_{page_num + 1:03d}.{image_format}"
-        output_path = output_dir / output_filename
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            
+            output_path = output_dir / f"{pdf_path.stem}_page_{page_num + 1:03d}.png"
+            pix.save(str(output_path))
+            image_paths.append(output_path)
+            
+        doc.close()
+        logger.info(f"Successfully converted {len(image_paths)} pages")
         
-        pix.save(str(output_path))
-        image_paths.append(str(output_path))
-        
-        print(f"Saved page {page_num + 1} to {output_path}")
-        if page_num == 20:  # Limit to first 20 pages for large PDFs
-            print("Limiting to first 20 pages for large PDFs")
-            break
+    except Exception as e:
+        logger.error(f"Failed to convert PDF '{pdf_path.name}': {e}")
+        raise
     
-    doc.close()
     return image_paths
 
-class HospitalRateData(BaseModel):
-    """Data model for hospital rate extraction."""
-    has_table: bool = Field(description="Whether a structured data table is present")
-    hospital_name: Optional[str] = Field(default=None, description="Complete hospital name from document header")
-    effective_date: Optional[str] = Field(default=None, description="Effective date")
-    lob_type: Optional[str] = Field(default=None, description="Line of Business type")
-    service_type: Optional[str] = Field(default=None, description="INPATIENT or OUTPATIENT")
-    
-    # Table data - list of all rows
-    table_data: Optional[List[Dict[str, str]]] = Field(
-        default=None, 
-        description="Complete list of ALL table rows with keys: service, billing_codes, rate, negotiated_type"
-    )
+# ==========================================
+# EXTRACTOR CLASS
+# ==========================================
 
-class HospitalRateExtractor:
-    """Clean, structured extractor for hospital rate schedules."""
+class HealthcareContractExtractor:
+    """Healthcare contract data extractor"""
     
-    def __init__(self, client, output_dir: str = None):
+    def __init__(self, client, output_dir: str = "contract_extraction"):
         self.client = client
-        self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+        self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Standard output format
+        # CSV columns
         self.columns = [
-            'Hospital', 'LOB', 'Place of Service', 'Service Category', 
-            'Billing Codes', 'Rate', 'Negotiated Type', 'Effective Date'
+            "Hospital Name",
+            "Charge Master Limit", 
+            "Charge Master Increase",
+            "Effective Date",
+            "Contract Duration",
+            "Notification Received Date",
+            "Document Source",
+            "Page Number"
         ]
-        
-        # Document-level tracking for consistency
-        self.document_hospital = None
-        self.document_lob = None
-        self.document_service_type = None
-        
-    def create_extraction_prompt(self) -> tuple:
-        """Create the extraction prompt and parser."""
-        parser = PydanticOutputParser(pydantic_object=HospitalRateData)
-        
-        class GeminiLLM:
-            def __init__(self, client):
-                self.client = client
-                
-            def __call__(self, prompt: str) -> str:
-                response = self.client.models.generate_content(
-                    model='gemini-2.0-flash',
-                    contents=[prompt]
-                )
-                return response.text
-        
-        llm = GeminiLLM(self.client)
-        output_parser = OutputFixingParser.from_llm(parser=parser, llm=llm)
-        
-        template = """
-Extract ALL information from this hospital rate schedule page.
-
-DOCUMENT METADATA:
-1. Hospital Name: Extract COMPLETE hospital name from header (e.g., "Mercy Springfield and Urbana Hospitals")
-2. Effective Date: Look for "Effective Date:" text
-3. LOB: "Commercial", "Medicare", "Medicaid", or "N/A" if not specified
-4. Service Type: "INPATIENT" or "OUTPATIENT" based on section headers
-
-TABLE EXTRACTION:
-Extract EVERY SINGLE ROW from the table. Do not skip any rows.
-
-For each row, extract:
-- service: Service name from Service column
-- billing_codes: Complete billing codes text as-is
-- rate: Only the number/percentage (e.g., "85.1%", "$1,800.00")
-- negotiated_type: Everything after the rate number
-
-Examples:
-- "85.1% of Billed Charges" → rate="85.1%", negotiated_type="of Billed Charges"
-- "$1,100.00 Case Rate" → rate="$1,100.00", negotiated_type="Case Rate"
-
-CRITICAL: Scan the ENTIRE table and extract ALL rows. Count the rows and make sure you get them all.
-
-{format_instructions}
-"""
-        
-        prompt = PromptTemplate(
-            template=template,
-            input_variables=[],
-            partial_variables={"format_instructions": output_parser.get_format_instructions()}
-        )
-        
-        return prompt, output_parser
     
-    def process_page(self, image_path: str, page_num: int) -> Dict[str, Any]:
-        """Process a single page and extract all data."""
-        print(f"Processing page {page_num}: {Path(image_path).name}")
+    def get_extraction_prompt(self) -> str:
+        """Generate extraction prompt for healthcare contracts"""
+        json_schema = json.dumps(ContractExtraction.model_json_schema(), indent=2)
+        
+        return f"""
+You are a healthcare contract data extraction specialist. Extract the following information from this document:
+
+**1. Hospital Name**
+- **What it is:** Hospital name, health system, medical center, or healthcare organization name
+- **Where to look:** Header area, letterhead, facility names, signatures
+- **Examples:** "Aultman Hospital", "Fairfield Medical Center", "Mercy Health", "Aetna"
+- **Rules:** Extract full official name, remove TIN numbers if present
+
+**2. Charge Master Limit** 
+- **What it is:** Charge master limit percentage, rate caps, or charge limitations
+- **Where to look:** Contract terms, rate information, tables with percentages
+- **Examples:** "CP 4.5%", "ME 3.0%", "charge master limit of 5%", "4.5% ME 3.0%"
+- **Rules:** Include exact percentages and context, extract full limit description
+
+**3. Charge Master Increase**
+- **What it is:** Charge master increase percentage or rate adjustments
+- **Where to look:** Rate adjustment sections, tables, increase notifications
+- **Examples:** "7% aggregate increase", "6% increase", "5.0% increase"
+- **Rules:** Extract exact percentage with context, look for "increase" terminology
+
+**4. Effective Date**
+- **What it is:** Date when the changes, rates, or contract terms take effect
+- **Where to look:** Date fields, "effective date" labels, "become effective" text
+- **Examples:** "01/01/2025", "1/1/2025", "January 1, 2025", "effective 1/1/2025"
+- **Rules:** Look for "effective", "become effective", extract complete date
+
+**5. Contract Duration**
+- **What it is:** Duration, term, or validity period of the contract or rates
+- **Where to look:** Contract terms, validity periods, time specifications
+- **Examples:** "12-month period", "through 2025", "2-year term", "CY2025"
+- **Rules:** Extract time periods and duration context
+
+**6. Notification Received Date**
+- **What it is:** Date when the notification, letter, or email was received or sent
+- **Where to look:** Letter dates, email headers, document dates, "dated" references
+- **Examples:** "December 6, 2024", "October 14, 2024", "dated December 6, 2024"
+- **Rules:** Look for letter/email dates, notification timing, document timestamps
+
+**EXTRACTION RULES:**
+- Extract exact text where possible
+- If information is not clearly found, use null
+- Look for specific percentages and dates
+- Focus on healthcare contract and rate-related information
+- Pay attention to tables, formal letter content, and contract terms
+- Scan the entire document thoroughly for all fields
+
+**JSON Schema:**
+{json_schema}
+"""
+    
+    def process_page(self, image_path: Path, page_num: int, document_name: str) -> ContractExtraction:
+        """Process single page and extract contract data"""
+        logger.info(f"Processing page {page_num}: {image_path.name}")
         
         try:
             with open(image_path, 'rb') as f:
                 image_bytes = f.read()
             
-            mime_type = 'image/png' if image_path.lower().endswith('.png') else 'image/jpeg'
+            mime_type = 'image/png' if image_path.suffix.lower() == '.png' else 'image/jpeg'
+            prompt = self.get_extraction_prompt()
             
-            prompt, parser = self.create_extraction_prompt()
-            prompt_text = prompt.format()
+            logger.info("Sending extraction request to Gemini...")
             
-            response = self.client.models.generate_content(
-                model='gemini-2.0-flash',
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    prompt_text
-                ]
-            )
+            # API call with fallback
+            try:
+                response = self.client.models.generate_content(
+                    model='gemini-2.0-flash',
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        prompt
+                    ]
+                )
+            except (AttributeError, TypeError):
+                response = self.client.generate_content(
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        prompt
+                    ]
+                )
             
-            extracted_data = parser.parse(response.text.strip())
+            # Clean and parse response
+            response_text = response.text.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text.split('```json')[1]
+            if response_text.endswith('```'):
+                response_text = response_text.rsplit('```', 1)[0]
+            response_text = response_text.strip()
             
-            if not extracted_data.has_table:
-                print(f"No table found on page {page_num}")
-                return {'page_num': page_num, 'has_table': False}
+            # Parse JSON response
+            extraction = ContractExtraction.model_validate_json(response_text)
             
-            # Update document-level info on first extraction
-            if extracted_data.hospital_name and not self.document_hospital:
-                self.document_hospital = extracted_data.hospital_name
-            if extracted_data.lob_type and not self.document_lob:
-                self.document_lob = extracted_data.lob_type
-            if extracted_data.service_type and not self.document_service_type:
-                self.document_service_type = extracted_data.service_type
+            # Log extracted data
+            logger.info(f"Extracted from page {page_num}:")
+            logger.info(f"  Hospital Name: {extraction.hospital_name}")
+            logger.info(f"  Charge Master Limit: {extraction.charge_master_limit}")
+            logger.info(f"  Charge Master Increase: {extraction.charge_master_increase}")
+            logger.info(f"  Effective Date: {extraction.effective_date}")
+            logger.info(f"  Contract Duration: {extraction.contract_duration}")
+            logger.info(f"  Notification Date: {extraction.notification_received_date}")
             
-            # Convert to standard format
-            rows = self.convert_to_standard_format(extracted_data)
-            
-            print(f"Extracted {len(rows)} rows from page {page_num}")
-            
-            return {
-                'page_num': page_num,
-                'has_table': True,
-                'rows': rows,
-                'row_count': len(rows)
-            }
+            return extraction
             
         except Exception as e:
-            print(f"Error processing page {page_num}: {e}")
-            return {'page_num': page_num, 'has_table': False, 'error': str(e)}
+            logger.error(f"Error processing page {page_num}: {e}")
+            return ContractExtraction()
     
-    def convert_to_standard_format(self, data: HospitalRateData) -> List[Dict[str, str]]:
-        """Convert extracted data to standard output format."""
-        if not data.table_data:
-            return []
+    def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
+        """Extract contract data from PDF"""
+        pdf_path = Path(pdf_path)
+        logger.info(f"Starting healthcare contract extraction: {pdf_path.name}")
         
-        standardized_rows = []
-        
-        # Use document-level info for consistency
-        hospital = self.document_hospital or data.hospital_name or "N/A"
-        lob = self.document_lob or data.lob_type or "N/A"
-        service_type = self.document_service_type or data.service_type or "INPATIENT"
-        effective_date = data.effective_date or "N/A"
-        
-        place_of_service = "OP" if service_type == "OUTPATIENT" else "IP"
-        
-        for row in data.table_data:
-            standardized_row = {
-                'Hospital': hospital,
-                'LOB': lob,
-                'Place of Service': place_of_service,
-                'Service Category': row.get('service', 'N/A'),
-                'Billing Codes': row.get('billing_codes', 'N/A'),
-                'Rate': row.get('rate', 'N/A'),
-                'Negotiated Type': row.get('negotiated_type', 'N/A'),
-                'Effective Date': effective_date
+        try:
+            # Convert PDF to images
+            image_output_dir = self.output_dir / pdf_path.stem / "images"
+            image_paths = pdf_to_images(str(pdf_path), str(image_output_dir), dpi)
+            
+            # Setup CSV output
+            csv_path = self.output_dir / pdf_path.stem / f"{pdf_path.stem}_contract_data.csv"
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Process all pages and collect extractions
+            all_extractions = []
+            
+            for i, image_path in enumerate(image_paths, 1):
+                logger.info(f"\n--- PAGE {i}/{len(image_paths)} ---")
+                extraction = self.process_page(image_path, i, pdf_path.name)
+                all_extractions.append((extraction, i))
+            
+            # Write to CSV
+            self.write_to_csv(all_extractions, csv_path, pdf_path.name)
+            
+            # Compile best extraction (consolidate data from all pages)
+            consolidated = self.consolidate_extractions(all_extractions)
+            
+            # Results
+            results = {
+                'pdf_name': pdf_path.name,
+                'total_pages': len(image_paths),
+                'csv_path': str(csv_path),
+                'consolidated_data': consolidated,
+                'all_page_extractions': all_extractions
             }
-            standardized_rows.append(standardized_row)
-        
-        return standardized_rows
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"EXTRACTION COMPLETE: {pdf_path.name}")
+            logger.info(f"{'='*60}")
+            logger.info(f"Pages processed: {len(image_paths)}")
+            logger.info(f"CSV saved: {csv_path}")
+            logger.info(f"Consolidated Results:")
+            logger.info(f"  Hospital Name: {consolidated.hospital_name}")
+            logger.info(f"  Charge Master Limit: {consolidated.charge_master_limit}")
+            logger.info(f"  Charge Master Increase: {consolidated.charge_master_increase}")
+            logger.info(f"  Effective Date: {consolidated.effective_date}")
+            logger.info(f"  Contract Duration: {consolidated.contract_duration}")
+            logger.info(f"  Notification Date: {consolidated.notification_received_date}")
+            logger.info(f"{'='*60}")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Failed to extract {pdf_path.name}: {e}")
+            raise
     
-    def extract_rates_from_pdf(self, pdf_path: str) -> str:
-        """Extract hospital rates from PDF and save to CSV."""
-        print(f"Starting extraction for: {pdf_path}")
+    def consolidate_extractions(self, extractions: List) -> ContractExtraction:
+        """Consolidate data from all pages to get the best extraction"""
+        consolidated = ContractExtraction()
         
-        # Convert PDF to images
-        image_paths = pdf_to_images(pdf_path, self.output_dir, dpi=300, image_format='png')
+        # For each field, pick the best non-null value
+        for extraction, page_num in extractions:
+            if extraction.hospital_name and not consolidated.hospital_name:
+                consolidated.hospital_name = extraction.hospital_name
+            if extraction.charge_master_limit and not consolidated.charge_master_limit:
+                consolidated.charge_master_limit = extraction.charge_master_limit
+            if extraction.charge_master_increase and not consolidated.charge_master_increase:
+                consolidated.charge_master_increase = extraction.charge_master_increase
+            if extraction.effective_date and not consolidated.effective_date:
+                consolidated.effective_date = extraction.effective_date
+            if extraction.contract_duration and not consolidated.contract_duration:
+                consolidated.contract_duration = extraction.contract_duration
+            if extraction.notification_received_date and not consolidated.notification_received_date:
+                consolidated.notification_received_date = extraction.notification_received_date
         
-        # Process all pages
-        all_rows = []
+        return consolidated
+    
+    def write_to_csv(self, extractions: List, csv_path: Path, document_name: str):
+        """Write extractions to CSV file"""
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(self.columns)
+            
+            for extraction, page_num in extractions:
+                row = [
+                    extraction.hospital_name or "N/A",
+                    extraction.charge_master_limit or "N/A",
+                    extraction.charge_master_increase or "N/A", 
+                    extraction.effective_date or "N/A",
+                    extraction.contract_duration or "N/A",
+                    extraction.notification_received_date or "N/A",
+                    document_name,
+                    page_num
+                ]
+                writer.writerow(row)
         
-        for page_num, image_path in enumerate(image_paths, 1):
-            result = self.process_page(image_path, page_num)
-            
-            if result.get('has_table') and 'rows' in result:
-                all_rows.extend(result['rows'])
-                print(f"Page {page_num}: Added {result['row_count']} rows")
-        
-        # Save to CSV
-        if all_rows:
-            output_file = self.output_dir / f"{Path(pdf_path).stem}_extracted_rates.csv"
-            
-            with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=self.columns)
-                writer.writeheader()
-                writer.writerows(all_rows)
-            
-            print(f"\n=== EXTRACTION COMPLETE ===")
-            print(f"Total rows extracted: {len(all_rows)}")
-            print(f"Output saved to: {output_file}")
-            
-            return str(output_file)
-        else:
-            print("No data extracted from PDF")
-            return None
+        logger.info(f"CSV written with {len(extractions)} rows")
 
-# Usage
+# ==========================================
+# CLIENT SETUP
+# ==========================================
+
+def create_client():
+    """Create Google Cloud client with Vertex AI"""
+    try:
+        client = genai.Client(
+            vertexai=True, 
+            project="anbc-hcb-dev",  # Replace with your project ID
+            location="us-central1"   # Replace with your location
+        )
+        logger.info("Created Vertex AI client successfully")
+        return client
+    except Exception as e:
+        logger.error(f"Failed to create client: {e}")
+        raise
+
+# ==========================================
+# MAIN FUNCTION
+# ==========================================
+
+def extract_healthcare_contract(pdf_path: str, output_dir: str = "contract_extraction") -> Dict:
+    """Extract healthcare contract data from single PDF"""
+    
+    # Create client and extractor
+    client = create_client()
+    extractor = HealthcareContractExtractor(client=client, output_dir=output_dir)
+    
+    # Extract data
+    results = extractor.extract_from_pdf(pdf_path)
+    
+    return results
+
+# ==========================================
+# USAGE
+# ==========================================
+
 if __name__ == "__main__":
-    pdf_file = r"C:\Users\N873855\Documents\extracted_tables\Mercy_health.pdf"
+    # Your PDF file path
+    pdf_file = "your_healthcare_contract.pdf"  # Replace with your actual PDF path
     
-    from google import genai
-    client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
-    
-    extractor = HospitalRateExtractor(client, output_dir="extracted_hospital_rates")
-    output_file = extractor.extract_rates_from_pdf(pdf_file)
-    
-    if output_file:
-        print(f"Extraction completed! Output: {output_file}")
+    try:
+        # Extract contract data
+        results = extract_healthcare_contract(pdf_file)
+        
+        # Print final results
+        print("\n" + "="*80)
+        print("HEALTHCARE CONTRACT EXTRACTION RESULTS")
+        print("="*80)
+        print(f"PDF: {results['pdf_name']}")
+        print(f"Pages: {results['total_pages']}")
+        print(f"Output: {results['csv_path']}")
+        print("\nExtracted Data:")
+        print("-" * 40)
+        
+        consolidated = results['consolidated_data']
+        print(f"Hospital Name: {consolidated.hospital_name or 'Not Found'}")
+        print(f"Charge Master Limit: {consolidated.charge_master_limit or 'Not Found'}")
+        print(f"Charge Master Increase: {consolidated.charge_master_increase or 'Not Found'}")
+        print(f"Effective Date: {consolidated.effective_date or 'Not Found'}")
+        print(f"Contract Duration: {consolidated.contract_duration or 'Not Found'}")
+        print(f"Notification Date: {consolidated.notification_received_date or 'Not Found'}")
+        
+        print("="*80)
+        print("Check contract_extraction.log for detailed processing logs")
+        
+    except Exception as e:
+        logger.critical(f"Extraction failed: {e}")
+        print(f"Error: {e}")
