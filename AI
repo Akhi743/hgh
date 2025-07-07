@@ -21,17 +21,117 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# DATA MODEL
+# DATA MODELS
 # ==========================================
 
-class ContractExtraction(BaseModel):
-    """Healthcare contract data extraction model"""
-    hospital_name: Optional[str] = Field(default=None, description="Hospital name or health system name")
-    charge_master_limit: Optional[str] = Field(default=None, description="Charge master limit percentage or cap")
-    charge_master_increase: Optional[str] = Field(default=None, description="Charge master increase percentage")
-    effective_date: Optional[str] = Field(default=None, description="Effective date when changes take effect")
-    contract_duration: Optional[str] = Field(default=None, description="Duration or term of the contract")
-    notification_received_date: Optional[str] = Field(default=None, description="Date when notification was received/sent")
+class ContractRow(BaseModel):
+    """Model for individual contract table row"""
+    hospital_name: str = Field(description="Hospital or facility name from the table row")
+    charge_master_limit: Optional[str] = Field(description="Charge master limit for this facility")
+    charge_master_increase: Optional[str] = Field(description="Charge master increase percentage for this facility")
+    effective_date: Optional[str] = Field(description="Effective date for this facility")
+
+class ContractPageExtraction(BaseModel):
+    """Model for page-level contract extraction"""
+    # Document-level fields (extract once if found)
+    notification_received_date_found: Optional[str] = Field(default=None, description="Notification date if found on this page")
+    contract_duration_found: Optional[str] = Field(default=None, description="Contract duration if found on this page")
+    
+    # Table rows (always extract)
+    contract_rows: List[ContractRow] = Field(description="List of all contract table rows found on this page")
+
+# ==========================================
+# HIERARCHICAL STATE MANAGER
+# ==========================================
+
+class ContractStateManager:
+    """Manages hierarchical context for contract extraction"""
+    
+    def __init__(self):
+        self.columns = [
+            "Hospital Name", "Charge Master Limit", "Charge Master Increase", 
+            "Effective Date", "Contract Duration", "Notification Received Date",
+            "Document Source", "Page Number"
+        ]
+        self.reset_document_state()
+    
+    def reset_document_state(self):
+        """Reset state for new document"""
+        # Document-level (stored once for entire PDF)
+        self.notification_received_date = "N/A"
+        self.contract_duration = "N/A"
+        
+        # CSV management
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_path = None
+        
+        logger.info("Reset contract document state")
+    
+    def start_csv(self, output_path: Path):
+        """Start new CSV file"""
+        self.csv_path = output_path
+        self.csv_file = open(self.csv_path, 'w', newline='', encoding='utf-8')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(self.columns)
+        logger.info(f"Started CSV: {self.csv_path}")
+    
+    def update_from_page(self, extraction: ContractPageExtraction):
+        """Update state from page extraction - hierarchical store and reuse"""
+        
+        # Document-level: Store once for entire PDF
+        if extraction.notification_received_date_found:
+            if self.notification_received_date == "N/A":
+                self.notification_received_date = extraction.notification_received_date_found
+                logger.info(f"Stored notification date: '{self.notification_received_date}'")
+        
+        if extraction.contract_duration_found:
+            if self.contract_duration == "N/A":
+                self.contract_duration = extraction.contract_duration_found
+                logger.info(f"Stored contract duration: '{self.contract_duration}'")
+    
+    def write_rows(self, extraction: ContractPageExtraction, document_name: str, page_num: int) -> int:
+        """Write extracted contract rows using stored context"""
+        if not self.csv_writer:
+            return 0
+        
+        rows_written = 0
+        
+        for row in extraction.contract_rows:
+            csv_row = [
+                row.hospital_name,
+                row.charge_master_limit or "N/A",
+                row.charge_master_increase or "N/A",
+                row.effective_date or "N/A",
+                self.contract_duration,  # Use stored document-level value
+                self.notification_received_date,  # Use stored document-level value
+                document_name,
+                page_num
+            ]
+            self.csv_writer.writerow(csv_row)
+            rows_written += 1
+            
+            logger.info(f"Wrote row: {row.hospital_name} - {row.charge_master_limit} - {row.charge_master_increase}")
+        
+        if self.csv_file:
+            self.csv_file.flush()
+        
+        logger.info(f"Total rows written from this page: {rows_written}")
+        return rows_written
+    
+    def get_current_state(self):
+        """Get current state for debugging"""
+        return {
+            'notification_received_date': self.notification_received_date,
+            'contract_duration': self.contract_duration
+        }
+    
+    def close_csv(self):
+        """Close CSV file"""
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
 
 # ==========================================
 # PDF PROCESSING
@@ -74,87 +174,69 @@ def pdf_to_images(pdf_path: str, output_dir: str = None, dpi: int = 200) -> List
     return image_paths
 
 # ==========================================
-# EXTRACTOR CLASS
+# CONTRACT EXTRACTOR
 # ==========================================
 
 class HealthcareContractExtractor:
-    """Healthcare contract data extractor"""
+    """Healthcare contract extractor using hierarchical state management"""
     
     def __init__(self, client, output_dir: str = "contract_extraction"):
         self.client = client
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # CSV columns
-        self.columns = [
-            "Hospital Name",
-            "Charge Master Limit", 
-            "Charge Master Increase",
-            "Effective Date",
-            "Contract Duration",
-            "Notification Received Date",
-            "Document Source",
-            "Page Number"
-        ]
+        self.state_manager = ContractStateManager()
     
     def get_extraction_prompt(self) -> str:
-        """Generate extraction prompt for healthcare contracts"""
-        json_schema = json.dumps(ContractExtraction.model_json_schema(), indent=2)
+        """Generate extraction prompt for contract data"""
+        json_schema = json.dumps(ContractPageExtraction.model_json_schema(), indent=2)
         
         return f"""
-You are a healthcare contract data extraction specialist. Extract the following information from this document:
+You are a healthcare contract data extraction specialist. Extract information from this document page following these rules:
 
-**1. Hospital Name**
-- **What it is:** Hospital name, health system, medical center, or healthcare organization name
-- **Where to look:** Header area, letterhead, facility names, signatures
-- **Examples:** "Aultman Hospital", "Fairfield Medical Center", "Mercy Health", "Aetna"
-- **Rules:** Extract full official name, remove TIN numbers if present
+**DOCUMENT-LEVEL FIELDS (extract only if found on THIS page):**
 
-**2. Charge Master Limit** 
-- **What it is:** Charge master limit percentage, rate caps, or charge limitations
-- **Where to look:** Contract terms, rate information, tables with percentages
-- **Examples:** "CP 4.5%", "ME 3.0%", "charge master limit of 5%", "4.5% ME 3.0%"
-- **Rules:** Include exact percentages and context, extract full limit description
+**1. notification_received_date_found**
+- **What it is:** Date when the notification letter was received or sent
+- **Where to look:** Letter date, email date, document date
+- **Examples:** "December 6, 2024", "12/6/2024", "dated December 6, 2024"
+- **Rule:** Only extract if clearly visible on this page
 
-**3. Charge Master Increase**
-- **What it is:** Charge master increase percentage or rate adjustments
-- **Where to look:** Rate adjustment sections, tables, increase notifications
-- **Examples:** "7% aggregate increase", "6% increase", "5.0% increase"
-- **Rules:** Extract exact percentage with context, look for "increase" terminology
+**2. contract_duration_found**
+- **What it is:** Duration or term of the contract
+- **Where to look:** Contract terms, "12-month period", validity periods
+- **Examples:** "12 months", "12-month period", "CY2025", "2-year term"
+- **Rule:** Only extract if clearly visible on this page
 
-**4. Effective Date**
-- **What it is:** Date when the changes, rates, or contract terms take effect
-- **Where to look:** Date fields, "effective date" labels, "become effective" text
-- **Examples:** "01/01/2025", "1/1/2025", "January 1, 2025", "effective 1/1/2025"
-- **Rules:** Look for "effective", "become effective", extract complete date
+**TABLE ROW EXTRACTION:**
 
-**5. Contract Duration**
-- **What it is:** Duration, term, or validity period of the contract or rates
-- **Where to look:** Contract terms, validity periods, time specifications
-- **Examples:** "12-month period", "through 2025", "2-year term", "CY2025"
-- **Rules:** Extract time periods and duration context
-
-**6. Notification Received Date**
-- **What it is:** Date when the notification, letter, or email was received or sent
-- **Where to look:** Letter dates, email headers, document dates, "dated" references
-- **Examples:** "December 6, 2024", "October 14, 2024", "dated December 6, 2024"
-- **Rules:** Look for letter/email dates, notification timing, document timestamps
+**3. contract_rows**
+- **What it is:** Extract EVERY row from any table showing facilities and their rates
+- **CRITICAL:** Extract each table row separately with exact data for that row
+- **For each row extract:**
+  - **hospital_name:** Exact facility name from the row (e.g., "Aultman Hospital", "Alliance Community Hospital", "Aultman Orville Hospital")
+  - **charge_master_limit:** Exact limit from that row's cell (e.g., "CP 4.5%/ME 3.0%", "CP 4.5%")
+  - **charge_master_increase:** Exact increase from that row's cell (e.g., "7.0%", "6.0%")
+  - **effective_date:** Exact effective date for that facility if shown in table
 
 **EXTRACTION RULES:**
-- Extract exact text where possible
-- If information is not clearly found, use null
-- Look for specific percentages and dates
-- Focus on healthcare contract and rate-related information
-- Pay attention to tables, formal letter content, and contract terms
-- Scan the entire document thoroughly for all fields
+- Extract EACH table row as a separate ContractRow object
+- Match data exactly to each facility - do NOT mix data between rows
+- For table parsing: Row 1 data goes with Row 1 facility, Row 2 data goes with Row 2 facility, etc.
+- Use exact text from each table cell
+- If a field is not found on this page, use null
+- CRITICAL: Do not duplicate or mix data between different facilities
 
 **JSON Schema:**
 {json_schema}
 """
     
-    def process_page(self, image_path: Path, page_num: int, document_name: str) -> ContractExtraction:
-        """Process single page and extract contract data"""
-        logger.info(f"Processing page {page_num}: {image_path.name}")
+    def process_page(self, image_path: Path, page_num: int, document_name: str) -> ContractPageExtraction:
+        """Process single page using hierarchical methodology"""
+        logger.info(f"=== PROCESSING PAGE {page_num}: {image_path.name} ===")
+        
+        # Show current state before processing
+        current_state = self.state_manager.get_current_state()
+        logger.info(f"Current state before processing: {current_state}")
         
         try:
             with open(image_path, 'rb') as f:
@@ -190,122 +272,98 @@ You are a healthcare contract data extraction specialist. Extract the following 
                 response_text = response_text.rsplit('```', 1)[0]
             response_text = response_text.strip()
             
-            # Parse JSON response
-            extraction = ContractExtraction.model_validate_json(response_text)
+            # Debug: Log raw response
+            logger.info(f"Cleaned AI response: {response_text[:500]}...")
             
-            # Log extracted data
-            logger.info(f"Extracted from page {page_num}:")
-            logger.info(f"  Hospital Name: {extraction.hospital_name}")
-            logger.info(f"  Charge Master Limit: {extraction.charge_master_limit}")
-            logger.info(f"  Charge Master Increase: {extraction.charge_master_increase}")
-            logger.info(f"  Effective Date: {extraction.effective_date}")
-            logger.info(f"  Contract Duration: {extraction.contract_duration}")
-            logger.info(f"  Notification Date: {extraction.notification_received_date}")
+            # Parse and validate
+            extraction = ContractPageExtraction.model_validate_json(response_text)
+            
+            # Debug: Log what was extracted
+            logger.info(f"Extracted fields:")
+            logger.info(f"  - notification_received_date_found: {extraction.notification_received_date_found}")
+            logger.info(f"  - contract_duration_found: {extraction.contract_duration_found}")
+            logger.info(f"  - contract_rows found: {len(extraction.contract_rows)}")
+            
+            for i, row in enumerate(extraction.contract_rows, 1):
+                logger.info(f"    Row {i}: {row.hospital_name} | {row.charge_master_limit} | {row.charge_master_increase} | {row.effective_date}")
+            
+            # Update hierarchical state
+            self.state_manager.update_from_page(extraction)
+            
+            # Write rows using stored context
+            rows_written = self.state_manager.write_rows(extraction, document_name, page_num)
+            
+            # Show updated state after processing
+            updated_state = self.state_manager.get_current_state()
+            logger.info(f"Updated state after processing: {updated_state}")
+            logger.info(f"Page {page_num}: {rows_written} rows extracted")
             
             return extraction
             
         except Exception as e:
-            logger.error(f"Error processing page {page_num}: {e}")
-            return ContractExtraction()
+            logger.error(f"CRITICAL ERROR on page {page_num}: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return ContractPageExtraction()
     
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
-        """Extract contract data from PDF"""
+        """Extract contract data from PDF using hierarchical approach"""
         pdf_path = Path(pdf_path)
-        logger.info(f"Starting healthcare contract extraction: {pdf_path.name}")
+        logger.info(f"Starting hierarchical contract extraction: {pdf_path.name}")
         
         try:
-            # Convert PDF to images
+            # Reset state for new PDF
+            self.state_manager.reset_document_state()
+            
+            # Convert to images
             image_output_dir = self.output_dir / pdf_path.stem / "images"
             image_paths = pdf_to_images(str(pdf_path), str(image_output_dir), dpi)
             
-            # Setup CSV output
+            # Setup CSV
             csv_path = self.output_dir / pdf_path.stem / f"{pdf_path.stem}_contract_data.csv"
             csv_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_manager.start_csv(csv_path)
             
-            # Process all pages and collect extractions
-            all_extractions = []
+            # Process pages sequentially (top to bottom)
+            total_rows = 0
+            successful_pages = 0
+            
+            logger.info("Processing pages sequentially (top to bottom)...")
             
             for i, image_path in enumerate(image_paths, 1):
-                logger.info(f"\n--- PAGE {i}/{len(image_paths)} ---")
+                logger.info(f"\n--- PAGE {i} ---")
                 extraction = self.process_page(image_path, i, pdf_path.name)
-                all_extractions.append((extraction, i))
+                if extraction.contract_rows or extraction.notification_received_date_found or extraction.contract_duration_found:
+                    successful_pages += 1
+                    total_rows += len(extraction.contract_rows)
             
-            # Write to CSV
-            self.write_to_csv(all_extractions, csv_path, pdf_path.name)
+            # Final state
+            final_state = self.state_manager.get_current_state()
             
-            # Compile best extraction (consolidate data from all pages)
-            consolidated = self.consolidate_extractions(all_extractions)
-            
-            # Results
             results = {
                 'pdf_name': pdf_path.name,
                 'total_pages': len(image_paths),
+                'successful_pages': successful_pages,
+                'total_rows': total_rows,
                 'csv_path': str(csv_path),
-                'consolidated_data': consolidated,
-                'all_page_extractions': all_extractions
+                'final_state': final_state,
+                'success_rate': f"{successful_pages}/{len(image_paths)}"
             }
             
-            logger.info(f"\n{'='*60}")
-            logger.info(f"EXTRACTION COMPLETE: {pdf_path.name}")
-            logger.info(f"{'='*60}")
-            logger.info(f"Pages processed: {len(image_paths)}")
+            logger.info(f"\nExtraction complete: {pdf_path.name}")
+            logger.info(f"Final state: {final_state}")
+            logger.info(f"Pages: {successful_pages}/{len(image_paths)} successful")
+            logger.info(f"Total rows: {total_rows}")
             logger.info(f"CSV saved: {csv_path}")
-            logger.info(f"Consolidated Results:")
-            logger.info(f"  Hospital Name: {consolidated.hospital_name}")
-            logger.info(f"  Charge Master Limit: {consolidated.charge_master_limit}")
-            logger.info(f"  Charge Master Increase: {consolidated.charge_master_increase}")
-            logger.info(f"  Effective Date: {consolidated.effective_date}")
-            logger.info(f"  Contract Duration: {consolidated.contract_duration}")
-            logger.info(f"  Notification Date: {consolidated.notification_received_date}")
-            logger.info(f"{'='*60}")
             
             return results
             
         except Exception as e:
             logger.error(f"Failed to extract {pdf_path.name}: {e}")
             raise
-    
-    def consolidate_extractions(self, extractions: List) -> ContractExtraction:
-        """Consolidate data from all pages to get the best extraction"""
-        consolidated = ContractExtraction()
-        
-        # For each field, pick the best non-null value
-        for extraction, page_num in extractions:
-            if extraction.hospital_name and not consolidated.hospital_name:
-                consolidated.hospital_name = extraction.hospital_name
-            if extraction.charge_master_limit and not consolidated.charge_master_limit:
-                consolidated.charge_master_limit = extraction.charge_master_limit
-            if extraction.charge_master_increase and not consolidated.charge_master_increase:
-                consolidated.charge_master_increase = extraction.charge_master_increase
-            if extraction.effective_date and not consolidated.effective_date:
-                consolidated.effective_date = extraction.effective_date
-            if extraction.contract_duration and not consolidated.contract_duration:
-                consolidated.contract_duration = extraction.contract_duration
-            if extraction.notification_received_date and not consolidated.notification_received_date:
-                consolidated.notification_received_date = extraction.notification_received_date
-        
-        return consolidated
-    
-    def write_to_csv(self, extractions: List, csv_path: Path, document_name: str):
-        """Write extractions to CSV file"""
-        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(self.columns)
             
-            for extraction, page_num in extractions:
-                row = [
-                    extraction.hospital_name or "N/A",
-                    extraction.charge_master_limit or "N/A",
-                    extraction.charge_master_increase or "N/A", 
-                    extraction.effective_date or "N/A",
-                    extraction.contract_duration or "N/A",
-                    extraction.notification_received_date or "N/A",
-                    document_name,
-                    page_num
-                ]
-                writer.writerow(row)
-        
-        logger.info(f"CSV written with {len(extractions)} rows")
+        finally:
+            self.state_manager.close_csv()
 
 # ==========================================
 # CLIENT SETUP
@@ -329,14 +387,14 @@ def create_client():
 # MAIN FUNCTION
 # ==========================================
 
-def extract_healthcare_contract(pdf_path: str, output_dir: str = "contract_extraction") -> Dict:
-    """Extract healthcare contract data from single PDF"""
+def extract_healthcare_contract(pdf_path: str, output_dir: str = "hierarchical_contract_extraction") -> Dict:
+    """Extract healthcare contract data using hierarchical state management"""
     
     # Create client and extractor
     client = create_client()
     extractor = HealthcareContractExtractor(client=client, output_dir=output_dir)
     
-    # Extract data
+    # Extract using hierarchical approach
     results = extractor.extract_from_pdf(pdf_path)
     
     return results
@@ -347,32 +405,23 @@ def extract_healthcare_contract(pdf_path: str, output_dir: str = "contract_extra
 
 if __name__ == "__main__":
     # Your PDF file path
-    pdf_file = "your_healthcare_contract.pdf"  # Replace with your actual PDF path
+    pdf_file = "Aultman Hospital.pdf"  # Replace with your actual PDF path
     
     try:
-        # Extract contract data
+        # Extract contract data using hierarchical approach
         results = extract_healthcare_contract(pdf_file)
         
-        # Print final results
-        print("\n" + "="*80)
-        print("HEALTHCARE CONTRACT EXTRACTION RESULTS")
-        print("="*80)
+        # Print results
+        print("\n" + "="*60)
+        print("HIERARCHICAL CONTRACT EXTRACTION RESULTS")
+        print("="*60)
         print(f"PDF: {results['pdf_name']}")
-        print(f"Pages: {results['total_pages']}")
-        print(f"Output: {results['csv_path']}")
-        print("\nExtracted Data:")
-        print("-" * 40)
-        
-        consolidated = results['consolidated_data']
-        print(f"Hospital Name: {consolidated.hospital_name or 'Not Found'}")
-        print(f"Charge Master Limit: {consolidated.charge_master_limit or 'Not Found'}")
-        print(f"Charge Master Increase: {consolidated.charge_master_increase or 'Not Found'}")
-        print(f"Effective Date: {consolidated.effective_date or 'Not Found'}")
-        print(f"Contract Duration: {consolidated.contract_duration or 'Not Found'}")
-        print(f"Notification Date: {consolidated.notification_received_date or 'Not Found'}")
-        
-        print("="*80)
-        print("Check contract_extraction.log for detailed processing logs")
+        print(f"Pages processed: {results['success_rate']}")
+        print(f"Total rows: {results['total_rows']}")
+        print(f"Final state: {results['final_state']}")
+        print(f"CSV output: {results['csv_path']}")
+        print("="*60)
+        print("Check contract_extraction.log for detailed logs")
         
     except Exception as e:
         logger.critical(f"Extraction failed: {e}")
