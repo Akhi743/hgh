@@ -51,7 +51,7 @@ class ContractStateManager:
         self.columns = [
             "Hospital Name", "Charge Master Limit", "Charge Master Increase", 
             "Effective Date", "Contract Duration", "Notification Received Date",
-            "Document Source", "Page Number"
+            "Document Source"
         ]
         self.reset_document_state()
     
