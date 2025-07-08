@@ -1,19 +1,16 @@
-import fitz  # PyMuPDF
+import fitz
 import os
 import csv
 import json
 import logging
+import re
 from pathlib import Path
-from typing import List, Optional, Dict, Any
-
-# Pydantic is used for data modeling and validation
-from pydantic import BaseModel, Field, ValidationError
-
-# Google GenAI for interacting with the Gemini API
+from typing import List, Optional, Dict
+from pydantic import BaseModel, Field
 from google.genai import types
 import google.genai as genai
 
-# Setup logging to file and console
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -25,311 +22,503 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# 1. DATA MODELS (Pydantic)
-# Defines the expected structure of the extracted data.
+# PATTERN RECOGNITION
+# ==========================================
+
+class ContractPatternMatcher:
+    """Detects healthcare contract pages using pattern recognition"""
+    
+    def __init__(self):
+        # Primary keywords (most critical)
+        self.primary_keywords = [
+            "charge master increase",
+            "charge master aggregate increase"
+        ]
+        
+        # Secondary keywords (supporting evidence)
+        self.secondary_keywords = [
+            "charge master limit",
+            "our agreement limits",
+            "we have received your email",
+            "we have received your letter", 
+            "notifying us of",
+            "effective january",
+            "effective 1/1/",
+            "rate adjustment exhibit",
+            "network management",
+            "medical economics"
+        ]
+        
+        # Visual/structural patterns
+        self.visual_patterns = [
+            "aetna",
+            "dear mr.",
+            "dear ms.", 
+            "sincerely,",
+            "facility",
+            "charge master limit",
+            "charge master increase"
+        ]
+        
+        # Data patterns (percentages, dates)
+        self.percentage_pattern = re.compile(r'\d+\.?\d*%')
+        self.date_patterns = [
+            re.compile(r'\d{1,2}/\d{1,2}/\d{4}'),
+            re.compile(r'january \d{1,2}, \d{4}', re.IGNORECASE),
+            re.compile(r'effective \d{1,2}/\d{1,2}/\d{4}', re.IGNORECASE)
+        ]
+    
+    def extract_text_from_image(self, image_path: Path) -> str:
+        """Extract text from image for pattern matching"""
+        try:
+            # Use PyMuPDF to extract text if it's a PDF page
+            # For now, we'll rely on the AI extraction, but this could be enhanced
+            # with OCR libraries like pytesseract for better text extraction
+            return ""
+        except Exception as e:
+            logger.debug(f"Could not extract text from {image_path}: {e}")
+            return ""
+    
+    def is_contract_page(self, image_path: Path, extracted_text: str = "") -> Dict[str, any]:
+        """
+        Determines if a page is a healthcare contract page based on patterns
+        
+        Returns:
+            Dict with 'is_contract': bool, 'confidence': float, 'patterns_found': list
+        """
+        text_lower = extracted_text.lower()
+        patterns_found = []
+        confidence_score = 0.0
+        
+        # Check primary keywords (high weight)
+        primary_found = 0
+        for keyword in self.primary_keywords:
+            if keyword in text_lower:
+                patterns_found.append(f"Primary: {keyword}")
+                primary_found += 1
+                confidence_score += 0.4  # 40% per primary keyword
+        
+        # Check secondary keywords (medium weight)  
+        secondary_found = 0
+        for keyword in self.secondary_keywords:
+            if keyword in text_lower:
+                patterns_found.append(f"Secondary: {keyword}")
+                secondary_found += 1
+                confidence_score += 0.05  # 5% per secondary keyword
+        
+        # Check visual patterns (low weight)
+        visual_found = 0
+        for pattern in self.visual_patterns:
+            if pattern in text_lower:
+                patterns_found.append(f"Visual: {pattern}")
+                visual_found += 1
+                confidence_score += 0.02  # 2% per visual pattern
+        
+        # Check data patterns
+        percentages = self.percentage_pattern.findall(extracted_text)
+        if len(percentages) >= 2:
+            patterns_found.append(f"Data: {len(percentages)} percentages found")
+            confidence_score += 0.1
+        
+        dates_found = 0
+        for date_pattern in self.date_patterns:
+            if date_pattern.search(extracted_text):
+                dates_found += 1
+        
+        if dates_found > 0:
+            patterns_found.append(f"Data: {dates_found} date patterns found")
+            confidence_score += 0.05 * dates_found
+        
+        # Determine if this is a contract page
+        is_contract = (
+            primary_found > 0 or  # At least one primary keyword
+            (secondary_found >= 3 and visual_found >= 2)  # Or multiple supporting patterns
+        )
+        
+        confidence_score = min(confidence_score, 1.0)  # Cap at 100%
+        
+        result = {
+            'is_contract': is_contract,
+            'confidence': confidence_score,
+            'patterns_found': patterns_found,
+            'primary_keywords': primary_found,
+            'secondary_keywords': secondary_found,
+            'visual_patterns': visual_found,
+            'percentages_found': len(percentages),
+            'dates_found': dates_found
+        }
+        
+        logger.info(f"Pattern analysis: {result}")
+        return result
+
+# ==========================================
+# DATA MODELS
 # ==========================================
 
 class ContractRow(BaseModel):
-    """Represents a single row of data from a contract table."""
-    hospital_name: str = Field(description="The specific name of the hospital or facility in a table row.")
-    charge_master_limit: Optional[str] = Field(None, description="The contractual charge master limit for this facility (e.g., '4.5%', '2.75% (CPI)').")
-    charge_master_increase: Optional[str] = Field(None, description="The charge master increase percentage for this facility (e.g., '7.0%').")
-    effective_date: Optional[str] = Field(None, description="The effective date for this specific facility if provided in the row.")
+    """Model for individual contract table row"""
+    hospital_name: str = Field(description="Hospital or facility name from the table row")
+    charge_master_limit: Optional[str] = Field(description="Charge master limit for this facility")
+    charge_master_increase: Optional[str] = Field(description="Charge master increase percentage for this facility")
+    effective_date: Optional[str] = Field(description="Effective date for this facility")
 
 class ContractPageExtraction(BaseModel):
-    """
-    Defines the structure for all data to be extracted from a single page.
-    This includes document-level fields and a list of table rows.
-    """
-    # Document-level fields that might be found on any page
-    notification_date: Optional[str] = Field(None, description="The primary date of the letter or notification (e.g., 'December 17, 2024').")
-    contract_duration: Optional[str] = Field(None, description="The term or duration of the agreement (e.g., '12-month period').")
+    """Model for page-level contract extraction"""
+    # Document-level fields (extract once if found)
+    notification_received_date_found: Optional[str] = Field(default=None, description="Notification date if found on this page")
+    contract_duration_found: Optional[str] = Field(default=None, description="Contract duration if found on this page")
     
-    # Table rows found on the page
-    contract_rows: List[ContractRow] = Field(default_factory=list, description="A list of all contract table rows found on the page.")
+    # Table rows (always extract)
+    contract_rows: List[ContractRow] = Field(description="List of all contract table rows found on this page")
 
 # ==========================================
-# 2. HIERARCHICAL STATE MANAGER
-# Manages and applies context (state) across multiple pages of a single document.
+# HIERARCHICAL STATE MANAGER
 # ==========================================
 
 class ContractStateManager:
-    """
-    Manages the state of document-level fields during extraction.
-    This allows information found on one page (e.g., a notification date)
-    to be applied to data extracted from subsequent pages.
-    """
+    """Manages hierarchical context for contract extraction"""
     
     def __init__(self):
         self.columns = [
-            "Hospital Name", "Charge Master Limit", "Charge Master Increase",
-            "Effective Date", "Contract Duration", "Notification Date",
+            "Hospital Name", "Charge Master Limit", "Charge Master Increase", 
+            "Effective Date", "Contract Duration", "Notification Received Date",
             "Document Source"
         ]
-        self._csv_file = None
-        self._csv_writer = None
         self.reset_document_state()
     
     def reset_document_state(self):
-        """Resets the stored state, typically called for each new PDF."""
-        # Internal state uses None for "not found"
-        self.notification_date: Optional[str] = None
-        self.contract_duration: Optional[str] = None
-        logger.info("Document state has been reset.")
+        """Reset state for new document"""
+        # Document-level (stored once for entire PDF)
+        self.notification_received_date = "N/A"
+        self.contract_duration = "N/A"
+        
+        # CSV management
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_path = None
+        
+        logger.info("Reset contract document state")
     
     def start_csv(self, output_path: Path):
-        """Creates and opens a new CSV file for writing results."""
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._csv_file = open(output_path, 'w', newline='', encoding='utf-8')
-        self._csv_writer = csv.writer(self._csv_file)
-        self._csv_writer.writerow(self.columns)
-        logger.info(f"CSV file started at: {output_path}")
+        """Start new CSV file"""
+        self.csv_path = output_path
+        self.csv_file = open(self.csv_path, 'w', newline='', encoding='utf-8')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(self.columns)
+        logger.info(f"Started CSV: {self.csv_path}")
     
     def update_from_page(self, extraction: ContractPageExtraction):
-        """
-        Updates the document-level state from a page's extraction result.
-        It only stores the *first* instance of a document-level field found.
-        """
-        if extraction.notification_date and self.notification_date is None:
-            self.notification_date = extraction.notification_date
-            logger.info(f"Stored document-level notification date: '{self.notification_date}'")
-            
-        if extraction.contract_duration and self.contract_duration is None:
-            self.contract_duration = extraction.contract_duration
-            logger.info(f"Stored document-level contract duration: '{self.contract_duration}'")
-
+        """Update state from page extraction - hierarchical store and reuse"""
+        
+        # Document-level: Store once for entire PDF
+        if extraction.notification_received_date_found:
+            if self.notification_received_date == "N/A":
+                self.notification_received_date = extraction.notification_received_date_found
+                logger.info(f"Stored notification date: '{self.notification_received_date}'")
+        
+        if extraction.contract_duration_found:
+            if self.contract_duration == "N/A":
+                self.contract_duration = extraction.contract_duration_found
+                logger.info(f"Stored contract duration: '{self.contract_duration}'")
+    
     def write_rows(self, extraction: ContractPageExtraction, document_name: str, page_num: int) -> int:
-        """
-        Writes extracted rows to the CSV file, enriching them with the stored document-level state.
-        """
-        if not self._csv_writer:
+        """Write extracted contract rows using stored context"""
+        if not self.csv_writer:
             return 0
         
         rows_written = 0
+        
         for row in extraction.contract_rows:
-            # Use stored document-level values, defaulting to "N/A" for the CSV
             csv_row = [
                 row.hospital_name,
                 row.charge_master_limit or "N/A",
                 row.charge_master_increase or "N/A",
                 row.effective_date or "N/A",
-                self.contract_duration or "N/A",
-                self.notification_date or "N/A",
+                self.contract_duration,  # Use stored document-level value
+                self.notification_received_date,  # Use stored document-level value
                 document_name
             ]
-            self._csv_writer.writerow(csv_row)
+            self.csv_writer.writerow(csv_row)
             rows_written += 1
-        
-        if self._csv_file:
-            self._csv_file.flush() # Ensure data is written to disk immediately
             
-        if rows_written > 0:
-            logger.info(f"Wrote {rows_written} row(s) to CSV from page {page_num}.")
+            logger.info(f"Wrote row: {row.hospital_name} - {row.charge_master_limit} - {row.charge_master_increase}")
+        
+        if self.csv_file:
+            self.csv_file.flush()
+        
+        logger.info(f"Total rows written from this page: {rows_written}")
         return rows_written
     
-    def get_current_state(self) -> Dict[str, Any]:
-        """Returns the current stored document-level state for debugging."""
+    def get_current_state(self):
+        """Get current state for debugging"""
         return {
-            'notification_date': self.notification_date,
+            'notification_received_date': self.notification_received_date,
             'contract_duration': self.contract_duration
         }
-        
-    def close_csv(self):
-        """Closes the CSV file if it is open."""
-        if self._csv_file:
-            self._csv_file.close()
-            self._csv_file = None
-            self._csv_writer = None
-            logger.info("CSV file has been closed.")
-
-# ==========================================
-# 3. PDF PROCESSING UTILITY
-# Converts PDF files into images for visual analysis by the AI model.
-# ==========================================
-
-def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 200) -> List[Path]:
-    """
-    Converts each page of a PDF into a high-resolution PNG image.
     
-    Args:
-        pdf_path: Path to the source PDF file.
-        output_dir: Directory to save the output images.
-        dpi: Dots per inch for image resolution.
-        
-    Returns:
-        A list of paths to the created image files.
-    """
+    def close_csv(self):
+        """Close CSV file"""
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+
+# ==========================================
+# PDF PROCESSING
+# ==========================================
+
+def pdf_to_images(pdf_path: str, output_dir: str = None, dpi: int = 200) -> List[Path]:
+    """Convert PDF pages to images using PyMuPDF"""
+    pdf_path = Path(pdf_path)
     if not pdf_path.exists():
-        logger.error(f"PDF file not found: {pdf_path}")
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    
+    if output_dir is None:
+        output_dir = pdf_path.parent / f"{pdf_path.stem}_images"
+    else:
+        output_dir = Path(output_dir)
     
     output_dir.mkdir(parents=True, exist_ok=True)
     image_paths = []
     
     try:
-        doc = fitz.open(pdf_path)
-        logger.info(f"Converting '{pdf_path.name}' ({len(doc)} pages) to images at {dpi} DPI...")
+        doc = fitz.open(str(pdf_path))
+        logger.info(f"Converting PDF '{pdf_path.name}' ({len(doc)} pages)")
         
-        for i, page in enumerate(doc):
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
             mat = fitz.Matrix(dpi / 72, dpi / 72)
             pix = page.get_pixmap(matrix=mat)
             
-            output_path = output_dir / f"{pdf_path.stem}_page_{i + 1:03d}.png"
-            pix.save(output_path)
+            output_path = output_dir / f"{pdf_path.stem}_page_{page_num + 1:03d}.png"
+            pix.save(str(output_path))
             image_paths.append(output_path)
             
         doc.close()
-        logger.info(f"Successfully converted {len(image_paths)} pages.")
+        logger.info(f"Successfully converted {len(image_paths)} pages")
         
     except Exception as e:
-        logger.error(f"Failed during PDF to image conversion for '{pdf_path.name}': {e}")
+        logger.error(f"Failed to convert PDF '{pdf_path.name}': {e}")
         raise
-        
+    
     return image_paths
 
 # ==========================================
-# 4. CONTRACT EXTRACTOR CLASS
-# The main class that orchestrates the entire extraction process.
+# CONTRACT EXTRACTOR
 # ==========================================
 
 class HealthcareContractExtractor:
-    """
-    Extracts structured data from healthcare contract PDFs by processing
-    each page and using a state manager to maintain document-level context.
-    """
+    """Healthcare contract extractor using hierarchical state management and pattern recognition"""
     
     def __init__(self, client, output_dir: str = "contract_extraction"):
         self.client = client
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.state_manager = ContractStateManager()
-        self.extraction_prompt = self._build_extraction_prompt()
-
-    def _build_extraction_prompt(self) -> str:
-        """Builds a robust, structured prompt for the AI model."""
+        self.pattern_matcher = ContractPatternMatcher()
+    
+    def get_extraction_prompt(self) -> str:
+        """Generate extraction prompt optimized for healthcare contract patterns"""
         json_schema = json.dumps(ContractPageExtraction.model_json_schema(), indent=2)
-
+        
         return f"""
-You are an expert data extraction AI specializing in healthcare contracts.
-Your task is to analyze the provided image of a document page and extract information precisely according to the rules and JSON schema below.
+You are a healthcare contract data extraction specialist focusing on Aetna charge master increase notifications.
 
-### EXTRACTION RULES
+**DOCUMENT PATTERNS TO RECOGNIZE:**
+This appears to be an Aetna letter about "charge master increase" notifications. Look for:
+- Aetna logo and letterhead
+- Phrases like "We have received your email/letter" and "notifying us of"
+- "charge master increase" and "charge master limit" terminology
+- Network Management or Medical Economics department
+- Table with Facility, Charge Master Limit, Charge Master Increase columns
 
-1.  **Analyze the Entire Page:** Review the whole page to find all requested fields.
-2.  **Follow the Schema:** Your output MUST be a valid JSON object that conforms to the provided schema.
-3.  **Exact Data:** Extract text exactly as it appears in the document. Do not correct or infer values.
-4.  **Row Integrity:** For tables, ensure all data in a single `ContractRow` object comes from the *same* physical row in the table. Do not mix data between rows.
-5.  **Null for Missing Fields:** If any field is not found on the page, its value must be `null` in the JSON output. Do not omit the key.
-6.  **Extract All Rows:** Create a `ContractRow` object for EVERY row found in any relevant table. If no tables are present, the `contract_rows` array should be empty.
+**DOCUMENT-LEVEL FIELDS (extract only if found on THIS page):**
 
-### FIELD DEFINITIONS
+**1. notification_received_date_found**
+- **What it is:** Date when Aetna received the hospital's notification
+- **Where to look:** Letter opening: "We have received your email dated [DATE]"
+- **Examples:** "December 6, 2024", "November 1, 2024"
+- **Pattern:** Look for "dated [DATE]" or "received your email dated [DATE]"
 
-* `notification_date`: The main date of the letter (e.g., "December 17, 2024"). Extract only if found on this page.
-* `contract_duration`: The length of the agreement (e.g., "12-month period"). Extract only if found on this page.
-* `contract_rows`: An array of objects, where each object represents one row from a table of facilities and their rates.
-    * `hospital_name`: The name of the facility from the row.
-    * `charge_master_limit`: The limit percentage from that specific row.
-    * `charge_master_increase`: The increase percentage from that specific row.
-    * `effective_date`: The effective date, if present in that specific row.
+**2. contract_duration_found**  
+- **What it is:** Contract term or agreement period
+- **Where to look:** Letter body mentioning "12-month period", contract terms
+- **Examples:** "12-month period", "12 months", "each 12-month period"
+- **Pattern:** Look for text mentioning duration of agreement or billing cycles
 
-### JSON OUTPUT SCHEMA
+**TABLE ROW EXTRACTION:**
+
+**3. contract_rows**
+- **CRITICAL:** Extract EVERY row from the facilities table
+- **Look for table with columns:** Facility | Charge Master Limit | Charge Master Increase
+- **For each table row extract:**
+  - **hospital_name:** Exact facility name (e.g., "Aultman Hospital", "Alliance Community Hospital")
+  - **charge_master_limit:** Exact limit (e.g., "CP 4.5%/ME 3.0%", "CP 4.5%")  
+  - **charge_master_increase:** Exact increase (e.g., "7.0%", "6.0%")
+  - **effective_date:** Date when increase takes effect (often "effective January 1, 2025")
+
+**EXTRACTION RULES:**
+- Match each row's data exactly - do NOT mix data between different facilities
+- Extract all facilities from the table, not just the first one
+- Look for the specific Aetna letter patterns described above
+- For missing fields, use null
+
+**JSON Schema:**
 {json_schema}
 """
-
-    def process_page(self, image_path: Path, page_num: int, document_name: str) -> Optional[ContractPageExtraction]:
-        """Processes a single page image to extract data."""
-        logger.info(f"--- Processing Page {page_num} of {document_name} ---")
-        logger.info(f"Current State: {self.state_manager.get_current_state()}")
-        response_text = ""
+    
+    def process_page(self, image_path: Path, page_num: int, document_name: str) -> ContractPageExtraction:
+        """Process single page with pattern recognition and hierarchical methodology"""
+        logger.info(f"=== PROCESSING PAGE {page_num}: {image_path.name} ===")
+        
+        # Show current state before processing
+        current_state = self.state_manager.get_current_state()
+        logger.info(f"Current state before processing: {current_state}")
         
         try:
             with open(image_path, 'rb') as f:
                 image_bytes = f.read()
             
             mime_type = 'image/png' if image_path.suffix.lower() == '.png' else 'image/jpeg'
+            prompt = self.get_extraction_prompt()
             
             logger.info("Sending extraction request to Gemini...")
             
-            # API call with fallback for different client types
+            # API call with fallback
             try:
                 response = self.client.models.generate_content(
                     model='gemini-2.0-flash',
                     contents=[
                         types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                        self.extraction_prompt
+                        prompt
                     ]
                 )
             except (AttributeError, TypeError):
                 response = self.client.generate_content(
                     contents=[
-                        self.extraction_prompt,
-                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        prompt
                     ]
                 )
             
+            # Clean and parse response
             response_text = response.text.strip()
-            logger.info(f"Received raw JSON response from model: {response_text[:500]}...")
+            if response_text.startswith('```json'):
+                response_text = response_text.split('```json')[1]
+            if response_text.endswith('```'):
+                response_text = response_text.rsplit('```', 1)[0]
+            response_text = response_text.strip()
             
+            # Debug: Log raw response
+            logger.info(f"Cleaned AI response: {response_text[:500]}...")
+            
+            # Pattern recognition on the response text (basic)
+            pattern_analysis = self.pattern_matcher.is_contract_page(image_path, response_text)
+            logger.info(f"Pattern recognition: {pattern_analysis}")
+            
+            # Parse and validate
             extraction = ContractPageExtraction.model_validate_json(response_text)
-            logger.info(f"Successfully parsed and validated extracted data for page {page_num}.")
             
-            self.state_manager.update_from_page(extraction)
-            self.state_manager.write_rows(extraction, document_name, page_num)
+            # Debug: Log what was extracted
+            logger.info(f"Extracted fields:")
+            logger.info(f"  - notification_received_date_found: {extraction.notification_received_date_found}")
+            logger.info(f"  - contract_duration_found: {extraction.contract_duration_found}")
+            logger.info(f"  - contract_rows found: {len(extraction.contract_rows)}")
+            
+            for i, row in enumerate(extraction.contract_rows, 1):
+                logger.info(f"    Row {i}: {row.hospital_name} | {row.charge_master_limit} | {row.charge_master_increase} | {row.effective_date}")
+            
+            # Only process if patterns suggest this is a contract page OR if we found contract rows
+            if pattern_analysis['is_contract'] or extraction.contract_rows:
+                logger.info("Page identified as contract page - processing data")
+                
+                # Update hierarchical state
+                self.state_manager.update_from_page(extraction)
+                
+                # Write rows using stored context
+                rows_written = self.state_manager.write_rows(extraction, document_name, page_num)
+                
+                # Show updated state after processing
+                updated_state = self.state_manager.get_current_state()
+                logger.info(f"Updated state after processing: {updated_state}")
+                logger.info(f"Page {page_num}: {rows_written} rows extracted")
+            else:
+                logger.info("Page does not match contract patterns - skipping")
             
             return extraction
             
-        except (json.JSONDecodeError, ValidationError) as e:
-            logger.error(f"CRITICAL: Failed to parse or validate AI response on page {page_num}. Error: {e}")
-            logger.error(f"Problematic response text: {response_text}")
         except Exception as e:
-            logger.error(f"CRITICAL: An unexpected error occurred on page {page_num}: {e}")
+            logger.error(f"CRITICAL ERROR on page {page_num}: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
-            
-        return None
-
-    def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict[str, Any]:
-        """Orchestrates the full extraction process for a single PDF."""
+            return ContractPageExtraction()
+    
+    def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
+        """Extract contract data from PDF using hierarchical approach with pattern recognition"""
         pdf_path = Path(pdf_path)
-        logger.info(f"======== STARTING EXTRACTION FOR: {pdf_path.name} ========")
-        
-        total_rows = 0
-        successful_pages = 0
+        logger.info(f"Starting hierarchical contract extraction with pattern recognition: {pdf_path.name}")
         
         try:
+            # Reset state for new PDF
             self.state_manager.reset_document_state()
-            image_output_dir = self.output_dir / pdf_path.stem / "images"
-            image_paths = pdf_to_images(pdf_path, image_output_dir, dpi)
-            total_pages = len(image_paths)
             
-            csv_path = self.output_dir / pdf_path.stem / f"{pdf_path.stem}_extracted_data.csv"
+            # Convert to images
+            image_output_dir = self.output_dir / pdf_path.stem / "images"
+            image_paths = pdf_to_images(str(pdf_path), str(image_output_dir), dpi)
+            
+            # Setup CSV
+            csv_path = self.output_dir / pdf_path.stem / f"{pdf_path.stem}_contract_data.csv"
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_manager.start_csv(csv_path)
-
+            
+            # Process pages sequentially (top to bottom)
+            total_rows = 0
+            successful_pages = 0
+            contract_pages_found = 0
+            
+            logger.info("Processing pages sequentially with pattern recognition...")
+            
             for i, image_path in enumerate(image_paths, 1):
+                logger.info(f"\n--- PAGE {i} ---")
                 extraction = self.process_page(image_path, i, pdf_path.name)
-                if extraction:
+                
+                # Check if this page had contract content
+                if extraction.contract_rows or extraction.notification_received_date_found or extraction.contract_duration_found:
                     successful_pages += 1
                     total_rows += len(extraction.contract_rows)
+                    if extraction.contract_rows:
+                        contract_pages_found += 1
+            
+            # Final state
+            final_state = self.state_manager.get_current_state()
             
             results = {
                 'pdf_name': pdf_path.name,
-                'total_pages': total_pages,
+                'total_pages': len(image_paths),
                 'successful_pages': successful_pages,
-                'total_rows_extracted': total_rows,
+                'contract_pages_found': contract_pages_found,
+                'total_rows': total_rows,
                 'csv_path': str(csv_path),
-                'final_state': self.state_manager.get_current_state(),
-                'success_rate': f"{successful_pages}/{total_pages}"
+                'final_state': final_state,
+                'success_rate': f"{successful_pages}/{len(image_paths)}",
+                'pattern_recognition_enabled': True
             }
-            logger.info(f"======== EXTRACTION COMPLETE FOR: {pdf_path.name} ========")
-            logger.info(f"Results: {results}")
+            
+            logger.info(f"\nExtraction complete: {pdf_path.name}")
+            logger.info(f"Final state: {final_state}")
+            logger.info(f"Pages: {successful_pages}/{len(image_paths)} successful")
+            logger.info(f"Contract pages found: {contract_pages_found}")
+            logger.info(f"Total rows: {total_rows}")
+            logger.info(f"CSV saved: {csv_path}")
+            
             return results
             
         except Exception as e:
-            logger.critical(f"Process failed for PDF '{pdf_path.name}'. Error: {e}")
+            logger.error(f"Failed to extract {pdf_path.name}: {e}")
             raise
+            
         finally:
             self.state_manager.close_csv()
-
 
 # ==========================================
 # CLIENT SETUP
@@ -338,7 +527,6 @@ Your task is to analyze the provided image of a document page and extract inform
 def create_client():
     """Create Google Cloud client with Vertex AI"""
     try:
-        # Use the google.genai Client for Vertex AI
         client = genai.Client(
             vertexai=True, 
             project="anbc-hcb-dev",  # Replace with your project ID
@@ -355,13 +543,13 @@ def create_client():
 # ==========================================
 
 def extract_healthcare_contract(pdf_path: str, output_dir: str = "hierarchical_contract_extraction") -> Dict:
-    """Extract healthcare contract data using hierarchical state management"""
+    """Extract healthcare contract data using hierarchical state management and pattern recognition"""
     
     # Create client and extractor
     client = create_client()
     extractor = HealthcareContractExtractor(client=client, output_dir=output_dir)
     
-    # Extract using hierarchical approach
+    # Extract using hierarchical approach with pattern recognition
     results = extractor.extract_from_pdf(pdf_path)
     
     return results
@@ -375,16 +563,17 @@ if __name__ == "__main__":
     pdf_file = "Aultman Hospital.pdf"  # Replace with your actual PDF path
     
     try:
-        # Extract contract data using hierarchical approach
+        # Extract contract data using hierarchical approach with pattern recognition
         results = extract_healthcare_contract(pdf_file)
         
         # Print results
         print("\n" + "="*60)
-        print("HIERARCHICAL CONTRACT EXTRACTION RESULTS")
+        print("HEALTHCARE CONTRACT EXTRACTION WITH PATTERN RECOGNITION")
         print("="*60)
         print(f"PDF: {results['pdf_name']}")
         print(f"Pages processed: {results['success_rate']}")
-        print(f"Total rows: {results['total_rows_extracted']}")
+        print(f"Contract pages found: {results['contract_pages_found']}")
+        print(f"Total rows: {results['total_rows']}")
         print(f"Final state: {results['final_state']}")
         print(f"CSV output: {results['csv_path']}")
         print("="*60)
