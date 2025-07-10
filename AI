@@ -211,7 +211,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                 with open(image_path, 'rb') as f:
                     image_bytes = f.read()
                 
-                response = self.client.generate_content(
+                response = self.client.models.generate_content(
                     model='gemini-2.0-flash-exp',
                     contents=[
                         types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
@@ -238,7 +238,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
             with open(image_path, 'rb') as f:
                 image_bytes = f.read()
             
-            response = self.client.generate_content(
+            response = self.client.models.generate_content(
                 model='gemini-2.0-flash-exp',
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
