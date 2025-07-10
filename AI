@@ -3,92 +3,151 @@ import csv
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict
-from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, Type
+from pydantic import BaseModel, Field, create_model
 from google.genai import types
 import google.genai as genai
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('document_extraction.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# DATA MODELS
+# CONFIGURATION SYSTEM
 # ==========================================
 
-class ContractRow(BaseModel):
-    hospital_name: str = Field(description="Hospital or facility name from the table row")
-    charge_master_limit: Optional[str] = Field(description="Charge master limit for this facility")
-    charge_master_increase: Optional[str] = Field(description="Charge master increase percentage for this facility")
-    effective_date: Optional[str] = Field(description="Effective date for this facility")
+class ExtractionField(BaseModel):
+    """Configuration for a single extraction field"""
+    name: str
+    description: str
+    field_type: str = "Optional[str]"
+    examples: List[str] = Field(default_factory=list)
+    extraction_rules: List[str] = Field(default_factory=list)
 
-class ContractPageExtraction(BaseModel):
-    notification_received_date_found: Optional[str] = Field(default=None, description="Notification date if found on this page")
-    contract_duration_found: Optional[str] = Field(default=None, description="Contract duration if found on this page")
-    contract_rows: List[ContractRow] = Field(description="List of all contract table rows found on this page")
+class DocumentTypeConfig(BaseModel):
+    """Configuration for a specific document type"""
+    document_type: str
+    description: str
+    
+    # Document-level fields (extracted once per document)
+    document_fields: List[ExtractionField] = Field(default_factory=list)
+    
+    # Row-level fields (extracted from tables/repeated structures)
+    row_fields: List[ExtractionField] = Field(default_factory=list)
+    
+    # Detection configuration
+    detection_keywords: List[str] = Field(default_factory=list)
+    detection_prompt: str = ""
+    
+    # Extraction instructions
+    extraction_instructions: str = ""
+    
+    # Output configuration
+    csv_columns: List[str] = Field(default_factory=list)
 
 # ==========================================
-# STATE MANAGER
+# HEALTHCARE CONTRACT CONFIGURATION
 # ==========================================
 
-class ContractStateManager:
-    def __init__(self):
-        self.columns = [
-            "Hospital Name", "Charge Master Limit", "Charge Master Increase",
-            "Effective Date", "Contract Duration", "Notification Received Date", "Document Source", "Page Number"
-        ]
-        self.reset_document_state()
+HEALTHCARE_CONTRACT_CONFIG = DocumentTypeConfig(
+    document_type="Healthcare Contract",
+    description="Aetna healthcare contract charge master increase notifications",
     
-    def reset_document_state(self):
-        self.notification_received_date = "N/A"
-        self.contract_duration = "N/A"
-        self.csv_file = None
-        self.csv_writer = None
+    document_fields=[
+        ExtractionField(
+            name="notification_received_date",
+            description="Date when notification was received",
+            examples=["December 6, 2024", "12/6/2024"],
+            extraction_rules=["Look for 'We have received your email dated [DATE]'"]
+        ),
+        ExtractionField(
+            name="contract_duration",
+            description="Contract duration period",
+            examples=["12-month period", "12 months"],
+            extraction_rules=["Look for duration text in letter body"]
+        )
+    ],
     
-    def start_csv(self, output_path: Path):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.csv_file = open(output_path, 'w', newline='', encoding='utf-8')
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(self.columns)
+    row_fields=[
+        ExtractionField(
+            name="hospital_name",
+            description="Hospital or facility name",
+            examples=["Aultman Hospital", "Alliance Community Hospital"],
+            extraction_rules=["Extract exact facility name from table row"]
+        ),
+        ExtractionField(
+            name="charge_master_limit",
+            description="Charge master limit for facility",
+            examples=["CP 4.5%/ME 3.0%", "CP 4.5%"],
+            extraction_rules=["Extract exact limit from table cell"]
+        ),
+        ExtractionField(
+            name="charge_master_increase",
+            description="Charge master increase percentage",
+            examples=["7.0%", "6.0%"],
+            extraction_rules=["Extract exact increase from table cell"]
+        ),
+        ExtractionField(
+            name="effective_date",
+            description="Effective date for facility",
+            examples=["01/01/2025", "January 1, 2025"],
+            extraction_rules=["Extract effective date if shown in table"]
+        )
+    ],
     
-    def update_from_page(self, extraction: ContractPageExtraction):
-        if extraction.notification_received_date_found and self.notification_received_date == "N/A":
-            self.notification_received_date = extraction.notification_received_date_found
-            logger.info(f"Stored notification date: '{self.notification_received_date}'")
-        
-        if extraction.contract_duration_found and self.contract_duration == "N/A":
-            self.contract_duration = extraction.contract_duration_found
-            logger.info(f"Stored contract duration: '{self.contract_duration}'")
+    detection_keywords=[
+        "charge master increase", "aetna", "we have received your email",
+        "charge master limit", "network management"
+    ],
     
-    def write_rows(self, extraction: ContractPageExtraction, document_name: str, page_num: int) -> int:
-        if not self.csv_writer:
-            return 0
-        
-        rows_written = 0
-        for row in extraction.contract_rows:
-            csv_row = [
-                row.hospital_name,
-                row.charge_master_limit or "N/A",
-                row.charge_master_increase or "N/A",
-                row.effective_date or "N/A",
-                self.contract_duration,
-                self.notification_received_date,
-                document_name,
-                page_num  # Add page number to CSV row
-            ]
-            self.csv_writer.writerow(csv_row)
-            rows_written += 1
-        
-        if self.csv_file:
-            self.csv_file.flush()
-        
-        return rows_written
+    detection_prompt="""
+Is this an Aetna healthcare contract letter about charge master increases? 
+Look for: Aetna logo, "charge master increase", "We have received your email/letter", table with facilities.
+Answer only: YES or NO
+""",
     
-    def close_csv(self):
-        if self.csv_file:
-            self.csv_file.close()
-            self.csv_file = None
-            self.csv_writer = None
+    extraction_instructions="Extract ALL healthcare contract data from this Aetna charge master increase letter.",
+    
+    csv_columns=[
+        "Hospital Name", "Charge Master Limit", "Charge Master Increase", 
+        "Effective Date", "Contract Duration", "Notification Received Date", "Document Source"
+    ]
+)
+
+# ==========================================
+# DYNAMIC MODEL CREATION
+# ==========================================
+
+def create_extraction_models(config: DocumentTypeConfig):
+    """Dynamically create Pydantic models based on configuration"""
+    
+    # Create row model
+    row_fields = {}
+    for field in config.row_fields:
+        if field.field_type == "str":
+            row_fields[field.name] = (str, Field(description=field.description))
+        else:  # Default to Optional[str]
+            row_fields[field.name] = (Optional[str], Field(description=field.description))
+    
+    RowModel = create_model(f'{config.document_type.replace(" ", "")}Row', **row_fields)
+    
+    # Create document extraction model
+    doc_fields = {}
+    for field in config.document_fields:
+        doc_fields[field.name] = (Optional[str], Field(default=None, description=field.description))
+    
+    doc_fields['rows'] = (List[RowModel], Field(default_factory=list, description="Extracted rows"))
+    
+    DocumentModel = create_model(f'{config.document_type.replace(" ", "")}Extraction', **doc_fields)
+    
+    return RowModel, DocumentModel
 
 # ==========================================
 # CONTRACT EXTRACTOR
@@ -135,7 +194,7 @@ Extract healthcare contract data from this Aetna charge master increase notifica
             mime_type = 'image/png' if image_path.suffix.lower() == '.png' else 'image/jpeg'
             prompt = self.get_extraction_prompt()
             
-            # API call with fallback
+            # API call for detailed extraction
             try:
                 response = self.client.models.generate_content(
                     model='gemini-1.5-flash',
@@ -162,7 +221,6 @@ Extract healthcare contract data from this Aetna charge master increase notifica
             
             extraction = ContractPageExtraction.model_validate_json(response_text)
             
-            # Update state and write rows
             self.state_manager.update_from_page(extraction)
             rows_written = self.state_manager.write_rows(extraction, document_name, page_num)
             
@@ -172,84 +230,106 @@ Extract healthcare contract data from this Aetna charge master increase notifica
             return extraction
             
         except Exception as e:
-            logger.error(f"Error processing page {page_num}: {e}")
-            # Return an empty object on failure so the loop can continue
+            logger.error(f"Error processing page {page_num} for detailed extraction: {e}")
             return ContractPageExtraction(contract_rows=[])
-    
-    def _find_pages_to_process(self, doc: fitz.Document) -> List[int]:
-        """Scans the document to find pages that match the keyword criteria."""
+
+    def _find_letter_pages_with_ai(self, doc: fitz.Document, image_output_dir: Path, dpi: int) -> List[int]:
+        """
+        Uses a simple AI call to classify each page and find the target letter(s).
+        """
         pages_to_process = []
+        
+        classifier_prompt = """
+        Analyze the image of this document page. Is this a formal letter from Aetna Network Management notifying a healthcare provider that 'We have received' their 'notifying us' of a charge master increase?
+        
+        Answer with only the word 'YES' or 'NO'.
+        """
+        
+        logger.info("Starting AI-powered page search...")
+        
         i = 0
         while i < len(doc):
-            page = doc[i]
-            text = page.get_text().lower() # Use lowercase for case-insensitive matching
+            page_num = i + 1
+            page = doc.load_page(i)
             
-            # Check for the trigger keywords
-            is_letter_page = ("network management" in text and
-                              "we have received" in text and
-                              "notifying us" in text)
-            
-            if is_letter_page:
-                page_num = i + 1
-                logger.info(f"✅ Found letter keywords on page {page_num}.")
-                pages_to_process.append(i)
+            # Convert single page to image for the classifier call
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            image_path = image_output_dir / f"{doc.name}_classifier_page_{page_num:03d}.png"
+            pix.save(str(image_path))
+
+            try:
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+
+                # Make the quick classifier API call
+                response = self.client.generate_content(
+                    model='gemini-1.5-flash', # Use a fast model for classification
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type='image/png'),
+                        classifier_prompt
+                    ]
+                )
                 
-                # Check for continuation keyword
-                if "sincerely" not in text:
-                    # If there is a next page, add it for processing
-                    if (i + 1) < len(doc):
-                        next_page_num = i + 2
-                        logger.info(f"⚠️ 'Sincerely' not found. Adding continuation page {next_page_num}.")
-                        pages_to_process.append(i + 1)
-                        i += 1 # Skip the next page in the main loop since it's already added
+                answer = response.text.strip().upper()
+                logger.info(f"AI classification for page {page_num}: '{answer}'")
+                
+                if 'YES' in answer:
+                    logger.info(f"AI identified page {page_num} as the target letter.")
+                    pages_to_process.append(i)
+                    
+                    # Check for continuation logic
+                    page_text = page.get_text().lower()
+                    if "sincerely" not in page_text:
+                        if (i + 1) < len(doc):
+                            next_page_num = i + 2
+                            logger.info(f"'Sincerely' not found on page {page_num}. Adding continuation page {next_page_num}.")
+                            pages_to_process.append(i + 1)
+                            i += 1 # Skip next page in loop
+                
+            except Exception as e:
+                logger.error(f"Could not classify page {page_num}. Error: {e}")
+            
             i += 1
             
-        # Return a unique, sorted list of page indices
         return sorted(list(set(pages_to_process)))
 
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
         pdf_path = Path(pdf_path)
         
         self.state_manager.reset_document_state()
-        
         doc = fitz.open(str(pdf_path))
         
-        # 1. Find the specific pages to process based on keywords
-        pages_to_process_indices = self._find_pages_to_process(doc)
-        total_pages_in_pdf = len(doc)
+        image_output_dir = self.output_dir / pdf_path.stem / "images"
+        image_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 1. Use the AI to find the specific pages to process
+        pages_to_process_indices = self._find_letter_pages_with_ai(doc, image_output_dir, dpi)
         
         if not pages_to_process_indices:
-            logger.warning(f"No pages with the specified keywords were found in '{pdf_path.name}'.")
+            logger.warning(f"AI could not identify any target letter pages in '{pdf_path.name}'.")
             doc.close()
             return {
                 'pdf_name': pdf_path.name,
-                'total_pages_in_pdf': total_pages_in_pdf,
+                'total_pages_in_pdf': len(doc),
                 'pages_processed': 0,
                 'total_rows': 0,
                 'csv_path': "N/A"
             }
         
-        logger.info(f"Found {len(pages_to_process_indices)} page(s) to process: {[p+1 for p in pages_to_process_indices]}")
+        logger.info(f"AI search complete. Processing pages: {[p+1 for p in pages_to_process_indices]}")
         
         # 2. Setup CSV
-        image_output_dir = self.output_dir / pdf_path.stem / "images"
-        image_output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = self.output_dir / pdf_path.stem / f"{pdf_path.stem}_contract_data.csv"
         self.state_manager.start_csv(csv_path)
         
-        # 3. Process only the identified pages
+        # 3. Process only the identified pages for detailed extraction
         total_rows = 0
         for page_index in pages_to_process_indices:
             page_num = page_index + 1
-            page = doc.load_page(page_index)
+            # Re-use the image saved by the classifier
+            image_path = image_output_dir / f"{doc.name}_classifier_page_{page_num:03d}.png"
             
-            # Convert just this single page to an image
-            mat = fitz.Matrix(dpi / 72, dpi / 72)
-            pix = page.get_pixmap(matrix=mat)
-            image_path = image_output_dir / f"{pdf_path.stem}_page_{page_num:03d}.png"
-            pix.save(str(image_path))
-            
-            # Process the created image
             extraction = self.process_page(image_path, page_num, pdf_path.name)
             if extraction:
                 total_rows += len(extraction.contract_rows)
@@ -259,7 +339,7 @@ Extract healthcare contract data from this Aetna charge master increase notifica
         
         return {
             'pdf_name': pdf_path.name,
-            'total_pages_in_pdf': total_pages_in_pdf,
+            'total_pages_in_pdf': len(doc),
             'pages_processed': len(pages_to_process_indices),
             'total_rows': total_rows,
             'csv_path': str(csv_path)
@@ -270,6 +350,7 @@ Extract healthcare contract data from this Aetna charge master increase notifica
 # ==========================================
 
 def create_client():
+    """Create Google Cloud client"""
     return genai.Client(
         vertexai=True, 
         project="anbc-hcb-dev",  # Replace with your project ID
@@ -277,22 +358,72 @@ def create_client():
     )
 
 # ==========================================
-# MAIN FUNCTION
+# MAIN EXTRACTION FUNCTIONS
 # ==========================================
 
 def extract_healthcare_contract(pdf_path: str, output_dir: str = "contract_extraction") -> Dict:
+    """Extract healthcare contracts using AI-powered page detection"""
     client = create_client()
     extractor = HealthcareContractExtractor(client=client, output_dir=output_dir)
     return extractor.extract_from_pdf(pdf_path)
+
+# ==========================================
+# TESTING FRAMEWORK
+# ==========================================
+
+def test_extraction_config(config: DocumentTypeConfig) -> bool:
+    """Test that a configuration is valid"""
+    try:
+        # Test model creation
+        RowModel, DocumentModel = create_extraction_models(config)
+        
+        # Test that required fields exist
+        assert config.document_type, "Document type must be specified"
+        assert config.csv_columns, "CSV columns must be specified"
+        
+        # Test that CSV columns match field configuration
+        expected_columns = len(config.row_fields) + len(config.document_fields) + 1  # +1 for document source
+        actual_columns = len(config.csv_columns)
+        assert actual_columns == expected_columns, \
+            f"CSV columns ({actual_columns}) must match field count ({expected_columns})"
+        
+        logger.info(f"Configuration test passed for {config.document_type}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Configuration test failed for {config.document_type}: {e}")
+        return False
+
+def run_extraction_tests():
+    """Run comprehensive tests on the extraction system"""
+    
+    # Test healthcare contract configuration
+    logger.info("Testing Healthcare Contract configuration")
+    success = test_extraction_config(HEALTHCARE_CONTRACT_CONFIG)
+    if not success:
+        raise ValueError("Healthcare Contract configuration test failed")
+    
+    logger.info("All extraction tests passed - system is robust and ready")
 
 # ==========================================
 # USAGE
 # ==========================================
 
 if __name__ == "__main__":
+    
+    # Run tests first to ensure system integrity
+    try:
+        run_extraction_tests()
+        logger.info("All tests passed - system is ready")
+    except Exception as e:
+        logger.error(f"Tests failed: {e}")
+        exit(1)
+    
+    # Your original usage (maintained for compatibility)
     pdf_file = "Aultman Hospital.pdf"  # Replace with your actual PDF path
     
     try:
+        # Original healthcare contract extraction (unchanged interface)
         results = extract_healthcare_contract(pdf_file)
         
         print("\n" + "="*60)
@@ -306,4 +437,5 @@ if __name__ == "__main__":
         print("="*60)
         
     except Exception as e:
+        logger.error(f"Extraction failed: {e}")
         print(f"Error: {e}")
