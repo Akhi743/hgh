@@ -207,9 +207,16 @@ Follow this JSON schema precisely. Use `null` for any missing values.
             pix.save(str(image_path))
 
             try:
+                # Read the image as bytes
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+                
                 response = self.client.generate_content(
-                    model='gemini-1.5-flash',
-                    contents=[types.Part.from_uri(uri=image_path.as_uri(), mime_type='image/png'), self.config.detection_prompt]
+                    model='gemini-2.0-flash-exp',
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
+                        self.config.detection_prompt
+                    ]
                 )
                 answer = response.text.strip().upper()
                 if 'YES' in answer:
@@ -227,9 +234,16 @@ Follow this JSON schema precisely. Use `null` for any missing values.
     def process_page(self, image_path: Path, page_num: int, document_name: str):
         """Processes a single page for detailed data extraction."""
         try:
+            # Read the image as bytes
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            
             response = self.client.generate_content(
-                model='gemini-1.5-flash',
-                contents=[types.Part.from_uri(uri=image_path.as_uri(), mime_type='image/png'), self.extraction_prompt]
+                model='gemini-2.0-flash-exp',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
+                    self.extraction_prompt
+                ]
             )
             response_text = response.text.strip().replace("```json", "").replace("```", "")
             extraction = self.DocumentModel.model_validate_json(response_text)
@@ -247,6 +261,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
         pdf_path = Path(pdf_path)
         doc = fitz.open(str(pdf_path))
         image_dir = self.output_dir / self.config.document_type / pdf_path.stem
+        image_dir.mkdir(parents=True, exist_ok=True)
         
         self.state_manager.reset_document_state()
         indices = self._find_target_pages_with_ai(doc, image_dir, dpi)
