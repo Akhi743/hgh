@@ -263,8 +263,8 @@ Extract healthcare contract data from this Aetna charge master increase notifica
                     image_bytes = f.read()
 
                 # Make the quick classifier API call
-                response = self.client.generate_content(
-                    model='gemini-1.5-flash', # Use a fast model for classification
+                response = self.client.models.generate_content(
+                    model='gemini-1.5-flash',
                     contents=[
                         types.Part.from_bytes(data=image_bytes, mime_type='image/png'),
                         classifier_prompt
