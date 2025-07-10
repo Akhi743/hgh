@@ -34,8 +34,8 @@ class ContractPageExtraction(BaseModel):
 class ContractStateManager:
     def __init__(self):
         self.columns = [
-            "Hospital Name", "Charge Master Limit", "Charge Master Increase", 
-            "Effective Date", "Contract Duration", "Notification Received Date", "Document Source"
+            "Hospital Name", "Charge Master Limit", "Charge Master Increase",
+            "Effective Date", "Contract Duration", "Notification Received Date", "Document Source", "Page Number"
         ]
         self.reset_document_state()
     
@@ -46,6 +46,7 @@ class ContractStateManager:
         self.csv_writer = None
     
     def start_csv(self, output_path: Path):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         self.csv_file = open(output_path, 'w', newline='', encoding='utf-8')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(self.columns)
@@ -59,7 +60,7 @@ class ContractStateManager:
             self.contract_duration = extraction.contract_duration_found
             logger.info(f"Stored contract duration: '{self.contract_duration}'")
     
-    def write_rows(self, extraction: ContractPageExtraction, document_name: str) -> int:
+    def write_rows(self, extraction: ContractPageExtraction, document_name: str, page_num: int) -> int:
         if not self.csv_writer:
             return 0
         
@@ -72,7 +73,8 @@ class ContractStateManager:
                 row.effective_date or "N/A",
                 self.contract_duration,
                 self.notification_received_date,
-                document_name
+                document_name,
+                page_num  # Add page number to CSV row
             ]
             self.csv_writer.writerow(csv_row)
             rows_written += 1
@@ -87,29 +89,6 @@ class ContractStateManager:
             self.csv_file.close()
             self.csv_file = None
             self.csv_writer = None
-
-# ==========================================
-# PDF PROCESSING
-# ==========================================
-
-def pdf_to_images(pdf_path: str, output_dir: str, dpi: int = 200) -> List[Path]:
-    pdf_path = Path(pdf_path)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    image_paths = []
-    
-    doc = fitz.open(str(pdf_path))
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(matrix=mat)
-        
-        output_path = output_dir / f"{pdf_path.stem}_page_{page_num + 1:03d}.png"
-        pix.save(str(output_path))
-        image_paths.append(output_path)
-    
-    doc.close()
-    return image_paths
 
 # ==========================================
 # CONTRACT EXTRACTOR
@@ -148,7 +127,7 @@ Extract healthcare contract data from this Aetna charge master increase notifica
 {json_schema}
 """
     
-    def process_page(self, image_path: Path, page_num: int, document_name: str) -> ContractPageExtraction:
+    def process_page(self, image_path: Path, page_num: int, document_name: str):
         try:
             with open(image_path, 'rb') as f:
                 image_bytes = f.read()
@@ -159,7 +138,7 @@ Extract healthcare contract data from this Aetna charge master increase notifica
             # API call with fallback
             try:
                 response = self.client.models.generate_content(
-                    model='gemini-2.0-flash',
+                    model='gemini-1.5-flash',
                     contents=[
                         types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                         prompt
@@ -185,43 +164,103 @@ Extract healthcare contract data from this Aetna charge master increase notifica
             
             # Update state and write rows
             self.state_manager.update_from_page(extraction)
-            rows_written = self.state_manager.write_rows(extraction, document_name)
+            rows_written = self.state_manager.write_rows(extraction, document_name, page_num)
             
             if rows_written > 0:
-                logger.info(f"Page {page_num}: {rows_written} rows extracted")
+                logger.info(f"Page {page_num}: Successfully extracted {rows_written} rows.")
             
             return extraction
             
         except Exception as e:
-            logger.error(f"Error on page {page_num}: {e}")
-            return ContractPageExtraction()
+            logger.error(f"Error processing page {page_num}: {e}")
+            # Return an empty object on failure so the loop can continue
+            return ContractPageExtraction(contract_rows=[])
     
+    def _find_pages_to_process(self, doc: fitz.Document) -> List[int]:
+        """Scans the document to find pages that match the keyword criteria."""
+        pages_to_process = []
+        i = 0
+        while i < len(doc):
+            page = doc[i]
+            text = page.get_text().lower() # Use lowercase for case-insensitive matching
+            
+            # Check for the trigger keywords
+            is_letter_page = ("network management" in text and
+                              "we have received" in text and
+                              "notifying us" in text)
+            
+            if is_letter_page:
+                page_num = i + 1
+                logger.info(f"✅ Found letter keywords on page {page_num}.")
+                pages_to_process.append(i)
+                
+                # Check for continuation keyword
+                if "sincerely" not in text:
+                    # If there is a next page, add it for processing
+                    if (i + 1) < len(doc):
+                        next_page_num = i + 2
+                        logger.info(f"⚠️ 'Sincerely' not found. Adding continuation page {next_page_num}.")
+                        pages_to_process.append(i + 1)
+                        i += 1 # Skip the next page in the main loop since it's already added
+            i += 1
+            
+        # Return a unique, sorted list of page indices
+        return sorted(list(set(pages_to_process)))
+
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
         pdf_path = Path(pdf_path)
         
-        # Reset state for new PDF
         self.state_manager.reset_document_state()
         
-        # Convert to images
-        image_output_dir = self.output_dir / pdf_path.stem / "images"
-        image_paths = pdf_to_images(str(pdf_path), str(image_output_dir), dpi)
+        doc = fitz.open(str(pdf_path))
         
-        # Setup CSV
+        # 1. Find the specific pages to process based on keywords
+        pages_to_process_indices = self._find_pages_to_process(doc)
+        total_pages_in_pdf = len(doc)
+        
+        if not pages_to_process_indices:
+            logger.warning(f"No pages with the specified keywords were found in '{pdf_path.name}'.")
+            doc.close()
+            return {
+                'pdf_name': pdf_path.name,
+                'total_pages_in_pdf': total_pages_in_pdf,
+                'pages_processed': 0,
+                'total_rows': 0,
+                'csv_path': "N/A"
+            }
+        
+        logger.info(f"Found {len(pages_to_process_indices)} page(s) to process: {[p+1 for p in pages_to_process_indices]}")
+        
+        # 2. Setup CSV
+        image_output_dir = self.output_dir / pdf_path.stem / "images"
+        image_output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = self.output_dir / pdf_path.stem / f"{pdf_path.stem}_contract_data.csv"
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_manager.start_csv(csv_path)
         
-        # Process pages
+        # 3. Process only the identified pages
         total_rows = 0
-        for i, image_path in enumerate(image_paths, 1):
-            extraction = self.process_page(image_path, i, pdf_path.name)
-            total_rows += len(extraction.contract_rows)
+        for page_index in pages_to_process_indices:
+            page_num = page_index + 1
+            page = doc.load_page(page_index)
+            
+            # Convert just this single page to an image
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            image_path = image_output_dir / f"{pdf_path.stem}_page_{page_num:03d}.png"
+            pix.save(str(image_path))
+            
+            # Process the created image
+            extraction = self.process_page(image_path, page_num, pdf_path.name)
+            if extraction:
+                total_rows += len(extraction.contract_rows)
         
         self.state_manager.close_csv()
+        doc.close()
         
         return {
             'pdf_name': pdf_path.name,
-            'total_pages': len(image_paths),
+            'total_pages_in_pdf': total_pages_in_pdf,
+            'pages_processed': len(pages_to_process_indices),
             'total_rows': total_rows,
             'csv_path': str(csv_path)
         }
@@ -260,9 +299,10 @@ if __name__ == "__main__":
         print("HEALTHCARE CONTRACT EXTRACTION RESULTS")
         print("="*60)
         print(f"PDF: {results['pdf_name']}")
-        print(f"Pages processed: {results['total_pages']}")
-        print(f"Total rows: {results['total_rows']}")
-        print(f"CSV output: {results['csv_path']}")
+        print(f"Total Pages in PDF: {results.get('total_pages_in_pdf', 'N/A')}")
+        print(f"Pages Processed: {results.get('pages_processed', 'N/A')}")
+        print(f"Total Rows Extracted: {results.get('total_rows', 'N/A')}")
+        print(f"CSV output: {results.get('csv_path', 'N/A')}")
         print("="*60)
         
     except Exception as e:
