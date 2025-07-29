@@ -1,585 +1,456 @@
-import fitz
-import os
+if __name__ == "__main__":
+    pdf_file_path = "Aultman Hospital.pdf"  # Replace with your PDF path
+    
+    try:
+        # Run the healthcare contract extraction
+        results = run_healthcare_document_extraction(pdf_file_path)
+        
+        print("\n" + "="*70)
+        print("HEALTHCARE CONTRACT EXTRACTION RESULTS")
+        print("="*70)
+        print(f"Document Type: {results.get('document_type', 'N/A')}")
+        print(f"PDF: {results.get('pdf_name', 'N/A')}")
+        print(f"Total Pages in PDF: {results.get('total_pages_in_pdf', 'N/A')}")
+        print(f"Pages Processed: {results.get('pages_processed', 'N/A')}")
+        print(f"Total Rows Extracted: {results.get('total_rows', 'N/A')}")
+        print(f"CSV Output: {results.get('csv_path', 'N/A')}")
+        print("="*70)
+        print("\nKey Features:")
+        print("1.import fitz
 import csv
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
-from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, Type
+from pydantic import BaseModel, Field, create_model, ValidationError
 from google.genai import types
 import google.genai as genai
 
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('hospital_extraction.log'),
+        logging.FileHandler('document_extraction.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-class TableRow(BaseModel):
-    service: str = Field(description="The full service description from the row.")
-    billing_codes: Optional[str] = Field(description="The full, verbatim text of all billing codes in the cell.")
-    rate: Optional[str] = Field(description="The full, verbatim text of the rate, including all conditions.")
-    row_type: Optional[str] = Field(default="complete", description="Type: 'complete', 'service_only', 'codes_only', 'continuation'")
+# ==========================================
+# CONFIGURATION SYSTEM
+# ==========================================
 
-class Section(BaseModel):
-    # Only extract if this is a NEW section header
-    place_of_service_found: Optional[str] = Field(default=None, description="Place of service if NEW section header found on this page.")
-    plan_type_found: Optional[str] = Field(default=None, description="Plan type if found under NEW section header.")
-    
-    # Always extract table rows
-    table_rows: List[TableRow] = Field(description="A list of all table rows extracted from this section.")
+class ExtractionField(BaseModel):
+    """Configuration for a single extraction field."""
+    name: str
+    description: str
+    field_type: str = "Optional[str]"
+    examples: List[str] = Field(default_factory=list)
 
-class PageExtraction(BaseModel):
-    # Only extract if found on this page
-    system_name_found: Optional[str] = Field(default=None, description="System name if found on THIS page only.")
-    effective_date_found: Optional[str] = Field(default=None, description="Effective date if found on THIS page only.")
-    hospital_names_found: Optional[str] = Field(default=None, description="Hospital names if found on THIS page only.")
-    line_of_business_found: Optional[str] = Field(default=None, description="Line of Business if found on THIS page only.")
-    
-    # Always extract sections
-    sections: List[Section] = Field(description="A list of all data sections found on this page.")
+class DocumentTypeConfig(BaseModel):
+    """Configuration for a specific document type, making the extractor generic."""
+    document_type: str
+    description: str
+    document_fields: List[ExtractionField] = Field(default_factory=list)
+    row_fields: List[ExtractionField] = Field(default_factory=list)
+    detection_prompt: str
+    extraction_instructions: str
+    csv_columns: List[str]
 
-def pdf_to_images(pdf_path: str, output_dir: str = None, dpi: int = 200) -> List[Path]:
-    """Convert PDF pages to images"""
-    pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-    
-    if output_dir is None:
-        output_dir = pdf_path.parent / f"{pdf_path.stem}_images"
-    else:
-        output_dir = Path(output_dir)
-    
-    output_dir.mkdir(parents=True, exist_ok=True)
-    image_paths = []
-    
-    try:
-        doc = fitz.open(str(pdf_path))
-        logger.info(f"Converting PDF '{pdf_path.name}' ({len(doc)} pages)")
-        
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            mat = fitz.Matrix(dpi / 72, dpi / 72)
-            pix = page.get_pixmap(matrix=mat)
-            
-            output_path = output_dir / f"{pdf_path.stem}_page_{page_num + 1:03d}.png"
-            pix.save(str(output_path))
-            image_paths.append(output_path)
-            
-        doc.close()
-        logger.info(f"Successfully converted {len(image_paths)} pages")
-        
-    except Exception as e:
-        logger.error(f"Failed to convert PDF '{pdf_path.name}': {e}")
-        raise
-    
-    return image_paths
+HEALTHCARE_CONTRACT_CONFIG = DocumentTypeConfig(
+    document_type="HealthcareContract",
+    description="Aetna healthcare contract for charge master increases.",
+    document_fields=[
+        # Extract notification date from email body text, not letter header
+        ExtractionField(
+            name="notification_received_date", 
+            description="The date mentioned in the sentence 'We have received your email dated [DATE]' in the letter body - NOT the letter header date.", 
+            examples=["December 6, 2024", "11/13/2024"]
+        ),
+        ExtractionField(name="contract_duration", description="The contract term or period.", examples=["12-month period"])
+    ],
+    row_fields=[
+        ExtractionField(name="hospital_name", description="The name of the facility from a table row."),
+        # Capture complete limit information including both Commercial and Medicare rates
+        ExtractionField(
+            name="charge_master_limit", 
+            description="The complete contractual limit information including both Commercial and Medicare rates if present. Format as 'Commercial X%, Medicare Y%' or single percentage if only one rate.",
+            examples=["Commercial 4%, Medicare 3%", "CP 4.5%/ME 3.0%", "4%"]
+        ),
+        ExtractionField(name="charge_master_increase", description="The increase percentage from the same row."),
+        ExtractionField(name="effective_date", description="The effective date from the same row.")
+    ],
+    detection_prompt="""Analyze the image. Is this a formal letter from Aetna about a 'charge master increase' where they state 'we have received' a notification? Answer only YES or NO.""",
+    extraction_instructions="""Extract ALL relevant data from this Aetna charge master increase notification letter. 
 
-class HierarchicalStateManager:
-    """Manages hierarchical context following top-to-bottom, store-and-reuse approach"""
+CRITICAL INSTRUCTIONS:
+1. For 'notification_received_date': Look for the phrase 'We have received your email dated [DATE]' in the letter body paragraphs - DO NOT use the letter header date.
+2. For 'charge_master_limit': Capture the COMPLETE limit information including both Commercial and Medicare rates when present. Examples:
+   - If you see "Commercial 4% and Medicare 3%" → extract as "Commercial 4%, Medicare 3%"
+   - If you see "CP 4.5%/ME 3.0%" → extract as "CP 4.5%/ME 3.0%"
+   - If only one rate is shown → extract that single rate
+3. Create one row for each facility mentioned, ensuring no fields are left empty when information is available.""",
+    csv_columns=[
+        "hospital_name", "charge_master_limit", "charge_master_increase", "effective_date", # Row Fields
+        "notification_received_date", "contract_duration", # Document Fields
+        "document_source", "page_number" # Metadata
+    ]
+)
+
+# ==========================================
+# DYNAMIC COMPONENT FACTORY
+# ==========================================
+
+def create_dynamic_models(config: DocumentTypeConfig) -> (Type[BaseModel], Type[BaseModel]):
+    """Dynamically creates Pydantic models for row and document data based on the config."""
     
-    def __init__(self):
-        self.columns = [
-            "System name", "Effective date", "Hospital Name/Names", 
-            "Line of Business", "Place of service", "Plan type", 
-            "Service", "Billing codes", "Rate"
-        ]
+    # Create the RowModel
+    row_model_fields = {
+        field.name: (Optional[str], Field(None, description=field.description))
+        for field in config.row_fields
+    }
+    RowModel = create_model(f"{config.document_type}Row", **row_model_fields)
+
+    # Create the DocumentExtractionModel
+    doc_model_fields = {
+        field.name: (Optional[str], Field(None, description=field.description))
+        for field in config.document_fields
+    }
+    doc_model_fields['rows'] = (List[RowModel], Field(default_factory=list, description="All extracted table rows."))
+    DocumentModel = create_model(f"{config.document_type}Extraction", **doc_model_fields)
+    
+    logger.info(f"Dynamically created Pydantic models for document type: {config.document_type}")
+    return RowModel, DocumentModel
+
+# ==========================================
+# DYNAMIC STATE MANAGER
+# ==========================================
+
+class StateManager:
+    """A generic state manager driven by the document configuration."""
+    def __init__(self, config: DocumentTypeConfig):
+        self.config = config
+        self.columns = config.csv_columns
+        self._csv_file = None
+        self._csv_writer = None
         self.reset_document_state()
-    
-    def reset_document_state(self):
-        """Reset state for new document"""
-        # Document-level (stored once for entire PDF)
-        self.system_name = "N/A"
-        self.effective_date = "N/A"
-        
-        # Header-level (sticky until new header)
-        self.current_hospitals = "N/A"
-        self.current_lob = "N/A"
-        
-        # Sub-header-level (sticky until new sub-header)
-        self.current_place_of_service = "N/A"
-        self.current_plan_type = "N/A"
-        
-        # CSV management
-        self.csv_file = None
-        self.csv_writer = None
-        self.csv_path = None
-        
-        logger.info("Reset document state")
-    
-    def start_csv(self, output_path: Path):
-        """Start new CSV file"""
-        self.csv_path = output_path
-        self.csv_file = open(self.csv_path, 'w', newline='', encoding='utf-8')
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(self.columns)
-        logger.info(f"Started CSV: {self.csv_path}")
-    
-    def update_from_page(self, extraction: PageExtraction):
-        """Update state from page extraction - hierarchical store and reuse"""
-        
-        # 1. Document-level: Store once for entire PDF
-        if extraction.system_name_found:
-            if self.system_name == "N/A" or len(extraction.system_name_found) > len(self.system_name):
-                self.system_name = extraction.system_name_found
-                logger.info(f"Stored system name: '{self.system_name}'")
-            
-        if extraction.effective_date_found:
-            if self.effective_date == "N/A":
-                self.effective_date = extraction.effective_date_found
-                logger.info(f"Stored effective date: '{self.effective_date}'")
-        
-        # 2. Header-level: Update when new header appears  
-        if extraction.hospital_names_found:
-            # ALWAYS update hospital names when found - this indicates a NEW section
-            old_hospitals = self.current_hospitals
-            self.current_hospitals = extraction.hospital_names_found
-            # RESET place of service AND plan type when new hospital section starts
-            self.current_place_of_service = "N/A"
-            self.current_plan_type = "N/A"
-            logger.info(f"NEW HEADER DETECTED - Changed hospital names from '{old_hospitals}' to '{self.current_hospitals}' - Reset place of service and plan type to N/A")
-            
-        if extraction.line_of_business_found:
-            # ALWAYS update LOB when found - this indicates a NEW section
-            old_lob = self.current_lob
-            self.current_lob = extraction.line_of_business_found
-            # RESET place of service AND plan type when new LOB section starts
-            self.current_place_of_service = "N/A"
-            self.current_plan_type = "N/A"
-            logger.info(f"NEW HEADER DETECTED - Changed LOB from '{old_lob}' to '{self.current_lob}' - Reset place of service and plan type to N/A")
-        
-        # 3. Sub-header-level: Update when new section appears
-        for section in extraction.sections:
-            if section.place_of_service_found:
-                # Validate it's a real section header, not a column name
-                valid_sections = ["INPATIENT RATES", "OUTPATIENT RATES", "INPATIENT CARVE OUT RATES", "OUTPATIENT CARVE OUT RATES"]
-                if any(valid in section.place_of_service_found.upper() for valid in valid_sections):
-                    old_pos = self.current_place_of_service
-                    self.current_place_of_service = section.place_of_service_found
-                    # RESET plan type when new place of service starts
-                    self.current_plan_type = "N/A"
-                    logger.info(f"NEW SECTION DETECTED - Changed place of service from '{old_pos}' to '{self.current_place_of_service}' - Reset plan type to N/A")
-                else:
-                    logger.warning(f"INVALID place_of_service ignored: '{section.place_of_service_found}' (not a valid section header)")
-                
-            if section.plan_type_found:
-                old_plan = self.current_plan_type
-                self.current_plan_type = section.plan_type_found
-                logger.info(f"NEW SECTION - Changed plan type from '{old_plan}' to '{self.current_plan_type}'")
-    
-    def write_rows(self, extraction: PageExtraction) -> int:
-        """Write extracted rows processing each section individually with enhanced continuation handling"""
-        if not self.csv_writer:
-            return 0
-        
-        rows_written = 0
-        
-        # Process each section separately
-        for section_num, section in enumerate(extraction.sections, 1):
-            logger.info(f"Processing section {section_num} on this page")
-            
-            # Update place of service for this section
-            section_place_of_service = self.current_place_of_service  # Default to current
-            section_plan_type = self.current_plan_type  # Default to current
-            
-            # Check if this section has new place of service
-            if section.place_of_service_found:
-                valid_sections = ["INPATIENT RATES", "OUTPATIENT RATES", "INPATIENT CARVE OUT RATES", "OUTPATIENT CARVE OUT RATES"]
-                if any(valid in section.place_of_service_found.upper() for valid in valid_sections):
-                    # Update the state for this and subsequent sections
-                    old_pos = self.current_place_of_service
-                    self.current_place_of_service = section.place_of_service_found
-                    section_place_of_service = self.current_place_of_service
-                    # RESET plan type when new place of service detected
-                    self.current_plan_type = "N/A"
-                    section_plan_type = "N/A"
-                    logger.info(f"Section {section_num}: Changed place of service from '{old_pos}' to '{self.current_place_of_service}' - Reset plan type to N/A")
-                else:
-                    logger.warning(f"Section {section_num}: Invalid place_of_service ignored: '{section.place_of_service_found}'")
-            
-            # Check if this section has new plan type
-            if section.plan_type_found:
-                old_plan = self.current_plan_type
-                self.current_plan_type = section.plan_type_found
-                section_plan_type = self.current_plan_type
-                logger.info(f"Section {section_num}: Changed plan type from '{old_plan}' to '{self.current_plan_type}'")
-            
-            # Enhanced row processing with continuation handling
-            section_rows = 0
-            current_service = ""
-            accumulated_codes = ""
-            current_rate = ""
-            
-            for row in section.table_rows:
-                # Determine if this is a continuation row or new service
-                if row.service and row.service.strip():
-                    # This is a new service - write previous accumulated data if exists
-                    if current_service and (accumulated_codes or current_rate):
-                        csv_row = [
-                            self.system_name,
-                            self.effective_date,
-                            self.current_hospitals,
-                            self.current_lob,
-                            section_place_of_service,
-                            section_plan_type,
-                            current_service,
-                            accumulated_codes.strip(),
-                            current_rate.strip()
-                        ]
-                        self.csv_writer.writerow(csv_row)
-                        section_rows += 1
-                        rows_written += 1
-                    
-                    # Start new service
-                    current_service = row.service
-                    accumulated_codes = row.billing_codes or ""
-                    current_rate = row.rate or ""
-                    
-                else:
-                    # This is a continuation row - accumulate codes/rates
-                    if row.billing_codes and row.billing_codes.strip():
-                        if accumulated_codes:
-                            accumulated_codes += " " + row.billing_codes.strip()
-                        else:
-                            accumulated_codes = row.billing_codes.strip()
-                    
-                    if row.rate and row.rate.strip():
-                        if current_rate:
-                            current_rate += " " + row.rate.strip()
-                        else:
-                            current_rate = row.rate.strip()
-            
-            # Write the last accumulated service
-            if current_service and (accumulated_codes or current_rate):
-                csv_row = [
-                    self.system_name,
-                    self.effective_date,
-                    self.current_hospitals,
-                    self.current_lob,
-                    section_place_of_service,
-                    section_plan_type,
-                    current_service,
-                    accumulated_codes.strip(),
-                    current_rate.strip()
-                ]
-                self.csv_writer.writerow(csv_row)
-                section_rows += 1
-                rows_written += 1
-            
-            logger.info(f"Section {section_num}: Wrote {section_rows} rows with place_of_service='{section_place_of_service}'")
-        
-        if self.csv_file:
-            self.csv_file.flush()
-        
-        logger.info(f"Total rows written from this page: {rows_written}")
-        return rows_written
-    
-    def get_current_state(self):
-        """Get current state for debugging"""
-        return {
-            'system_name': self.system_name,
-            'effective_date': self.effective_date,
-            'hospitals': self.current_hospitals,
-            'lob': self.current_lob,
-            'place_of_service': self.current_place_of_service,
-            'plan_type': self.current_plan_type
-        }
-    
-    def close_csv(self):
-        """Close CSV file"""
-        if self.csv_file:
-            self.csv_file.close()
-            self.csv_file = None
-            self.csv_writer = None
 
-class PDFExtractor:
-    """PDF extractor using hierarchical store-and-reuse approach"""
-    
-    def __init__(self, client, output_dir: str = "extraction_output"):
+    def reset_document_state(self):
+        """Resets document-level fields to None based on the config."""
+        self.doc_state = {field.name: None for field in self.config.document_fields}
+        logger.info(f"State manager reset for new document. Tracking fields: {list(self.doc_state.keys())}")
+
+    def start_csv(self, output_path: Path):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._csv_file = open(output_path, 'w', newline='', encoding='utf-8')
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow(self.columns)
+
+    def update_from_page(self, extraction_data: BaseModel):
+        """Dynamically updates the state from a page's extraction results."""
+        for field_name in self.doc_state.keys():
+            if self.doc_state[field_name] is None:
+                extracted_value = getattr(extraction_data, field_name, None)
+                if extracted_value:
+                    self.doc_state[field_name] = extracted_value
+                    logger.info(f"Stored document-level field '{field_name}': '{extracted_value}'")
+
+    def write_rows(self, extraction_data: BaseModel, document_name: str, page_num: int) -> int:
+        """Dynamically writes rows to the CSV, enriching them with document-level state."""
+        rows_written = 0
+        for row_data in extraction_data.rows:
+            csv_row = {}
+            # Add row-level data
+            for field in self.config.row_fields:
+                csv_row[field.name] = getattr(row_data, field.name, "N/A")
+            # Add document-level data from state
+            for field in self.config.document_fields:
+                csv_row[field.name] = self.doc_state.get(field.name, "N/A")
+            # Add metadata
+            csv_row["document_source"] = document_name
+            csv_row["page_number"] = page_num
+            
+            # Write in the order specified by config
+            self._csv_writer.writerow([csv_row.get(col, "N/A") for col in self.columns])
+            rows_written += 1
+        
+        if self._csv_file:
+            self._csv_file.flush()
+        return rows_written
+
+    def close_csv(self):
+        if self._csv_file:
+            self._csv_file.close()
+
+# Enhanced Document Extractor for Healthcare Contracts
+class HealthcareDocumentExtractor:
+    def __init__(self, client, config: DocumentTypeConfig, output_dir: str = "document_extraction"):
         self.client = client
+        self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.state_manager = HierarchicalStateManager()
-    
-    def get_extraction_prompt(self) -> str:
-        """Generate extraction prompt"""
-        json_schema = json.dumps(PageExtraction.model_json_schema(), indent=2)
+        
+        # Create components from config
+        self.RowModel, self.DocumentModel = create_dynamic_models(config)
+        self.state_manager = StateManager(config)
+        self.extraction_prompt = self._build_extraction_prompt()
+
+    def _build_extraction_prompt(self) -> str:
+        """Builds extraction prompt with specific instructions for healthcare contracts."""
+        doc_fields_str = "\n".join(
+            f"- **{f.name}**: {f.description} (e.g., '{', '.join(f.examples)}')" for f in self.config.document_fields
+        )
+        row_fields_str = "\n".join(
+            f"- **{f.name}**: {f.description} (e.g., '{', '.join(f.examples)}')" for f in self.config.row_fields
+        )
+        json_schema = json.dumps(self.DocumentModel.model_json_schema(), indent=2)
         
         return f"""
-You are an automated data extraction expert specializing in hospital rate schedules. Your task is to analyze the header of the provided document image and extract the following four key pieces of information.
+You are an expert data extraction AI. {self.config.extraction_instructions}
 
-**1. system_name_found**
-* **What it is:** The name of the parent health system or corporation.
-* **Where to look:** Typically found in the top-right corner of the page.
-* **Examples:** "Advocate Health And Hospital Corporation", "Mercy Health (Ohio)", "Memorial Health System", "Henry Ford Health System".
+### EXTRACTION SCHEMA
+Follow this JSON schema precisely. Use `null` for any missing values.
 
-**2. hospital_names_found**
-* **What it is:** The specific name(s) of the hospital(s) covered by the rate schedule. This can be a single hospital or a list of several.
-* **Where to look:** Usually located in the center of the header, often in a large font.
-* **CRITICAL RULE:** If you see a Taxpayer Identification Number (TIN) next to a name, **extract the name only** and discard the TIN.
-* **IMPORTANT:** Continue scanning the ENTIRE document for hospital names - there may be multiple hospitals on different pages or sections.
-* **Examples:**
-   * "Mercy Health Youngstown Hospital"
-   * "Mercy Tiffin Hospital" 
-   * "Cleveland Clinic Foundation"
-   * "Henry Ford Home Infusion"
-   * "Marietta Memorial and Selby General Hospital" *(extracted from "Marietta Memorial TIN 314379509 and Selby General Hospital TIN 314413259")*
+#### Document-Level Fields:
+{doc_fields_str}
 
-**3. line_of_business_found**
-* **What it is:** The type of insurance plan or rate agreement. This is the most important field for categorizing the document.
-* **Where to look:** Look DIRECTLY under or near the hospital name in the center header area, NOT in corners or other locations.
-* **CRITICAL RULE:** Extract the EXACT text that appears near the hospital name. Do NOT substitute or assume - extract exactly what is written.
-* **CRITICAL RULE:** Do NOT extract generic titles like "HOSPITAL SERVICE AND RATE SCHEDULE" or "RATE ADDENDA A-1". The Line of Business specifies the plan type.
-* **Examples of what TO extract:**
-   * "COMMERCIAL GATEKEEPER AND NON-GATEKEEPER PRODUCTS"
-   * "Qualified Health Plan Rates"
-   * "COMMERCIAL RATE SCHEDULE"
-   * "Commercial"
-   * "New Business"
-   * "Medicare"
-   * "Medicaid"
-* **Examples of what NOT to extract:**
-   * "Hospital Service and Rate Schedule" (this is a document title, not LOB)
-   * "Rate Schedule" (generic title)
+#### Row-Level Fields (extract one object for each table row):
+{row_fields_str}
 
-**4. effective_date_found**
-* **What it is:** The date when the rates become effective.
-* **Where to look:** Look for the label "Effective Date:". It is almost always in the top-right corner.
-* **Examples:** "01/01/2025", "09/01/2024", "06/01/2025", "07/01/2025".
+### CRITICAL REMINDERS:
+1. **notification_received_date**: Look for "We have received your email dated [DATE]" in the letter body - ignore header dates
+2. **charge_master_limit**: Capture complete limit info including both Commercial and Medicare rates when present
+3. **No empty fields**: If information exists in the document, extract it completely
 
-**5. Place of Service Sections**
-For each section, look for:
-- place_of_service_found: NEW section titles like:
-  * "INPATIENT RATES"
-  * "OUTPATIENT RATES"
-  * "INPATIENT CARVE OUT RATES"
-  * "OUTPATIENT CARVE OUT RATES"
-  Extract only if this is a NEW section header.
-- plan_type_found: Bold text/headers immediately above tables that are NOT place of service headers.
-  * Look for bold text like: "For Gatekeeper and Non-Gatekeeper products:", "For Government Programs products:", "PPO Members:", "HMO Products:", etc.
-  * CRITICAL RULE: Only extract if it's NOT one of these place of service headers: "INPATIENT RATES", "OUTPATIENT RATES", "INPATIENT CARVE OUT RATES", "OUTPATIENT CARVE OUT RATES"
-  * Extract any bold header above a table that describes plan types, product categories, or member types
-
-**6. Table Data Extraction**
-- table_rows: Extract EVERY SINGLE ROW from any content organized into clear columns and rows, even if visual borders or lines are faint or missing. Look for repeating row structures under headers like "Service", "Billing Codes", and "Rates".
-  * CRITICAL: DO NOT SKIP ANY ROWS - Extract every row you can see in the table
-  * CRITICAL: For continuation pages, extract ALL continuation rows even if they only contain codes or partial information
-  * Handle different row types:
-    - Complete rows: service + billing_codes + rate
-    - Service-only rows: just service name (billing_codes="", rate="")
-    - Code continuation rows: billing codes continuing from previous service (service="", billing_codes="continuation codes", rate="")
-    - Rate-only rows: just rate info (service="", billing_codes="", rate="rate info")
-  * For each valid table row extract:
-    * service: Full service description (use "" if this row only contains continuation codes)
-    * billing_codes: Complete billing codes (use "" if empty, not null) - INCLUDE ALL CODE CONTINUATIONS
-    * rate: Complete rate text (use "" if empty, not null)
-  * IMPORTANT: When codes span multiple lines or continue to next rows, capture ALL of them
-  * IMPORTANT: Maintain proper service-to-code relationships - codes that appear after a service belong to that service
-
-**EXTRACTION RULES:**
-- Only extract fields that are visible on THIS page
-- Use null for fields not found on current page
-- Remove TIN numbers but keep hospital names
-- For empty table cells, use empty string "" as the value, not null
-- Preserve ALL text in table rows exactly as written
-- Extract complete facility names and business line descriptions
-- SCAN ENTIRE PAGE: Don't stop after finding the first hospital - continue scanning for additional hospitals
-- EXTRACT ALL HOSPITALS: If multiple hospitals appear on the same page, extract all of them
-- LOB LOCATION: Extract line_of_business_found from the SAME header area as hospital_names_found, NOT from other locations
-- EXACT TEXT: Extract line of business exactly as written - do not substitute or assume different terms
-
-**JSON Schema:**
+### JSON OUTPUT SCHEMA:
 {json_schema}
 """
-    
-    def process_page(self, image_path: Path, page_num: int) -> Tuple[int, bool]:
-        """Process single page with systematic methodology and debugging"""
-        logger.info(f"=== PROCESSING PAGE {page_num}: {image_path.name} ===")
+
+    def _find_target_pages_with_ai(self, doc: fitz.Document, image_dir: Path, dpi: int) -> List[int]:
+        """Uses AI to classify each page and identify relevant healthcare contract pages."""
+        logger.info("Starting AI-powered page classification...")
+        pages_to_process = []
+        created_images = []
         
-        # Show current state before processing
-        current_state = self.state_manager.get_current_state()
-        logger.info(f"Current state before processing: {current_state}")
-        
+        i = 0
+        while i < len(doc):
+            page_num = i + 1
+            try:
+                page = doc.load_page(i)
+                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                pix = page.get_pixmap(matrix=mat)
+                
+                pdf_name = Path(doc.name).stem if doc.name else "document"
+                image_path = image_dir / f"{pdf_name}_page_{page_num:03d}.png"
+                pix.save(str(image_path))
+                created_images.append(image_path)
+                
+                logger.info(f"Created image: {image_path}")
+
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+                
+                response = self.client.models.generate_content(
+                    model='gemini-1.5-flash',
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
+                        self.config.detection_prompt
+                    ]
+                )
+                answer = response.text.strip().upper()
+                
+                if 'YES' in answer:
+                    logger.info(f"AI classified page {page_num} as '{self.config.document_type}'.")
+                    pages_to_process.append(i)
+                    
+                    # Check if this page contains letter ending indicators
+                    page_text = page.get_text().lower()
+                    has_letter_ending = any(ending in page_text for ending in ["sincerely", "enclosure"])
+                    
+                    if not has_letter_ending and (i + 1) < len(doc):
+                        # Verify next page is also a healthcare contract before adding
+                        next_page = doc.load_page(i + 1)
+                        next_mat = fitz.Matrix(dpi / 72, dpi / 72)
+                        next_pix = next_page.get_pixmap(matrix=next_mat)
+                        next_image_path = image_dir / f"{pdf_name}_page_{i + 2:03d}.png"
+                        next_pix.save(str(next_image_path))
+                        
+                        with open(next_image_path, 'rb') as f:
+                            next_image_bytes = f.read()
+                        
+                        next_response = self.client.models.generate_content(
+                            model='gemini-1.5-flash',
+                            contents=[
+                                types.Part.from_bytes(data=next_image_bytes, mime_type='image/png'), 
+                                self.config.detection_prompt
+                            ]
+                        )
+                        next_answer = next_response.text.strip().upper()
+                        
+                        if 'YES' in next_answer:
+                            logger.info(f"Continuation confirmed: Adding page {i + 2}")
+                            pages_to_process.append(i + 1)
+                            i += 1
+                        else:
+                            logger.info(f"Page {i + 2} is not a healthcare contract. Stopping continuation.")
+                    else:
+                        if has_letter_ending:
+                            logger.info(f"Letter ending detected on page {page_num}. No continuation needed.")
+                        else:
+                            logger.info(f"Last page of document. No continuation possible.")
+                else:
+                    logger.info(f"AI classified page {page_num} as NOT '{self.config.document_type}'.")
+                    
+            except Exception as e:
+                logger.error(f"Could not classify page {page_num}: {e}")
+            i += 1
+            
+        logger.info(f"Created {len(created_images)} image files, identified {len(pages_to_process)} target pages")
+        return sorted(list(set(pages_to_process)))
+
+    def process_page(self, image_path: Path, page_num: int, document_name: str):
+        """Processes a single page for data extraction with validation."""
         try:
+            if not image_path.exists():
+                logger.error(f"Image file not found: {image_path}")
+                return None
+                
             with open(image_path, 'rb') as f:
                 image_bytes = f.read()
             
-            mime_type = 'image/png' if image_path.suffix.lower() == '.png' else 'image/jpeg'
-            prompt = self.get_extraction_prompt()
+            logger.info(f"Processing page {page_num} for data extraction...")
             
-            logger.info("Sending extraction request to AI...")
+            response = self.client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
+                    self.extraction_prompt
+                ]
+            )
+            response_text = response.text.strip().replace("```json", "").replace("```", "")
             
-            # API call with fallback
-            try:
-                response = self.client.models.generate_content(
-                    model='gemini-2.0-flash',
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                        prompt
-                    ]
-                )
-            except (AttributeError, TypeError):
-                response = self.client.generate_content(
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                        prompt
-                    ]
-                )
+            logger.info(f"Raw AI response for page {page_num} (first 300 chars): {response_text[:300]}...")
             
-            logger.info("Received response from AI, parsing...")
+            extraction = self.DocumentModel.model_validate_json(response_text)
             
-            # Clean response
-            response_text = response.text.strip()
-            if response_text.startswith('```json'):
-                response_text = response_text.split('```json')[1]
-            if response_text.endswith('```'):
-                response_text = response_text.rsplit('```', 1)[0]
-            response_text = response_text.strip()
+            # Log extraction results for debugging
+            logger.info(f"Extracted from page {page_num}:")
+            logger.info(f"  notification_received_date: {getattr(extraction, 'notification_received_date', 'None')}")
+            logger.info(f"  Number of rows: {len(extraction.rows)}")
+            for i, row in enumerate(extraction.rows):
+                logger.info(f"  Row {i+1} - charge_master_limit: {getattr(row, 'charge_master_limit', 'None')}")
             
-            # Debug: Log raw response
-            logger.info(f"Cleaned AI response: {response_text[:500]}...")
-            
-            # Parse and validate
-            extraction = PageExtraction.model_validate_json(response_text)
-            
-            # Debug: Log what was extracted
-            logger.info(f"Extracted fields:")
-            logger.info(f"  - system_name_found: {extraction.system_name_found}")
-            logger.info(f"  - effective_date_found: {extraction.effective_date_found}")
-            logger.info(f"  - hospital_names_found: {extraction.hospital_names_found}")
-            logger.info(f"  - line_of_business_found: {extraction.line_of_business_found}")
-            logger.info(f"  - sections found: {len(extraction.sections)}")
-            
-            # Update hierarchical state
             self.state_manager.update_from_page(extraction)
+            rows_written = self.state_manager.write_rows(extraction, document_name, page_num)
+            logger.info(f"Successfully wrote {rows_written} rows for page {page_num}")
             
-            # Write rows using stored context
-            rows_written = self.state_manager.write_rows(extraction)
-            
-            # Show updated state after processing
-            updated_state = self.state_manager.get_current_state()
-            logger.info(f"Updated state after processing: {updated_state}")
-            logger.info(f"Page {page_num}: {rows_written} rows extracted")
-            
-            # Validation checks
-            if extraction.hospital_names_found:
-                logger.info(f"SUCCESS: Hospital name extracted on page {page_num}")
-            else:
-                logger.warning(f"WARNING: No hospital name extracted on page {page_num}")
-                
-            if extraction.sections:
-                logger.info(f"SUCCESS: {len(extraction.sections)} sections found on page {page_num}")
-            else:
-                logger.warning(f"WARNING: No sections found on page {page_num}")
-            
-            return rows_written, True
-            
+            return extraction
+        except (ValidationError, json.JSONDecodeError) as e:
+            logger.error(f"Pydantic/JSON validation failed on page {page_num}: {e}")
+            logger.error(f"Raw response was: {response_text}")
         except Exception as e:
-            logger.error(f"CRITICAL ERROR on page {page_num}: {e}")
-            logger.error(f"Exception type: {type(e).__name__}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            return 0, False
-    
+            logger.error(f"Extraction failed on page {page_num}: {e}")
+        return None
+
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
-        """Extract data from single PDF using store-and-reuse approach"""
+        """Main orchestration method for PDF extraction with proper error handling."""
         pdf_path = Path(pdf_path)
-        logger.info(f"Starting hierarchical extraction: {pdf_path.name}")
+        doc = None
         
         try:
-            # Reset state for new PDF
+            logger.info(f"Starting extraction for: {pdf_path.name}")
+            doc = fitz.open(str(pdf_path))
+            
+            image_dir = self.output_dir / self.config.document_type / pdf_path.stem
+            image_dir.mkdir(parents=True, exist_ok=True)
+            
             self.state_manager.reset_document_state()
+            indices = self._find_target_pages_with_ai(doc, image_dir, dpi)
             
-            # Convert to images
-            image_output_dir = self.output_dir / pdf_path.stem / "images"
-            image_paths = pdf_to_images(str(pdf_path), str(image_output_dir), dpi)
-            
-            # Setup CSV
-            csv_path = self.output_dir / pdf_path.stem / f"{pdf_path.stem}_extracted.csv"
-            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            if not indices:
+                logger.warning(f"No '{self.config.document_type}' pages found in '{pdf_path.name}'.")
+                return {'total_pages_in_pdf': len(doc), 'pages_processed': 0, 'total_rows': 0}
+
+            csv_path = image_dir / f"{pdf_path.stem}_data.csv"
             self.state_manager.start_csv(csv_path)
             
-            # Process pages sequentially (top to bottom)
             total_rows = 0
-            successful_pages = 0
+            for i in indices:
+                pdf_name = pdf_path.stem
+                image_path = image_dir / f"{pdf_name}_page_{i + 1:03d}.png"
+                
+                logger.info(f"Processing page {i + 1}, looking for image: {image_path}")
+                extraction = self.process_page(image_path, i + 1, pdf_path.name)
+                if extraction:
+                    total_rows += len(extraction.rows)
             
-            logger.info("Processing pages sequentially (top to bottom)...")
+            self.state_manager.close_csv()
             
-            for i, image_path in enumerate(image_paths, 1):
-                logger.info(f"\n--- PAGE {i} ---")
-                rows, success = self.process_page(image_path, i)
-                total_rows += rows
-                if success:
-                    successful_pages += 1
-            
-            # Final state
-            final_state = self.state_manager.get_current_state()
-            
-            results = {
+            result = {
                 'pdf_name': pdf_path.name,
-                'total_pages': len(image_paths),
-                'successful_pages': successful_pages,
+                'document_type': self.config.document_type,
+                'total_pages_in_pdf': len(doc),
+                'pages_processed': len(indices),
                 'total_rows': total_rows,
-                'csv_path': str(csv_path),
-                'final_state': final_state,
-                'success_rate': f"{successful_pages}/{len(image_paths)}"
+                'csv_path': str(csv_path)
             }
             
-            logger.info(f"\nExtraction complete: {pdf_path.name}")
-            logger.info(f"Final state: {final_state}")
-            logger.info(f"Pages: {successful_pages}/{len(image_paths)} successful")
-            logger.info(f"Total rows: {total_rows}")
-            logger.info(f"CSV saved: {csv_path}")
-            
-            return results
+            logger.info(f"Extraction completed successfully for {pdf_path.name}")
+            return result
             
         except Exception as e:
-            logger.error(f"Failed to extract {pdf_path.name}: {e}")
-            raise
-            
+            logger.error(f"Critical error during PDF extraction: {e}")
+            return {'error': str(e), 'pdf_name': pdf_path.name}
         finally:
-            self.state_manager.close_csv()
+            # Ensure document is properly closed
+            if doc:
+                try:
+                    doc.close()
+                    logger.info(f"Document {pdf_path.name} closed successfully")
+                except Exception as e:
+                    logger.error(f"Error closing document: {e}")
+
+# ==========================================
+# CLIENT SETUP & MAIN FUNCTION
+# ==========================================
 
 def create_client():
-    """Create client with your setup"""
-    try:
-        client = genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
-        logger.info("Created Vertex AI client")
-        return client
-    except Exception as e:
-        logger.error(f"Failed to create client: {e}")
-        raise
+    return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+
+def run_healthcare_document_extraction(pdf_path: str, output_dir: str = "healthcare_extraction_output") -> Dict:
+    """Run healthcare contract extraction with optimized page classification."""
+    client = create_client()
+    extractor = HealthcareDocumentExtractor(client=client, config=HEALTHCARE_CONTRACT_CONFIG, output_dir=output_dir)
+    return extractor.extract_from_pdf(pdf_path)
+
+# ==========================================
+# USAGE
+# ==========================================
 
 if __name__ == "__main__":
-    # Test single PDF with hierarchical approach
-    pdf_file = r"path/to/your/test.pdf"  # Change this to your test PDF
+    pdf_file_path = "Aultman Hospital.pdf"  # Replace with your PDF path
     
     try:
-        # Create client
-        client = create_client()
+        # Run the healthcare contract extraction
+        results = run_healthcare_document_extraction(pdf_file_path)
         
-        # Create extractor
-        extractor = PDFExtractor(client=client, output_dir="hierarchical_extraction")
-        
-        # Extract using store-and-reuse approach
-        results = extractor.extract_from_pdf(pdf_file, dpi=200)
-        
-        # Print results
-        print("\n" + "="*60)
-        print("HIERARCHICAL EXTRACTION RESULTS")
-        print("="*60)
-        print(f"PDF: {results['pdf_name']}")
-        print(f"Pages processed: {results['success_rate']}")
-        print(f"Total rows: {results['total_rows']}")
-        print(f"Final state: {results['final_state']}")
-        print(f"CSV output: {results['csv_path']}")
-        print("="*60)
+        print("\n" + "="*70)
+        print("HEALTHCARE CONTRACT EXTRACTION RESULTS")
+        print("="*70)
+        print(f"Document Type: {results.get('document_type', 'N/A')}")
+        print(f"PDF: {results.get('pdf_name', 'N/A')}")
+        print(f"Total Pages in PDF: {results.get('total_pages_in_pdf', 'N/A')}")
+        print(f"Pages Processed: {results.get('pages_processed', 'N/A')}")
+        print(f"Total Rows Extracted: {results.get('total_rows', 'N/A')}")
+        print(f"CSV Output: {results.get('csv_path', 'N/A')}")
+        print("="*70)
+        print("\nKey Features:")
+        print("1. Extracts notification date from email body text (not header)")
+        print("2. Captures complete Commercial + Medicare limit information")
+        print("3. Smart page classification to avoid processing irrelevant pages")
+        print("4. Letter ending detection using 'sincerely' or 'enclosure'")
         
     except Exception as e:
-        logger.critical(f"Extraction failed: {e}")
+        logger.critical(f"A critical error occurred in the main execution block: {e}")
         print(f"Error: {e}")
-        print("Check hospital_extraction.log for details")
