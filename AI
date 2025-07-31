@@ -496,7 +496,7 @@ def create_client():
     return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
 
 def run_healthcare_document_extraction(pdf_path: str, output_dir: str = "healthcare_extraction_output") -> Dict:
-    """Run healthcare contract extraction with optimized page classification."""
+    """Run healthcare contract extraction with sequential processing."""
     client = create_client()
     extractor = HealthcareDocumentExtractor(client=client, config=HEALTHCARE_CONTRACT_CONFIG, output_dir=output_dir)
     return extractor.extract_from_pdf(pdf_path)
