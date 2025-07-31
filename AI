@@ -152,12 +152,17 @@ class StateManager:
 
     def collect_page_data(self, extraction_data: BaseModel, document_name: str, page_num: int):
         """First pass: Collect all data from pages without writing to CSV yet."""
-        # Update document-level fields (any page can contribute)
+        # Update document-level fields (any page can contribute to current letter)
         for field_name in self.doc_state.keys():
             extracted_value = getattr(extraction_data, field_name, None)
-            if extracted_value and self.doc_state[field_name] is None:
-                self.doc_state[field_name] = extracted_value
-                logger.info(f"Collected document-level field '{field_name}': '{extracted_value}' from page {page_num}")
+            if extracted_value:
+                if self.doc_state[field_name] is None:
+                    # First time finding this field for current letter
+                    self.doc_state[field_name] = extracted_value
+                    logger.info(f"Collected document-level field '{field_name}': '{extracted_value}' from page {page_num}")
+                else:
+                    # Field already exists for current letter - keep first occurrence
+                    logger.info(f"Field '{field_name}' already set to '{self.doc_state[field_name]}' - keeping existing value")
 
         # Collect all rows from this page
         for row_data in extraction_data.rows:
@@ -173,7 +178,9 @@ class StateManager:
             
         logger.info(f"Collected {len(extraction_data.rows)} rows from page {page_num}. Total rows so far: {len(self.temp_rows)}")
 
-    def write_all_collected_data(self) -> int:
+    def get_current_letter_state(self) -> Dict:
+        """Returns the current letter's document-level state for debugging."""
+        return {field_name: value for field_name, value in self.doc_state.items() if value is not None}
         """Second pass: Write all collected rows with complete document-level information."""
         total_rows_written = 0
         
@@ -462,28 +469,36 @@ Follow this JSON schema precisely. Use `null` for any missing values.
             total_rows_all_letters = 0
             
             for letter_id, page_indices in letter_groups.items():
-                logger.info(f"Processing Letter {letter_id} with {len(page_indices)} pages...")
+                logger.info(f"=" * 50)
+                logger.info(f"PROCESSING LETTER {letter_id}")
+                logger.info(f"=" * 50)
+                logger.info(f"Letter {letter_id} pages: {[p + 1 for p in page_indices]}")
                 
-                # Reset state for each letter
+                # CRITICAL: Reset state completely for each letter
                 self.state_manager.reset_document_state()
+                logger.info(f"State reset for Letter {letter_id}. Fresh document-level fields initialized.")
                 
                 # Create separate CSV for each letter
                 csv_path = image_dir / f"{pdf_path.stem}_letter_{letter_id}_data.csv"
                 self.state_manager.start_csv(csv_path)
                 
-                # PASS 1: Collect all data from pages of this specific letter
+                # PASS 1: Collect all data from pages of this specific letter ONLY
                 logger.info(f"PASS 1 - Letter {letter_id}: Collecting data from {len(page_indices)} pages...")
                 successful_extractions = 0
                 for page_index in page_indices:
                     pdf_name = pdf_path.stem
                     image_path = image_dir / f"{pdf_name}_page_{page_index + 1:03d}.png"
                     
-                    logger.info(f"Letter {letter_id}: Collecting data from page {page_index + 1}")
+                    logger.info(f"Letter {letter_id}: Processing page {page_index + 1}")
                     extraction = self.process_page(image_path, page_index + 1, f"{pdf_path.name}_Letter_{letter_id}")
                     if extraction:
                         successful_extractions += 1
                 
-                # PASS 2: Write all collected data for this letter with complete document-level information
+                # Log current letter's document-level state before writing
+                current_state = self.state_manager.get_current_letter_state()
+                logger.info(f"Letter {letter_id} final document-level state: {current_state}")
+                
+                # PASS 2: Write all collected data for this letter with ITS OWN document-level information
                 logger.info(f"PASS 2 - Letter {letter_id}: Writing collected data to CSV...")
                 letter_rows = self.state_manager.write_all_collected_data()
                 total_rows_all_letters += letter_rows
@@ -496,11 +511,13 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                     'pages_processed': len(page_indices),
                     'successful_extractions': successful_extractions,
                     'total_rows': letter_rows,
+                    'document_state': current_state,  # For debugging
                     'csv_path': str(csv_path)
                 }
                 all_results.append(letter_result)
                 
-                logger.info(f"Letter {letter_id} completed: {letter_rows} rows from {successful_extractions} pages")
+                logger.info(f"Letter {letter_id} completed: {letter_rows} rows with state {current_state}")
+                logger.info(f"=" * 50)
             
             # Summary result
             result = {
