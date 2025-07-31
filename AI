@@ -181,6 +181,44 @@ class StateManager:
     def get_current_letter_state(self) -> Dict:
         """Returns the current letter's document-level state for debugging."""
         return {field_name: value for field_name, value in self.doc_state.items() if value is not None}
+
+    def write_all_collected_data(self) -> int:
+        """Second pass: Write all collected rows with complete document-level information."""
+        total_rows_written = 0
+        
+        logger.info(f"Writing all collected data with complete document-level fields:")
+        for field_name, value in self.doc_state.items():
+            logger.info(f"  {field_name}: {value}")
+        
+        # Write all rows with complete document-level information
+        for row_dict in self.temp_rows:
+            csv_row_data = {}
+            
+            # Add row-level data
+            for field in self.config.row_fields:
+                csv_row_data[field.name] = row_dict.get(field.name, "N/A")
+            
+            # Add complete document-level data
+            for field in self.config.document_fields:
+                csv_row_data[field.name] = self.doc_state.get(field.name, "N/A")
+            
+            # Add metadata
+            csv_row_data["document_source"] = row_dict.get("document_source", "N/A")
+            csv_row_data["page_number"] = row_dict.get("page_number", "N/A")
+            
+            # Write in the order specified by config
+            self._csv_writer.writerow([csv_row_data.get(col, "N/A") for col in self.columns])
+            total_rows_written += 1
+        
+        if self._csv_file:
+            self._csv_file.flush()
+            
+        logger.info(f"Successfully wrote {total_rows_written} rows with complete document-level information")
+        return total_rows_written
+
+    def close_csv(self):
+        if self._csv_file:
+            self._csv_file.close()
         """Second pass: Write all collected rows with complete document-level information."""
         total_rows_written = 0
         
