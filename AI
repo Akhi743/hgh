@@ -343,17 +343,39 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                 # Add page data to current letter accumulation
                 self.state_manager.add_page_data(extraction, pdf_path.name, page_num)
                 
-                # Check if this page ends a letter
+                # DEBUG: Check for letter ending with detailed logging
                 page_text = page.get_text()
+                has_sincerely = "sincerely" in page_text.lower()
+                has_enclosure = "enclosure" in page_text.lower()
+                
+                logger.info(f"Page {page_num} letter ending check:")
+                logger.info(f"  - Contains 'sincerely': {has_sincerely}")
+                logger.info(f"  - Contains 'enclosure': {has_enclosure}")
+                logger.info(f"  - Page text sample: {page_text[:200]}")
+                
                 if self._is_letter_ending_page(page_text):
                     logger.info(f"Letter ending detected on page {page_num} - finalizing current letter")
+                    
+                    # DEBUG: Log what document-level fields we're extracting
+                    logger.info(f"Document-level fields being extracted from page {page_num}:")
+                    logger.info(f"  - notification_received_date: {getattr(extraction, 'notification_received_date', 'None')}")
+                    logger.info(f"  - contract_duration: {getattr(extraction, 'contract_duration', 'None')}")
+                    logger.info(f"  - effective_date: {getattr(extraction, 'effective_date', 'None')}")
+                    
                     self.state_manager.finalize_current_letter(extraction)
                     logger.info("Letter finalized. Ready for next letter.")
+                else:
+                    logger.info(f"No letter ending detected on page {page_num} - continuing to accumulate")
             
             # Handle case where PDF ends without explicit letter ending
             if self.state_manager.current_letter_rows:
                 logger.info("PDF ended with pending letter data - finalizing last letter")
+                logger.info(f"Pending rows: {len(self.state_manager.current_letter_rows)}")
+                
+                # For last letter without ending, try to get document fields from any accumulated extraction
+                # or create empty extraction
                 empty_extraction = self.DocumentModel()
+                logger.info("Using empty extraction for final letter (no document-level fields available)")
                 self.state_manager.finalize_current_letter(empty_extraction)
             
             summary = self.state_manager.get_summary()
