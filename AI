@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURATION SYSTEM
+# CONFIGURATION SYSTEM (UNCHANGED)
 # ==========================================
 
 class ExtractionField(BaseModel):
@@ -39,10 +39,6 @@ class DocumentTypeConfig(BaseModel):
     detection_prompt: str
     extraction_instructions: str
     csv_columns: List[str]
-
-# ==========================================
-# HEALTHCARE CONTRACT CONFIGURATION
-# ==========================================
 
 HEALTHCARE_CONTRACT_CONFIG = DocumentTypeConfig(
     document_type="HealthcareContract",
@@ -77,17 +73,17 @@ CRITICAL INSTRUCTIONS:
 3. For 'effective_date': Extract the effective date that applies to all facilities in this letter - usually mentioned as "effective [DATE]" or "to become effective [DATE]"
 4. Create one row for each facility mentioned, ensuring no fields are left empty when information is available.""",
     csv_columns=[
-        "hospital_name", "charge_master_limit", "charge_master_increase",
-        "notification_received_date", "contract_duration", "effective_date",
-        "document_source", "page_number"
+        "hospital_name", "charge_master_limit", "charge_master_increase", # Row Fields
+        "notification_received_date", "contract_duration", "effective_date", # Document Fields
+        "document_source", "page_number" # Metadata
     ]
 )
 
 # ==========================================
-# DYNAMIC COMPONENT FACTORY
+# DYNAMIC COMPONENT FACTORY (UNCHANGED)
 # ==========================================
 
-def create_dynamic_models(config: DocumentTypeConfig):
+def create_dynamic_models(config: DocumentTypeConfig) -> (Type[BaseModel], Type[BaseModel]):
     """Dynamically creates Pydantic models for row and document data based on the config."""
     
     # Create the RowModel
@@ -109,108 +105,115 @@ def create_dynamic_models(config: DocumentTypeConfig):
     return RowModel, DocumentModel
 
 # ==========================================
-# SEQUENTIAL STATE MANAGER
+# FIXED STATE MANAGER - HANDLES MULTIPLE LETTERS PER PDF
 # ==========================================
 
-class SequentialStateManager:
-    """State manager that processes letters sequentially and writes when letter boundaries are detected."""
-    
+class FixedStateManager:
+    """FIXED: State manager that properly handles multiple separate letters in one PDF."""
     def __init__(self, config: DocumentTypeConfig):
         self.config = config
         self.columns = config.csv_columns
-        self.output_dir = None
-        self.pdf_name = None
-        
-        # Current letter state
-        self.current_letter_rows = []
-        self.current_letter_id = 1
-        self.total_letters_processed = 0
-        self.total_rows_written = 0
-        
-        logger.info("Sequential state manager initialized")
+        self._csv_file = None
+        self._csv_writer = None
+        self.all_letter_data = []  # Store complete letter data separately
 
-    def setup_output(self, output_dir: Path, pdf_name: str):
-        """Setup output directory and PDF name for later CSV creation."""
-        self.output_dir = output_dir
-        self.pdf_name = pdf_name
+    def start_csv(self, output_path: Path):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._csv_file = open(output_path, 'w', newline='', encoding='utf-8')
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow(self.columns)
 
-    def add_page_data(self, extraction_data: BaseModel, document_name: str, page_num: int):
-        """Add page data to current letter accumulation."""
-        for row_data in extraction_data.rows:
-            row_dict = {}
-            for field in self.config.row_fields:
-                row_dict[field.name] = getattr(row_data, field.name, "N/A")
-            row_dict["document_source"] = document_name
-            row_dict["page_number"] = page_num
+    def process_letter_page(self, extraction_data: BaseModel, document_name: str, page_num: int):
+        """Process each letter page as a potentially separate letter."""
+        
+        # Check if this page has document-level fields (indicates start of new letter)
+        has_doc_fields = any(getattr(extraction_data, field.name, None) for field in self.config.document_fields)
+        
+        if has_doc_fields:
+            # This is a new letter - create new letter entry
+            letter_data = {
+                "doc_fields": {},
+                "rows": [],
+                "start_page": page_num
+            }
             
-            self.current_letter_rows.append(row_dict)
+            # Collect document-level fields from this page
+            for field in self.config.document_fields:
+                value = getattr(extraction_data, field.name, None)
+                letter_data["doc_fields"][field.name] = value
+                if value:
+                    logger.info(f"New letter detected on page {page_num} - {field.name}: {value}")
             
-        logger.info(f"Added {len(extraction_data.rows)} rows from page {page_num}. Current letter total: {len(self.current_letter_rows)}")
+            # Add any rows from this page
+            for row_data in extraction_data.rows:
+                row_dict = {field.name: getattr(row_data, field.name, "N/A") for field in self.config.row_fields}
+                row_dict["document_source"] = document_name
+                row_dict["page_number"] = page_num
+                letter_data["rows"].append(row_dict)
+            
+            self.all_letter_data.append(letter_data)
+            logger.info(f"Started new letter #{len(self.all_letter_data)} on page {page_num} with {len(extraction_data.rows)} rows")
+            
+        else:
+            # This is a continuation page - add rows to the most recent letter
+            if self.all_letter_data and extraction_data.rows:
+                current_letter = self.all_letter_data[-1]
+                
+                for row_data in extraction_data.rows:
+                    row_dict = {field.name: getattr(row_data, field.name, "N/A") for field in self.config.row_fields}
+                    row_dict["document_source"] = document_name
+                    row_dict["page_number"] = page_num
+                    current_letter["rows"].append(row_dict)
+                
+                logger.info(f"Added {len(extraction_data.rows)} rows to letter #{len(self.all_letter_data)} from page {page_num}")
+            else:
+                logger.warning(f"Page {page_num} has rows but no current letter context")
 
-    def finalize_current_letter(self, final_extraction_data: BaseModel) -> int:
-        """Extract document-level fields from letter-ending page and write complete letter data."""
-        if not self.current_letter_rows:
-            logger.info(f"No rows to write for letter {self.current_letter_id}")
-            return 0
+    def write_all_letters(self) -> int:
+        """Write all letters with their respective document-level fields."""
+        total_rows_written = 0
+        
+        logger.info(f"Writing {len(self.all_letter_data)} separate letters to CSV")
+        
+        for letter_idx, letter_data in enumerate(self.all_letter_data, 1):
+            logger.info(f"Writing letter #{letter_idx} with {len(letter_data['rows'])} rows")
+            logger.info(f"  Letter document fields: {letter_data['doc_fields']}")
             
-        # Extract document-level fields from the letter-ending page
-        document_fields = {}
-        for field in self.config.document_fields:
-            document_fields[field.name] = getattr(final_extraction_data, field.name, "N/A")
-        
-        logger.info(f"Finalizing Letter {self.current_letter_id} with document fields: {document_fields}")
-        
-        # Create CSV for this letter
-        csv_path = self.output_dir / f"{self.pdf_name}_letter_{self.current_letter_id}_data.csv"
-        
-        rows_written = 0
-        with open(csv_path, 'w', newline='', encoding='utf-8') as csv_file:
-            csv_writer = csv.writer(csv_file)
-            csv_writer.writerow(self.columns)
-            
-            # Write all accumulated rows with the document-level fields
-            for row_dict in self.current_letter_rows:
+            # Write each row of this letter with its specific document-level fields
+            for row_dict in letter_data["rows"]:
                 csv_row_data = {}
                 
                 # Add row-level data
                 for field in self.config.row_fields:
                     csv_row_data[field.name] = row_dict.get(field.name, "N/A")
                 
-                # Add document-level data from letter-ending page
+                # Add THIS LETTER'S document-level data
                 for field in self.config.document_fields:
-                    csv_row_data[field.name] = document_fields.get(field.name, "N/A")
+                    csv_row_data[field.name] = letter_data["doc_fields"].get(field.name, "N/A")
                 
                 # Add metadata
                 csv_row_data["document_source"] = row_dict.get("document_source", "N/A")
                 csv_row_data["page_number"] = row_dict.get("page_number", "N/A")
                 
                 # Write in the order specified by config
-                csv_writer.writerow([csv_row_data.get(col, "N/A") for col in self.columns])
-                rows_written += 1
+                self._csv_writer.writerow([csv_row_data.get(col, "N/A") for col in self.columns])
+                total_rows_written += 1
         
-        logger.info(f"Letter {self.current_letter_id} completed: {rows_written} rows written to {csv_path}")
-        
-        # Reset for next letter
-        self.current_letter_rows = []
-        self.current_letter_id += 1
-        self.total_letters_processed += 1
-        self.total_rows_written += rows_written
-        
-        return rows_written
+        if self._csv_file:
+            self._csv_file.flush()
+            
+        logger.info(f"Successfully wrote {total_rows_written} rows from {len(self.all_letter_data)} separate letters")
+        return total_rows_written
 
-    def get_summary(self) -> Dict:
-        """Get processing summary."""
-        return {
-            'total_letters_processed': self.total_letters_processed,
-            'total_rows_written': self.total_rows_written,
-            'current_letter_rows_pending': len(self.current_letter_rows)
-        }
+    def close_csv(self):
+        if self._csv_file:
+            self._csv_file.close()
 
 # ==========================================
-# HEALTHCARE DOCUMENT EXTRACTOR
+# ENHANCED DOCUMENT EXTRACTOR WITH LETTER DETECTION
 # ==========================================
 
-class HealthcareDocumentExtractor:
+class FixedDocumentExtractor:
     def __init__(self, client, config: DocumentTypeConfig, output_dir: str = "document_extraction"):
         self.client = client
         self.config = config
@@ -219,11 +222,11 @@ class HealthcareDocumentExtractor:
         
         # Create components from config
         self.RowModel, self.DocumentModel = create_dynamic_models(config)
-        self.state_manager = SequentialStateManager(config)
+        self.state_manager = FixedStateManager(config)
         self.extraction_prompt = self._build_extraction_prompt()
 
     def _build_extraction_prompt(self) -> str:
-        """Builds extraction prompt optimized for sequential processing."""
+        """Builds extraction prompt optimized for detecting new letters."""
         doc_fields_str = "\n".join(
             f"- **{f.name}**: {f.description} (e.g., '{', '.join(f.examples)}')" for f in self.config.document_fields
         )
@@ -235,60 +238,71 @@ class HealthcareDocumentExtractor:
         return f"""
 You are an expert data extraction AI. {self.config.extraction_instructions}
 
+### CRITICAL: MULTIPLE LETTERS HANDLING
+- If this page starts a NEW letter (has letterhead, "Dear..." greeting, document-level info), extract ALL document-level fields
+- If this is a continuation page of an existing letter, focus on table/facility rows and use null for document-level fields
+- ALWAYS extract document-level fields when they appear, even if you extracted similar fields from a previous letter
+
 ### EXTRACTION SCHEMA
 Follow this JSON schema precisely. Use `null` for any missing values.
 
-#### Document-Level Fields (extract if present on this page):
+#### Document-Level Fields (extract if present, especially for new letters):
 {doc_fields_str}
 
 #### Row-Level Fields (extract ALL facility rows from this page):
 {row_fields_str}
 
-### IMPORTANT:
-- Extract ALL visible facility/hospital rows from this page
-- For document-level fields, extract them if present (they may not be on every page)
-- Use null for missing values
-
 ### JSON OUTPUT SCHEMA:
 {json_schema}
 """
 
-    def _is_letter_ending_page(self, page_text: str, page_num: int, total_pages: int) -> bool:
-        """Check if this page contains letter ending indicators and is likely the actual end."""
-        page_text_lower = page_text.lower()
-        has_sincerely = "sincerely" in page_text_lower
-        has_enclosure = "enclosure" in page_text_lower
+    def _find_target_pages_with_ai(self, doc: fitz.Document, image_dir: Path, dpi: int) -> List[int]:
+        """Uses AI to classify each page and identify relevant healthcare contract pages."""
+        logger.info("Starting AI-powered page classification...")
+        pages_to_process = []
+        created_images = []
         
-        # Basic check for ending words
-        has_ending_words = has_sincerely or has_enclosure
-        
-        if not has_ending_words:
-            return False
+        for i in range(len(doc)):
+            page_num = i + 1
+            try:
+                page = doc.load_page(i)
+                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                pix = page.get_pixmap(matrix=mat)
+                
+                pdf_name = Path(doc.name).stem if doc.name else "document"
+                image_path = image_dir / f"{pdf_name}_page_{page_num:03d}.png"
+                pix.save(str(image_path))
+                created_images.append(image_path)
+                
+                logger.info(f"Created image: {image_path}")
+
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+                
+                response = self.client.models.generate_content(
+                    model='gemini-1.5-flash',
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
+                        self.config.detection_prompt
+                    ]
+                )
+                answer = response.text.strip().upper()
+                
+                if 'YES' in answer:
+                    logger.info(f"AI classified page {page_num} as '{self.config.document_type}'.")
+                    pages_to_process.append(i)
+                else:
+                    logger.info(f"AI classified page {page_num} as NOT '{self.config.document_type}'.")
+                    
+            except Exception as e:
+                logger.error(f"Could not classify page {page_num}: {e}")
+                continue
             
-        # Additional logic to determine if this is the REAL ending
-        # Check if this is the last page of the document
-        is_last_page = page_num == total_pages
-        
-        # Check for signature patterns (indicating real end)
-        has_signature_pattern = any(pattern in page_text_lower for pattern in [
-            "joanne roberts", "manager", "medical economics", 
-            "charge master", "network management"
-        ])
-        
-        # Check for formal closing elements
-        has_formal_closing = has_sincerely and (has_signature_pattern or is_last_page)
-        
-        logger.info(f"Letter ending analysis for page {page_num}:")
-        logger.info(f"  - has_sincerely: {has_sincerely}")
-        logger.info(f"  - has_enclosure: {has_enclosure}")
-        logger.info(f"  - has_signature_pattern: {has_signature_pattern}")
-        logger.info(f"  - is_last_page: {is_last_page}")
-        logger.info(f"  - has_formal_closing: {has_formal_closing}")
-        
-        return has_formal_closing
+        logger.info(f"Created {len(created_images)} image files, identified {len(pages_to_process)} target pages")
+        return sorted(list(set(pages_to_process)))
 
     def process_page(self, image_path: Path, page_num: int, document_name: str):
-        """Process a single page and return extraction data."""
+        """Processes a single page for data extraction."""
         try:
             if not image_path.exists():
                 logger.error(f"Image file not found: {image_path}")
@@ -308,117 +322,83 @@ Follow this JSON schema precisely. Use `null` for any missing values.
             )
             response_text = response.text.strip().replace("```json", "").replace("```", "")
             
+            logger.info(f"Raw AI response for page {page_num} (first 300 chars): {response_text[:300]}...")
+            
             extraction = self.DocumentModel.model_validate_json(response_text)
             
-            logger.info(f"Extracted from page {page_num}: {len(extraction.rows)} rows")
-            return extraction
+            # Log extraction results for debugging
+            logger.info(f"Extracted from page {page_num}:")
+            logger.info(f"  notification_received_date: {getattr(extraction, 'notification_received_date', 'None')}")
+            logger.info(f"  effective_date: {getattr(extraction, 'effective_date', 'None')}")
+            logger.info(f"  contract_duration: {getattr(extraction, 'contract_duration', 'None')}")
+            logger.info(f"  Number of rows: {len(extraction.rows)}")
+            for i, row in enumerate(extraction.rows):
+                logger.info(f"  Row {i+1} - hospital_name: {getattr(row, 'hospital_name', 'None')}")
             
+            # FIXED: Process each page as potentially separate letter
+            self.state_manager.process_letter_page(extraction, document_name, page_num)
+            logger.info(f"Data from page {page_num} processed")
+            
+            return extraction
         except (ValidationError, json.JSONDecodeError) as e:
-            logger.error(f"Extraction failed on page {page_num}: {e}")
+            logger.error(f"Pydantic/JSON validation failed on page {page_num}: {e}")
+            logger.error(f"Raw response was: {response_text}")
         except Exception as e:
-            logger.error(f"Processing failed on page {page_num}: {e}")
+            logger.error(f"Extraction failed on page {page_num}: {e}")
         return None
 
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
-        """Sequential processing: scan pages, accumulate rows, write when letter ends."""
+        """FIXED: Main orchestration method that properly handles multiple letters per PDF."""
         pdf_path = Path(pdf_path)
         doc = None
         
         try:
-            logger.info(f"Starting sequential extraction for: {pdf_path.name}")
+            logger.info(f"Starting FIXED extraction for: {pdf_path.name}")
             doc = fitz.open(str(pdf_path))
             
             image_dir = self.output_dir / self.config.document_type / pdf_path.stem
             image_dir.mkdir(parents=True, exist_ok=True)
             
-            self.state_manager.setup_output(image_dir, pdf_path.stem)
+            # FIXED: No need to reset document state - each letter handled separately
+            indices = self._find_target_pages_with_ai(doc, image_dir, dpi)
             
-            # Process pages sequentially
-            for page_index in range(len(doc)):
-                page_num = page_index + 1
-                logger.info(f"=== Processing Page {page_num} ===")
-                
-                # Convert page to image
-                page = doc.load_page(page_index)
-                mat = fitz.Matrix(dpi / 72, dpi / 72)
-                pix = page.get_pixmap(matrix=mat)
+            if not indices:
+                logger.warning(f"No '{self.config.document_type}' pages found in '{pdf_path.name}'.")
+                return {'total_pages_in_pdf': len(doc), 'pages_processed': 0, 'total_rows': 0}
+
+            csv_path = image_dir / f"{pdf_path.stem}_data.csv"
+            self.state_manager.start_csv(csv_path)
+            
+            # FIXED: Single pass - process each page and detect letter boundaries automatically
+            logger.info(f"Processing {len(indices)} pages with automatic letter detection...")
+            successful_extractions = 0
+            for i in indices:
                 pdf_name = pdf_path.stem
-                image_path = image_dir / f"{pdf_name}_page_{page_num:03d}.png"
-                pix.save(str(image_path))
+                image_path = image_dir / f"{pdf_name}_page_{i + 1:03d}.png"
                 
-                # Check if this is a healthcare contract page
-                with open(image_path, 'rb') as f:
-                    image_bytes = f.read()
-                
-                response = self.client.models.generate_content(
-                    model='gemini-1.5-flash',
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
-                        self.config.detection_prompt
-                    ]
-                )
-                
-                if 'YES' not in response.text.strip().upper():
-                    logger.info(f"Page {page_num} is not a healthcare contract page - skipping")
-                    continue
-                
-                logger.info(f"Page {page_num} is a healthcare contract page - processing")
-                
-                # Extract data from this page
-                extraction = self.process_page(image_path, page_num, pdf_path.name)
-                if not extraction:
-                    continue
-                
-                # Add page data to current letter accumulation
-                self.state_manager.add_page_data(extraction, pdf_path.name, page_num)
-                
-                # DEBUG: Check for letter ending with detailed logging
-                page_text = page.get_text()
-                has_sincerely = "sincerely" in page_text.lower()
-                has_enclosure = "enclosure" in page_text.lower()
-                
-                logger.info(f"Page {page_num} letter ending check:")
-                logger.info(f"  - Contains 'sincerely': {has_sincerely}")
-                logger.info(f"  - Contains 'enclosure': {has_enclosure}")
-                logger.info(f"  - Page text sample: {page_text[:200]}")
-                
-                if self._is_letter_ending_page(page_text, page_num, len(doc)):
-                    logger.info(f"REAL letter ending detected on page {page_num} - finalizing current letter")
-                    
-                    # DEBUG: Log what document-level fields we're extracting
-                    logger.info(f"Document-level fields being extracted from page {page_num}:")
-                    logger.info(f"  - notification_received_date: {getattr(extraction, 'notification_received_date', 'None')}")
-                    logger.info(f"  - contract_duration: {getattr(extraction, 'contract_duration', 'None')}")
-                    logger.info(f"  - effective_date: {getattr(extraction, 'effective_date', 'None')}")
-                    
-                    self.state_manager.finalize_current_letter(extraction)
-                    logger.info("Letter finalized. Ready for next letter.")
-                else:
-                    logger.info(f"Page {page_num} has ending words but not identified as real letter ending - continuing to accumulate")
+                logger.info(f"Processing page {i + 1}")
+                extraction = self.process_page(image_path, i + 1, pdf_path.name)
+                if extraction:
+                    successful_extractions += 1
             
-            # Handle case where PDF ends without explicit letter ending
-            if self.state_manager.current_letter_rows:
-                logger.info("PDF ended with pending letter data - finalizing last letter")
-                logger.info(f"Pending rows: {len(self.state_manager.current_letter_rows)}")
-                
-                # For last letter without ending, try to get document fields from any accumulated extraction
-                # or create empty extraction
-                empty_extraction = self.DocumentModel()
-                logger.info("Using empty extraction for final letter (no document-level fields available)")
-                self.state_manager.finalize_current_letter(empty_extraction)
+            # FIXED: Write all letters with their respective document fields
+            total_rows = self.state_manager.write_all_letters()
             
-            summary = self.state_manager.get_summary()
+            self.state_manager.close_csv()
             
             result = {
                 'pdf_name': pdf_path.name,
                 'document_type': self.config.document_type,
                 'total_pages_in_pdf': len(doc),
-                'letters_processed': summary['total_letters_processed'],
-                'total_rows': summary['total_rows_written']
+                'pages_processed': len(indices),
+                'successful_extractions': successful_extractions,
+                'total_rows': total_rows,
+                'letters_detected': len(self.state_manager.all_letter_data),
+                'csv_path': str(csv_path)
             }
             
-            logger.info(f"Sequential extraction completed for {pdf_path.name}")
-            logger.info(f"Final result: {summary['total_letters_processed']} letters, {summary['total_rows_written']} total rows")
+            logger.info(f"FIXED extraction completed successfully for {pdf_path.name}")
+            logger.info(f"Detected {len(self.state_manager.all_letter_data)} separate letters with {total_rows} total rows")
             return result
             
         except Exception as e:
@@ -433,46 +413,49 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                     logger.error(f"Error closing document: {e}")
 
 # ==========================================
-# CLIENT SETUP & MAIN FUNCTION
+# CLIENT SETUP & MAIN FUNCTION (UNCHANGED)
 # ==========================================
 
 def create_client():
     return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
 
 def run_healthcare_document_extraction(pdf_path: str, output_dir: str = "healthcare_extraction_output") -> Dict:
-    """Run healthcare contract extraction with sequential processing."""
+    """FIXED: Run healthcare contract extraction that properly handles multiple letters per PDF."""
     client = create_client()
-    extractor = HealthcareDocumentExtractor(client=client, config=HEALTHCARE_CONTRACT_CONFIG, output_dir=output_dir)
+    extractor = FixedDocumentExtractor(client=client, config=HEALTHCARE_CONTRACT_CONFIG, output_dir=output_dir)
     return extractor.extract_from_pdf(pdf_path)
 
 # ==========================================
-# USAGE
+# MAIN EXECUTION
 # ==========================================
 
 if __name__ == "__main__":
-    pdf_file_path = "Western Reserve Hospital.pdf"  # Replace with your PDF path
+    pdf_file_path = "Western Reserve Hospital.pdf"  # Your multi-letter PDF
     
     try:
-        # Run the sequential healthcare contract extraction
+        # Run the FIXED healthcare contract extraction
         results = run_healthcare_document_extraction(pdf_file_path)
         
         print("\n" + "="*70)
-        print("SEQUENTIAL HEALTHCARE CONTRACT EXTRACTION RESULTS")
+        print("FIXED HEALTHCARE CONTRACT EXTRACTION RESULTS")
         print("="*70)
+        print(f"Document Type: {results.get('document_type', 'N/A')}")
         print(f"PDF: {results.get('pdf_name', 'N/A')}")
         print(f"Total Pages in PDF: {results.get('total_pages_in_pdf', 'N/A')}")
-        print(f"Letters Processed: {results.get('letters_processed', 'N/A')}")
+        print(f"Pages Processed: {results.get('pages_processed', 'N/A')}")
+        print(f"Letters Detected: {results.get('letters_detected', 'N/A')}")  # NEW
         print(f"Total Rows Extracted: {results.get('total_rows', 'N/A')}")
+        print(f"CSV Output: {results.get('csv_path', 'N/A')}")
         print("="*70)
-        print("\nSequential Processing Features:")
-        print("1. Scans pages one by one")
-        print("2. Accumulates facility rows for current letter")
-        print("3. When 'sincerely' or 'enclosure' found:")
-        print("   - Extracts document-level fields from that page")
-        print("   - Writes complete letter data to separate CSV")
-        print("   - Resets state for next letter")
-        print("4. Ensures complete isolation between letters")
+        print("\nFIX APPLIED:")
+        print("✓ Each letter now maintains its own document-level fields")
+        print("✓ notification_received_date won't be overwritten between letters")
+        print("✓ effective_date specific to each letter")
+        print("✓ contract_duration specific to each letter")
+        
+        if 'error' in results:
+            print(f"Error: {results['error']}")
         
     except Exception as e:
-        logger.critical(f"A critical error occurred in the main execution block: {e}")
         print(f"Error: {e}")
+        logger.error(f"Error in main execution: {e}")
