@@ -253,10 +253,39 @@ Follow this JSON schema precisely. Use `null` for any missing values.
 {json_schema}
 """
 
-    def _is_letter_ending_page(self, page_text: str) -> bool:
-        """Check if this page contains letter ending indicators."""
+    def _is_letter_ending_page(self, page_text: str, page_num: int, total_pages: int) -> bool:
+        """Check if this page contains letter ending indicators and is likely the actual end."""
         page_text_lower = page_text.lower()
-        return any(ending in page_text_lower for ending in ["sincerely", "enclosure"])
+        has_sincerely = "sincerely" in page_text_lower
+        has_enclosure = "enclosure" in page_text_lower
+        
+        # Basic check for ending words
+        has_ending_words = has_sincerely or has_enclosure
+        
+        if not has_ending_words:
+            return False
+            
+        # Additional logic to determine if this is the REAL ending
+        # Check if this is the last page of the document
+        is_last_page = page_num == total_pages
+        
+        # Check for signature patterns (indicating real end)
+        has_signature_pattern = any(pattern in page_text_lower for pattern in [
+            "joanne roberts", "manager", "medical economics", 
+            "charge master", "network management"
+        ])
+        
+        # Check for formal closing elements
+        has_formal_closing = has_sincerely and (has_signature_pattern or is_last_page)
+        
+        logger.info(f"Letter ending analysis for page {page_num}:")
+        logger.info(f"  - has_sincerely: {has_sincerely}")
+        logger.info(f"  - has_enclosure: {has_enclosure}")
+        logger.info(f"  - has_signature_pattern: {has_signature_pattern}")
+        logger.info(f"  - is_last_page: {is_last_page}")
+        logger.info(f"  - has_formal_closing: {has_formal_closing}")
+        
+        return has_formal_closing
 
     def process_page(self, image_path: Path, page_num: int, document_name: str):
         """Process a single page and return extraction data."""
@@ -353,8 +382,8 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                 logger.info(f"  - Contains 'enclosure': {has_enclosure}")
                 logger.info(f"  - Page text sample: {page_text[:200]}")
                 
-                if self._is_letter_ending_page(page_text):
-                    logger.info(f"Letter ending detected on page {page_num} - finalizing current letter")
+                if self._is_letter_ending_page(page_text, page_num, len(doc)):
+                    logger.info(f"REAL letter ending detected on page {page_num} - finalizing current letter")
                     
                     # DEBUG: Log what document-level fields we're extracting
                     logger.info(f"Document-level fields being extracted from page {page_num}:")
@@ -365,7 +394,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                     self.state_manager.finalize_current_letter(extraction)
                     logger.info("Letter finalized. Ready for next letter.")
                 else:
-                    logger.info(f"No letter ending detected on page {page_num} - continuing to accumulate")
+                    logger.info(f"Page {page_num} has ending words but not identified as real letter ending - continuing to accumulate")
             
             # Handle case where PDF ends without explicit letter ending
             if self.state_manager.current_letter_rows:
