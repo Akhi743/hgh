@@ -1,22 +1,4 @@
-if __name__ == "__main__":
-    pdf_file_path = "Aultman Hospital.pdf"  # Replace with your PDF path
-    
-    try:
-        # Run the healthcare contract extraction
-        results = run_healthcare_document_extraction(pdf_file_path)
-        
-        print("\n" + "="*70)
-        print("HEALTHCARE CONTRACT EXTRACTION RESULTS")
-        print("="*70)
-        print(f"Document Type: {results.get('document_type', 'N/A')}")
-        print(f"PDF: {results.get('pdf_name', 'N/A')}")
-        print(f"Total Pages in PDF: {results.get('total_pages_in_pdf', 'N/A')}")
-        print(f"Pages Processed: {results.get('pages_processed', 'N/A')}")
-        print(f"Total Rows Extracted: {results.get('total_rows', 'N/A')}")
-        print(f"CSV Output: {results.get('csv_path', 'N/A')}")
-        print("="*70)
-        print("\nKey Features:")
-        print("1.import fitz
+import fitz
 import csv
 import json
 import logging
@@ -58,23 +40,24 @@ class DocumentTypeConfig(BaseModel):
     extraction_instructions: str
     csv_columns: List[str]
 
+# ==========================================
+# HEALTHCARE CONTRACT CONFIGURATION
+# ==========================================
+
 HEALTHCARE_CONTRACT_CONFIG = DocumentTypeConfig(
     document_type="HealthcareContract",
     description="Aetna healthcare contract for charge master increases.",
     document_fields=[
-        # Extract notification date from email body text, not letter header
         ExtractionField(
             name="notification_received_date", 
             description="The date mentioned in the sentence 'We have received your email dated [DATE]' in the letter body - NOT the letter header date.", 
             examples=["December 6, 2024", "11/13/2024"]
         ),
         ExtractionField(name="contract_duration", description="The contract term or period.", examples=["12-month period"]),
-        # Moved effective_date to document-level since it applies to all facilities in the letter
         ExtractionField(name="effective_date", description="The effective date for all charge master increases mentioned in this letter.", examples=["January 1, 2025", "1/1/2025"])
     ],
     row_fields=[
         ExtractionField(name="hospital_name", description="The name of the facility from a table row."),
-        # Capture complete limit information including both Commercial and Medicare rates
         ExtractionField(
             name="charge_master_limit", 
             description="The complete contractual limit information including both Commercial and Medicare rates if present. Format as 'Commercial X%, Medicare Y%' or single percentage if only one rate.",
@@ -94,9 +77,9 @@ CRITICAL INSTRUCTIONS:
 3. For 'effective_date': Extract the effective date that applies to all facilities in this letter - usually mentioned as "effective [DATE]" or "to become effective [DATE]"
 4. Create one row for each facility mentioned, ensuring no fields are left empty when information is available.""",
     csv_columns=[
-        "hospital_name", "charge_master_limit", "charge_master_increase", # Row Fields
-        "notification_received_date", "contract_duration", "effective_date", # Document Fields
-        "document_source", "page_number" # Metadata
+        "hospital_name", "charge_master_limit", "charge_master_increase",
+        "notification_received_date", "contract_duration", "effective_date",
+        "document_source", "page_number"
     ]
 )
 
@@ -104,7 +87,7 @@ CRITICAL INSTRUCTIONS:
 # DYNAMIC COMPONENT FACTORY
 # ==========================================
 
-def create_dynamic_models(config: DocumentTypeConfig) -> (Type[BaseModel], Type[BaseModel]):
+def create_dynamic_models(config: DocumentTypeConfig):
     """Dynamically creates Pydantic models for row and document data based on the config."""
     
     # Create the RowModel
@@ -126,11 +109,12 @@ def create_dynamic_models(config: DocumentTypeConfig) -> (Type[BaseModel], Type[
     return RowModel, DocumentModel
 
 # ==========================================
-# DYNAMIC STATE MANAGER
+# SEQUENTIAL STATE MANAGER
 # ==========================================
 
 class SequentialStateManager:
     """State manager that processes letters sequentially and writes when letter boundaries are detected."""
+    
     def __init__(self, config: DocumentTypeConfig):
         self.config = config
         self.columns = config.csv_columns
@@ -138,12 +122,12 @@ class SequentialStateManager:
         self.pdf_name = None
         
         # Current letter state
-        self.current_letter_rows = []  # Accumulate rows for current letter
+        self.current_letter_rows = []
         self.current_letter_id = 1
         self.total_letters_processed = 0
         self.total_rows_written = 0
         
-        logger.info(f"Sequential state manager initialized")
+        logger.info("Sequential state manager initialized")
 
     def setup_output(self, output_dir: Path, pdf_name: str):
         """Setup output directory and PDF name for later CSV creation."""
@@ -152,13 +136,10 @@ class SequentialStateManager:
 
     def add_page_data(self, extraction_data: BaseModel, document_name: str, page_num: int):
         """Add page data to current letter accumulation."""
-        # Collect all rows from this page for the current letter
         for row_data in extraction_data.rows:
             row_dict = {}
-            # Add row-level data
             for field in self.config.row_fields:
                 row_dict[field.name] = getattr(row_data, field.name, "N/A")
-            # Add metadata
             row_dict["document_source"] = document_name
             row_dict["page_number"] = page_num
             
@@ -224,44 +205,11 @@ class SequentialStateManager:
             'total_rows_written': self.total_rows_written,
             'current_letter_rows_pending': len(self.current_letter_rows)
         }
-        """Second pass: Write all collected rows with complete document-level information."""
-        total_rows_written = 0
-        
-        logger.info(f"Writing all collected data with complete document-level fields:")
-        for field_name, value in self.doc_state.items():
-            logger.info(f"  {field_name}: {value}")
-        
-        # Write all rows with complete document-level information
-        for row_dict in self.temp_rows:
-            csv_row_data = {}
-            
-            # Add row-level data
-            for field in self.config.row_fields:
-                csv_row_data[field.name] = row_dict.get(field.name, "N/A")
-            
-            # Add complete document-level data
-            for field in self.config.document_fields:
-                csv_row_data[field.name] = self.doc_state.get(field.name, "N/A")
-            
-            # Add metadata
-            csv_row_data["document_source"] = row_dict.get("document_source", "N/A")
-            csv_row_data["page_number"] = row_dict.get("page_number", "N/A")
-            
-            # Write in the order specified by config
-            self._csv_writer.writerow([csv_row_data.get(col, "N/A") for col in self.columns])
-            total_rows_written += 1
-        
-        if self._csv_file:
-            self._csv_file.flush()
-            
-        logger.info(f"Successfully wrote {total_rows_written} rows with complete document-level information")
-        return total_rows_written
 
-    def close_csv(self):
-        if self._csv_file:
-            self._csv_file.close()
+# ==========================================
+# HEALTHCARE DOCUMENT EXTRACTOR
+# ==========================================
 
-# Enhanced Document Extractor for Healthcare Contracts
 class HealthcareDocumentExtractor:
     def __init__(self, client, config: DocumentTypeConfig, output_dir: str = "document_extraction"):
         self.client = client
@@ -405,7 +353,6 @@ Follow this JSON schema precisely. Use `null` for any missing values.
             # Handle case where PDF ends without explicit letter ending
             if self.state_manager.current_letter_rows:
                 logger.info("PDF ended with pending letter data - finalizing last letter")
-                # Use empty extraction for final letter (no document-level fields)
                 empty_extraction = self.DocumentModel()
                 self.state_manager.finalize_current_letter(empty_extraction)
             
@@ -432,60 +379,6 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                     doc.close()
                     logger.info(f"Document {pdf_path.name} closed successfully")
                 except Exception as e:
-                    logger.error(f"Error closing document: {e}")logger.info(f"Letter {letter_id}: Processing page {page_index + 1}")
-                    extraction = self.process_page(image_path, page_index + 1, f"{pdf_path.name}_Letter_{letter_id}")
-                    if extraction:
-                        successful_extractions += 1
-                
-                # Log current letter's document-level state before writing
-                current_state = self.state_manager.get_current_letter_state()
-                logger.info(f"Letter {letter_id} final document-level state: {current_state}")
-                
-                # PASS 2: Write all collected data for this letter with ITS OWN document-level information
-                logger.info(f"PASS 2 - Letter {letter_id}: Writing collected data to CSV...")
-                letter_rows = self.state_manager.write_all_collected_data()
-                total_rows_all_letters += letter_rows
-                
-                self.state_manager.close_csv()
-                
-                letter_result = {
-                    'letter_id': letter_id,
-                    'pages': [p + 1 for p in page_indices],
-                    'pages_processed': len(page_indices),
-                    'successful_extractions': successful_extractions,
-                    'total_rows': letter_rows,
-                    'document_state': current_state,  # For debugging
-                    'csv_path': str(csv_path)
-                }
-                all_results.append(letter_result)
-                
-                logger.info(f"Letter {letter_id} completed: {letter_rows} rows with state {current_state}")
-                logger.info(f"=" * 50)
-            
-            # Summary result
-            result = {
-                'pdf_name': pdf_path.name,
-                'document_type': self.config.document_type,
-                'total_pages_in_pdf': len(doc),
-                'letters_found': len(letter_groups),
-                'letters_processed': len(all_results),
-                'total_rows_all_letters': total_rows_all_letters,
-                'letter_details': all_results
-            }
-            
-            logger.info(f"Multi-letter extraction completed for {pdf_path.name}")
-            logger.info(f"Final result: {len(letter_groups)} letters, {total_rows_all_letters} total rows")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Critical error during PDF extraction: {e}")
-            return {'error': str(e), 'pdf_name': pdf_path.name}
-        finally:
-            if doc:
-                try:
-                    doc.close()
-                    logger.info(f"Document {pdf_path.name} closed successfully")
-                except Exception as e:
                     logger.error(f"Error closing document: {e}")
 
 # ==========================================
@@ -500,3 +393,35 @@ def run_healthcare_document_extraction(pdf_path: str, output_dir: str = "healthc
     client = create_client()
     extractor = HealthcareDocumentExtractor(client=client, config=HEALTHCARE_CONTRACT_CONFIG, output_dir=output_dir)
     return extractor.extract_from_pdf(pdf_path)
+
+# ==========================================
+# USAGE
+# ==========================================
+
+if __name__ == "__main__":
+    pdf_file_path = "Western Reserve Hospital.pdf"  # Replace with your PDF path
+    
+    try:
+        # Run the sequential healthcare contract extraction
+        results = run_healthcare_document_extraction(pdf_file_path)
+        
+        print("\n" + "="*70)
+        print("SEQUENTIAL HEALTHCARE CONTRACT EXTRACTION RESULTS")
+        print("="*70)
+        print(f"PDF: {results.get('pdf_name', 'N/A')}")
+        print(f"Total Pages in PDF: {results.get('total_pages_in_pdf', 'N/A')}")
+        print(f"Letters Processed: {results.get('letters_processed', 'N/A')}")
+        print(f"Total Rows Extracted: {results.get('total_rows', 'N/A')}")
+        print("="*70)
+        print("\nSequential Processing Features:")
+        print("1. Scans pages one by one")
+        print("2. Accumulates facility rows for current letter")
+        print("3. When 'sincerely' or 'enclosure' found:")
+        print("   - Extracts document-level fields from that page")
+        print("   - Writes complete letter data to separate CSV")
+        print("   - Resets state for next letter")
+        print("4. Ensures complete isolation between letters")
+        
+    except Exception as e:
+        logger.critical(f"A critical error occurred in the main execution block: {e}")
+        print(f"Error: {e}")
