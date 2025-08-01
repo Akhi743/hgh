@@ -264,21 +264,25 @@ class FixedDocumentExtractor:
         return f"""
 You are an expert data extraction AI. {self.config.extraction_instructions}
 
-### CRITICAL: NEW LETTER DETECTION AND BOUNDARIES
+### CRITICAL: LETTER BOUNDARY DETECTION
 - A NEW letter starts with "Dear..." greeting AND "We have received your letter/email" phrase
-- A letter ENDS with "Enclosure" or "Sincerely" - DO NOT extract any data that appears AFTER these closing words
-- If this page has BOTH "Dear..." and "We have received..." then extract ALL document-level fields
-- If this is a continuation page (no "Dear..." greeting), focus on table/facility rows and use null for document-level fields
-- IGNORE any summary tables, rate sheets, or additional details that appear AFTER "Enclosure"
-- ONLY extract data from the actual letter content, NOT from supplementary materials
+- Extract ALL data that appears BEFORE the words "Enclosure" or "Sincerely" 
+- COMPLETELY IGNORE any tables, data, or content that appears AFTER "Enclosure" or "Sincerely"
+- If you see "Enclosure" or "Sincerely", treat that as the END of the letter - do not extract anything below those words
+- Summary tables, rate sheets, or facility details that appear AFTER letter closing should be completely ignored
+
+### EXTRACTION RULES:
+1. If this page has "Dear..." and "We have received..." → extract document-level fields from letter portion only
+2. Extract facility/hospital rows ONLY from the letter content (before "Enclosure"/"Sincerely")  
+3. If content appears after "Enclosure"/"Sincerely", pretend it doesn't exist
 
 ### EXTRACTION SCHEMA
 Follow this JSON schema precisely. Use `null` for any missing values.
 
-#### Document-Level Fields (extract if this is a NEW letter with "Dear..." and "We have received..."):
+#### Document-Level Fields (from letter content only):
 {doc_fields_str}
 
-#### Row-Level Fields (extract ALL facility rows from the LETTER ONLY, ignore post-Enclosure content):
+#### Row-Level Fields (from letter content only, BEFORE "Enclosure"/"Sincerely"):
 {row_fields_str}
 
 ### JSON OUTPUT SCHEMA:
