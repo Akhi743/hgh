@@ -109,7 +109,7 @@ def create_dynamic_models(config: DocumentTypeConfig) -> (Type[BaseModel], Type[
 # ==========================================
 
 class FixedStateManager:
-    """FIXED: State manager that properly handles multiple separate letters in one PDF."""
+    """State manager that properly handles multiple separate letters in one PDF."""
     def __init__(self, config: DocumentTypeConfig):
         self.config = config
         self.columns = config.csv_columns
@@ -126,10 +126,11 @@ class FixedStateManager:
     def process_letter_page(self, extraction_data: BaseModel, document_name: str, page_num: int):
         """Process each letter page as a potentially separate letter."""
         
-        # Check if this page has document-level fields (indicates start of new letter)
-        has_doc_fields = any(getattr(extraction_data, field.name, None) for field in self.config.document_fields)
+        # Check if this page starts a NEW letter by looking for key identifiers
+        # New letter must have notification_received_date (indicates "We have received..." phrase was found)
+        is_new_letter = getattr(extraction_data, 'notification_received_date', None) is not None
         
-        if has_doc_fields:
+        if is_new_letter:
             # This is a new letter - create new letter entry
             letter_data = {
                 "doc_fields": {},
@@ -155,19 +156,44 @@ class FixedStateManager:
             logger.info(f"Started new letter #{len(self.all_letter_data)} on page {page_num} with {len(extraction_data.rows)} rows")
             
         else:
-            # This is a continuation page - add rows to the most recent letter
-            if self.all_letter_data and extraction_data.rows:
+            # This is a continuation page - add to the most recent letter
+            if self.all_letter_data:
                 current_letter = self.all_letter_data[-1]
+                
+                # Update missing document fields from continuation pages (if any)
+                for field in self.config.document_fields:
+                    value = getattr(extraction_data, field.name, None)
+                    if value and not current_letter["doc_fields"].get(field.name):
+                        current_letter["doc_fields"][field.name] = value
+                        logger.info(f"Updated letter #{len(self.all_letter_data)} with {field.name}: {value} from page {page_num}")
+                
+                # Add rows if any
+                if extraction_data.rows:
+                    for row_data in extraction_data.rows:
+                        row_dict = {field.name: getattr(row_data, field.name, "N/A") for field in self.config.row_fields}
+                        row_dict["document_source"] = document_name
+                        row_dict["page_number"] = page_num
+                        current_letter["rows"].append(row_dict)
+                    
+                    logger.info(f"Added {len(extraction_data.rows)} rows to letter #{len(self.all_letter_data)} from page {page_num}")
+                else:
+                    logger.info(f"Page {page_num} is continuation page of letter #{len(self.all_letter_data)} (no additional rows)")
+            else:
+                # Edge case: continuation page without a previous letter - treat as new letter
+                logger.warning(f"Page {page_num} appears to be continuation but no current letter exists - treating as new letter")
+                letter_data = {
+                    "doc_fields": {field.name: getattr(extraction_data, field.name, None) for field in self.config.document_fields},
+                    "rows": [],
+                    "start_page": page_num
+                }
                 
                 for row_data in extraction_data.rows:
                     row_dict = {field.name: getattr(row_data, field.name, "N/A") for field in self.config.row_fields}
                     row_dict["document_source"] = document_name
                     row_dict["page_number"] = page_num
-                    current_letter["rows"].append(row_dict)
+                    letter_data["rows"].append(row_dict)
                 
-                logger.info(f"Added {len(extraction_data.rows)} rows to letter #{len(self.all_letter_data)} from page {page_num}")
-            else:
-                logger.warning(f"Page {page_num} has rows but no current letter context")
+                self.all_letter_data.append(letter_data)
 
     def write_all_letters(self) -> int:
         """Write all letters with their respective document-level fields."""
@@ -238,15 +264,16 @@ class FixedDocumentExtractor:
         return f"""
 You are an expert data extraction AI. {self.config.extraction_instructions}
 
-### CRITICAL: MULTIPLE LETTERS HANDLING
-- If this page starts a NEW letter (has letterhead, "Dear..." greeting, document-level info), extract ALL document-level fields
-- If this is a continuation page of an existing letter, focus on table/facility rows and use null for document-level fields
-- ALWAYS extract document-level fields when they appear, even if you extracted similar fields from a previous letter
+### CRITICAL: NEW LETTER DETECTION
+- A NEW letter starts with "Dear..." greeting AND "We have received your letter/email" phrase
+- If this page has BOTH "Dear..." and "We have received..." then extract ALL document-level fields
+- If this is a continuation page (no "Dear..." greeting), focus on table/facility rows and use null for document-level fields
+- ALWAYS extract document-level fields when you see a new letter starting
 
 ### EXTRACTION SCHEMA
 Follow this JSON schema precisely. Use `null` for any missing values.
 
-#### Document-Level Fields (extract if present, especially for new letters):
+#### Document-Level Fields (extract if this is a NEW letter with "Dear..." and "We have received..."):
 {doc_fields_str}
 
 #### Row-Level Fields (extract ALL facility rows from this page):
@@ -335,7 +362,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
             for i, row in enumerate(extraction.rows):
                 logger.info(f"  Row {i+1} - hospital_name: {getattr(row, 'hospital_name', 'None')}")
             
-            # FIXED: Process each page as potentially separate letter
+            # Process each page as potentially separate letter
             self.state_manager.process_letter_page(extraction, document_name, page_num)
             logger.info(f"Data from page {page_num} processed")
             
@@ -348,12 +375,12 @@ Follow this JSON schema precisely. Use `null` for any missing values.
         return None
 
     def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
-        """FIXED: Main orchestration method that properly handles multiple letters per PDF."""
+        """Main orchestration method that properly handles multiple letters per PDF."""
         pdf_path = Path(pdf_path)
         doc = None
         
         try:
-            logger.info(f"Starting FIXED extraction for: {pdf_path.name}")
+            logger.info(f"Starting extraction for: {pdf_path.name}")
             doc = fitz.open(str(pdf_path))
             
             image_dir = self.output_dir / self.config.document_type / pdf_path.stem
@@ -369,7 +396,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
             csv_path = image_dir / f"{pdf_path.stem}_data.csv"
             self.state_manager.start_csv(csv_path)
             
-            # FIXED: Single pass - process each page and detect letter boundaries automatically
+            # Process each page and detect letter boundaries automatically
             logger.info(f"Processing {len(indices)} pages with automatic letter detection...")
             successful_extractions = 0
             for i in indices:
@@ -381,7 +408,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                 if extraction:
                     successful_extractions += 1
             
-            # FIXED: Write all letters with their respective document fields
+            # Write all letters with their respective document fields
             total_rows = self.state_manager.write_all_letters()
             
             self.state_manager.close_csv()
@@ -397,7 +424,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
                 'csv_path': str(csv_path)
             }
             
-            logger.info(f"FIXED extraction completed successfully for {pdf_path.name}")
+            logger.info(f"Extraction completed successfully for {pdf_path.name}")
             logger.info(f"Detected {len(self.state_manager.all_letter_data)} separate letters with {total_rows} total rows")
             return result
             
@@ -420,7 +447,7 @@ def create_client():
     return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
 
 def run_healthcare_document_extraction(pdf_path: str, output_dir: str = "healthcare_extraction_output") -> Dict:
-    """FIXED: Run healthcare contract extraction that properly handles multiple letters per PDF."""
+    """Run healthcare contract extraction that properly handles multiple letters per PDF."""
     client = create_client()
     extractor = FixedDocumentExtractor(client=client, config=HEALTHCARE_CONTRACT_CONFIG, output_dir=output_dir)
     return extractor.extract_from_pdf(pdf_path)
@@ -437,21 +464,16 @@ if __name__ == "__main__":
         results = run_healthcare_document_extraction(pdf_file_path)
         
         print("\n" + "="*70)
-        print("FIXED HEALTHCARE CONTRACT EXTRACTION RESULTS")
+        print("HEALTHCARE CONTRACT EXTRACTION RESULTS")
         print("="*70)
         print(f"Document Type: {results.get('document_type', 'N/A')}")
         print(f"PDF: {results.get('pdf_name', 'N/A')}")
         print(f"Total Pages in PDF: {results.get('total_pages_in_pdf', 'N/A')}")
         print(f"Pages Processed: {results.get('pages_processed', 'N/A')}")
-        print(f"Letters Detected: {results.get('letters_detected', 'N/A')}")  # NEW
+        print(f"Letters Detected: {results.get('letters_detected', 'N/A')}")
         print(f"Total Rows Extracted: {results.get('total_rows', 'N/A')}")
         print(f"CSV Output: {results.get('csv_path', 'N/A')}")
         print("="*70)
-        print("\nFIX APPLIED:")
-        print("✓ Each letter now maintains its own document-level fields")
-        print("✓ notification_received_date won't be overwritten between letters")
-        print("✓ effective_date specific to each letter")
-        print("✓ contract_duration specific to each letter")
         
         if 'error' in results:
             print(f"Error: {results['error']}")
