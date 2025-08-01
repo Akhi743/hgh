@@ -264,11 +264,13 @@ class FixedDocumentExtractor:
         return f"""
 You are an expert data extraction AI. {self.config.extraction_instructions}
 
-### CRITICAL: NEW LETTER DETECTION
+### CRITICAL: NEW LETTER DETECTION AND BOUNDARIES
 - A NEW letter starts with "Dear..." greeting AND "We have received your letter/email" phrase
+- A letter ENDS with "Enclosure" or "Sincerely" - DO NOT extract any data that appears AFTER these closing words
 - If this page has BOTH "Dear..." and "We have received..." then extract ALL document-level fields
 - If this is a continuation page (no "Dear..." greeting), focus on table/facility rows and use null for document-level fields
-- ALWAYS extract document-level fields when you see a new letter starting
+- IGNORE any summary tables, rate sheets, or additional details that appear AFTER "Enclosure"
+- ONLY extract data from the actual letter content, NOT from supplementary materials
 
 ### EXTRACTION SCHEMA
 Follow this JSON schema precisely. Use `null` for any missing values.
@@ -276,7 +278,7 @@ Follow this JSON schema precisely. Use `null` for any missing values.
 #### Document-Level Fields (extract if this is a NEW letter with "Dear..." and "We have received..."):
 {doc_fields_str}
 
-#### Row-Level Fields (extract ALL facility rows from this page):
+#### Row-Level Fields (extract ALL facility rows from the LETTER ONLY, ignore post-Enclosure content):
 {row_fields_str}
 
 ### JSON OUTPUT SCHEMA:
