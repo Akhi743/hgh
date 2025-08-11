@@ -259,9 +259,9 @@ class EnterpriseFileDiscovery:
             logger.error(f"Critical error processing state {state_name}: {state_error}")
     
     def _process_single_hospital_folder(self, hospital_subfolder: Path, state_name: str, hospital_index: int, total_hospitals: int):
-        """Process all PDFs in a single hospital subfolder completely."""
+        """Process all PDFs in a single hospital subfolder completely - at ALL levels."""
         hospital_name = hospital_subfolder.name
-        logger.debug(f"    Starting processing of: {hospital_name}")
+        logger.debug(f"    Starting comprehensive processing of: {hospital_name}")
         
         try:
             # Check if we can access the folder first
@@ -273,49 +273,70 @@ class EnterpriseFileDiscovery:
                 logger.warning(f"    Hospital path is not a directory: {hospital_name}")
                 return
             
-            # Use multiple strategies to find ALL PDFs in this folder and all its subfolders
-            pdf_files = []
+            # Comprehensive PDF collection strategy - collect from ALL levels
+            all_pdf_files = []
             processed_paths = set()
             
-            # Strategy 1: Try recursive search (most comprehensive)
+            # Step 1: Get PDFs directly in the main hospital folder
+            direct_pdfs = []
             try:
-                logger.debug(f"    Attempting recursive PDF search in {hospital_name}")
-                recursive_pdfs = list(hospital_subfolder.rglob("*.pdf"))
-                for pdf in recursive_pdfs:
-                    if str(pdf) not in processed_paths:
-                        pdf_files.append(pdf)
-                        processed_paths.add(str(pdf))
-                logger.info(f"    Recursive search found {len(recursive_pdfs)} PDFs in {hospital_name}")
+                for item in hospital_subfolder.iterdir():
+                    if item.is_file() and item.suffix.lower() == '.pdf':
+                        if str(item) not in processed_paths:
+                            direct_pdfs.append(item)
+                            processed_paths.add(str(item))
                 
-                if len(recursive_pdfs) > 0:
-                    # Log first few PDF names for debugging
-                    sample_pdfs = recursive_pdfs[:3]
-                    for pdf in sample_pdfs:
-                        logger.debug(f"      Sample PDF: {pdf.name}")
+                logger.debug(f"    Found {len(direct_pdfs)} PDFs directly in {hospital_name}")
+                all_pdf_files.extend(direct_pdfs)
                 
             except Exception as e:
-                logger.warning(f"    Recursive search failed for {hospital_name}: {e}")
-                
-                # Strategy 2: Manual deep traversal (fallback for path issues)
-                try:
-                    logger.debug(f"    Attempting manual traversal in {hospital_name}")
-                    pdf_files = self._manual_pdf_search(hospital_subfolder, processed_paths)
-                    logger.info(f"    Manual traversal found {len(pdf_files)} PDFs in {hospital_name}")
-                except Exception as e2:
-                    logger.error(f"    Manual traversal also failed for {hospital_name}: {e2}")
+                logger.debug(f"    Error getting direct PDFs from {hospital_name}: {e}")
             
-            if not pdf_files:
-                logger.info(f"    No PDFs found in {hospital_name}")
+            # Step 2: Get PDFs from ALL subfolders (including Supplemental Documents, etc.)
+            subfolder_pdfs = []
+            try:
+                for item in hospital_subfolder.iterdir():
+                    if item.is_dir():
+                        logger.debug(f"      Scanning subfolder: {item.name}")
+                        subfolder_pdf_count = self._collect_pdfs_from_subfolder(item, processed_paths, subfolder_pdfs)
+                        if subfolder_pdf_count > 0:
+                            logger.debug(f"        Found {subfolder_pdf_count} PDFs in {item.name}")
+                
+                logger.debug(f"    Found {len(subfolder_pdfs)} PDFs in subfolders of {hospital_name}")
+                all_pdf_files.extend(subfolder_pdfs)
+                
+            except Exception as e:
+                logger.debug(f"    Error getting subfolder PDFs from {hospital_name}: {e}")
+            
+            # Step 3: Final verification - use recursive search as backup
+            if not all_pdf_files:
+                try:
+                    logger.debug(f"    No PDFs found with manual method, trying recursive search")
+                    recursive_pdfs = list(hospital_subfolder.rglob("*.pdf"))
+                    for pdf in recursive_pdfs:
+                        if str(pdf) not in processed_paths:
+                            all_pdf_files.append(pdf)
+                            processed_paths.add(str(pdf))
+                    logger.debug(f"    Recursive backup found {len(recursive_pdfs)} additional PDFs")
+                except Exception as e:
+                    logger.debug(f"    Recursive backup search failed: {e}")
+            
+            # Summary of discovery
+            total_found = len(all_pdf_files)
+            logger.info(f"    TOTAL PDFs found in {hospital_name}: {total_found}")
+            logger.info(f"      Direct PDFs: {len(direct_pdfs)}")
+            logger.info(f"      Subfolder PDFs: {len(subfolder_pdfs)}")
+            
+            if total_found == 0:
+                logger.info(f"    No PDFs found anywhere in {hospital_name}")
                 return
             
-            logger.info(f"    Processing {len(pdf_files)} PDFs in {hospital_name}")
-            
-            # Process each PDF sequentially with detailed logging
+            # Process all collected PDFs
             processed_count = 0
             failed_count = 0
             
-            for pdf_index, pdf_file in enumerate(pdf_files, 1):
-                logger.debug(f"      Processing PDF {pdf_index}/{len(pdf_files)}: {pdf_file.name}")
+            for pdf_index, pdf_file in enumerate(all_pdf_files, 1):
+                logger.debug(f"      Processing PDF {pdf_index}/{total_found}: {pdf_file.name}")
                 
                 try:
                     # Verify file still exists and is accessible
@@ -359,17 +380,39 @@ class EnterpriseFileDiscovery:
             
             # Detailed summary for this hospital folder
             logger.info(f"    Completed {hospital_name}:")
-            logger.info(f"      PDFs found: {len(pdf_files)}")
+            logger.info(f"      Total PDFs discovered: {total_found}")
             logger.info(f"      PDFs processed successfully: {processed_count}")
             logger.info(f"      PDFs failed: {failed_count}")
             
-            if processed_count == 0 and len(pdf_files) > 0:
-                logger.warning(f"    WARNING: Found {len(pdf_files)} PDFs but processed 0 successfully!")
+            if processed_count == 0 and total_found > 0:
+                logger.warning(f"    WARNING: Found {total_found} PDFs but processed 0 successfully!")
             
         except Exception as e:
             logger.error(f"    Critical error processing hospital folder {hospital_name}: {e}")
             logger.error(f"    Error type: {type(e).__name__}")
             return
+    
+    def _collect_pdfs_from_subfolder(self, subfolder_path: Path, processed_paths: set, pdf_list: List[Path]) -> int:
+        """Recursively collect all PDFs from a subfolder and its subdirectories."""
+        pdf_count = 0
+        
+        try:
+            # First get PDFs directly in this subfolder
+            for item in subfolder_path.iterdir():
+                if item.is_file() and item.suffix.lower() == '.pdf':
+                    if str(item) not in processed_paths:
+                        pdf_list.append(item)
+                        processed_paths.add(str(item))
+                        pdf_count += 1
+                elif item.is_dir():
+                    # Recursively process subdirectories
+                    sub_count = self._collect_pdfs_from_subfolder(item, processed_paths, pdf_list)
+                    pdf_count += sub_count
+                    
+        except Exception as e:
+            logger.debug(f"        Error processing subfolder {subfolder_path.name}: {e}")
+        
+        return pdf_count
     
     def _manual_pdf_search(self, folder_path: Path, processed_paths: set) -> List[Path]:
         """Manually search for PDFs with better error handling for problematic paths."""
