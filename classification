@@ -221,17 +221,24 @@ class EnterpriseFileDiscovery:
                         logger.info(f"\n  Processing Hospital {hospital_index}/{len(hospital_subfolders)}: {hospital_subfolder.name}")
                         
                         docs_before = len(self.discovered_documents)
-                        self._process_single_hospital_folder(hospital_subfolder, state_name, hospital_index, len(hospital_subfolders))
+                        
+                        # Process this hospital folder with better error handling
+                        try:
+                            self._process_single_hospital_folder(hospital_subfolder, state_name, hospital_index, len(hospital_subfolders))
+                        except Exception as processing_error:
+                            logger.error(f"    Error during processing: {processing_error}")
+                            continue
+                        
                         docs_after = len(self.discovered_documents)
                         docs_found = docs_after - docs_before
                         
                         if docs_found > 0:
-                            logger.info(f"    Found {docs_found} PDFs in {hospital_subfolder.name}")
+                            logger.info(f"    Successfully processed {docs_found} PDFs from {hospital_subfolder.name}")
                         else:
-                            logger.info(f"    No PDFs found in {hospital_subfolder.name}")
+                            logger.warning(f"    No PDFs were successfully processed from {hospital_subfolder.name}")
                     
                     except Exception as hospital_error:
-                        logger.error(f"    Error processing hospital {hospital_subfolder.name}: {hospital_error}")
+                        logger.error(f"    Error accessing hospital {hospital_subfolder.name}: {hospital_error}")
                         continue
                 
                 # Summary for this state
@@ -254,8 +261,18 @@ class EnterpriseFileDiscovery:
     def _process_single_hospital_folder(self, hospital_subfolder: Path, state_name: str, hospital_index: int, total_hospitals: int):
         """Process all PDFs in a single hospital subfolder completely."""
         hospital_name = hospital_subfolder.name
+        logger.debug(f"    Starting processing of: {hospital_name}")
         
         try:
+            # Check if we can access the folder first
+            if not hospital_subfolder.exists():
+                logger.warning(f"    Hospital folder does not exist: {hospital_name}")
+                return
+            
+            if not hospital_subfolder.is_dir():
+                logger.warning(f"    Hospital path is not a directory: {hospital_name}")
+                return
+            
             # Use multiple strategies to find ALL PDFs in this folder and all its subfolders
             pdf_files = []
             processed_paths = set()
@@ -268,57 +285,90 @@ class EnterpriseFileDiscovery:
                     if str(pdf) not in processed_paths:
                         pdf_files.append(pdf)
                         processed_paths.add(str(pdf))
-                logger.debug(f"    Recursive search found {len(recursive_pdfs)} PDFs")
+                logger.info(f"    Recursive search found {len(recursive_pdfs)} PDFs in {hospital_name}")
+                
+                if len(recursive_pdfs) > 0:
+                    # Log first few PDF names for debugging
+                    sample_pdfs = recursive_pdfs[:3]
+                    for pdf in sample_pdfs:
+                        logger.debug(f"      Sample PDF: {pdf.name}")
+                
             except Exception as e:
-                logger.debug(f"    Recursive search failed: {e}")
-            
-            # Strategy 2: Manual deep traversal (fallback for path issues)
-            if not pdf_files:
+                logger.warning(f"    Recursive search failed for {hospital_name}: {e}")
+                
+                # Strategy 2: Manual deep traversal (fallback for path issues)
                 try:
                     logger.debug(f"    Attempting manual traversal in {hospital_name}")
                     pdf_files = self._manual_pdf_search(hospital_subfolder, processed_paths)
-                    logger.debug(f"    Manual traversal found {len(pdf_files)} PDFs")
-                except Exception as e:
-                    logger.debug(f"    Manual traversal failed: {e}")
+                    logger.info(f"    Manual traversal found {len(pdf_files)} PDFs in {hospital_name}")
+                except Exception as e2:
+                    logger.error(f"    Manual traversal also failed for {hospital_name}: {e2}")
             
             if not pdf_files:
-                logger.debug(f"    No PDFs found in {hospital_name}")
+                logger.info(f"    No PDFs found in {hospital_name}")
                 return
             
-            logger.info(f"    Found {len(pdf_files)} PDFs to process in {hospital_name}")
+            logger.info(f"    Processing {len(pdf_files)} PDFs in {hospital_name}")
             
-            # Process each PDF sequentially
+            # Process each PDF sequentially with detailed logging
             processed_count = 0
+            failed_count = 0
+            
             for pdf_index, pdf_file in enumerate(pdf_files, 1):
                 logger.debug(f"      Processing PDF {pdf_index}/{len(pdf_files)}: {pdf_file.name}")
                 
                 try:
-                    if pdf_file.exists() and pdf_file.is_file():
-                        # Create document metadata
-                        doc_metadata = DocumentMetadata(
-                            file_path=pdf_file,
-                            source_path=str(pdf_file),
-                            pdf_name=pdf_file.name,
-                            state=state_name,
-                            file_size=pdf_file.stat().st_size,
-                            last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                        )
+                    # Verify file still exists and is accessible
+                    if not pdf_file.exists():
+                        logger.debug(f"        File no longer exists: {pdf_file.name}")
+                        failed_count += 1
+                        continue
                         
-                        self.discovered_documents.append(doc_metadata)
-                        processed_count += 1
-                        logger.debug(f"        Added: {pdf_file.name}")
-                    else:
-                        logger.debug(f"        Invalid file: {pdf_file.name}")
+                    if not pdf_file.is_file():
+                        logger.debug(f"        Not a file: {pdf_file.name}")
+                        failed_count += 1
+                        continue
+                    
+                    # Get file stats
+                    try:
+                        file_size = pdf_file.stat().st_size
+                        last_modified = datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                    except Exception as stat_error:
+                        logger.debug(f"        Cannot get file stats for {pdf_file.name}: {stat_error}")
+                        failed_count += 1
+                        continue
+                    
+                    # Create document metadata
+                    doc_metadata = DocumentMetadata(
+                        file_path=pdf_file,
+                        source_path=str(pdf_file),
+                        pdf_name=pdf_file.name,
+                        state=state_name,
+                        file_size=file_size,
+                        last_modified=last_modified
+                    )
+                    
+                    self.discovered_documents.append(doc_metadata)
+                    processed_count += 1
+                    logger.debug(f"        Successfully added: {pdf_file.name}")
                 
                 except Exception as pdf_error:
                     logger.debug(f"        Error processing {pdf_file.name}: {pdf_error}")
+                    failed_count += 1
                     continue
             
-            # Summary for this hospital folder
-            logger.info(f"    Completed {hospital_name}: Processed {processed_count}/{len(pdf_files)} PDFs successfully")
+            # Detailed summary for this hospital folder
+            logger.info(f"    Completed {hospital_name}:")
+            logger.info(f"      PDFs found: {len(pdf_files)}")
+            logger.info(f"      PDFs processed successfully: {processed_count}")
+            logger.info(f"      PDFs failed: {failed_count}")
+            
+            if processed_count == 0 and len(pdf_files) > 0:
+                logger.warning(f"    WARNING: Found {len(pdf_files)} PDFs but processed 0 successfully!")
             
         except Exception as e:
-            logger.error(f"    Error processing hospital folder {hospital_name}: {e}")
+            logger.error(f"    Critical error processing hospital folder {hospital_name}: {e}")
+            logger.error(f"    Error type: {type(e).__name__}")
             return
     
     def _manual_pdf_search(self, folder_path: Path, processed_paths: set) -> List[Path]:
