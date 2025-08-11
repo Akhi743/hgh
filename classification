@@ -248,12 +248,12 @@ class EnterpriseFileDiscovery:
                         )
                         
                         self.discovered_documents.append(doc_metadata)
-                        logger.debug(f"        ✓ Added: {pdf_file.name}")
+                        logger.debug(f"        Added: {pdf_file.name}")
                     else:
-                        logger.debug(f"        ✗ Invalid file: {pdf_file.name}")
+                        logger.debug(f"        Invalid file: {pdf_file.name}")
                 
                 except Exception as pdf_error:
-                    logger.debug(f"        ✗ Error processing {pdf_file.name}: {pdf_error}")
+                    logger.debug(f"        Error processing {pdf_file.name}: {pdf_error}")
                     continue
             
             # Summary for this hospital folder
@@ -520,28 +520,28 @@ class HealthcareDocumentClassifier:
                         if classification_result.is_relevant:
                             doc.classification_result = "relevant"
                             relevant_docs.append(doc)
-                            logger.info(f"      ✓ RELEVANT: {doc.pdf_name} (Effective: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
+                            logger.info(f"      RELEVANT: {doc.pdf_name} (Effective: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
                         else:
                             # Determine specific rejection reason
                             if "Stage 1" in classification_result.stage_failed:
                                 doc.classification_result = "not_healthcare"
                                 not_healthcare_docs.append(doc)
-                                logger.info(f"      ✗ Not healthcare contract: {doc.pdf_name}")
+                                logger.info(f"      Not healthcare contract: {doc.pdf_name}")
                             elif "before 2020" in classification_result.stage_failed:
                                 doc.classification_result = "old_date"
                                 old_date_docs.append(doc)
-                                logger.info(f"      ✗ Old date: {doc.pdf_name} ({doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
+                                logger.info(f"      Old date: {doc.pdf_name} ({doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
                             elif "No effective date" in classification_result.stage_failed:
                                 doc.classification_result = "no_date"
                                 no_date_docs.append(doc)
-                                logger.info(f"      ✗ No effective date: {doc.pdf_name}")
+                                logger.info(f"      No effective date: {doc.pdf_name}")
                             else:
                                 doc.classification_result = "not_relevant"
                                 not_healthcare_docs.append(doc)
-                                logger.info(f"      ✗ Not relevant: {doc.pdf_name}")
+                                logger.info(f"      Not relevant: {doc.pdf_name}")
                             
                     except Exception as e:
-                        logger.error(f"      ✗ Classification failed: {doc.pdf_name} - {e}")
+                        logger.error(f"      Classification failed: {doc.pdf_name} - {e}")
                         doc.classification_status = "failed"
                         doc.classification_result = "failed"
                         doc.error_message = str(e)
