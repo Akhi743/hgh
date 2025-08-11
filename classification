@@ -1,0 +1,792 @@
+import fitz
+import csv
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Tuple
+from google.genai import types
+import google.genai as genai
+from datetime import datetime
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dateutil import parser
+import re
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('healthcare_classification.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# DATA STRUCTURES
+# ==========================================
+
+@dataclass
+class DocumentMetadata:
+    """Metadata for each discovered document."""
+    file_path: Path
+    source_path: str
+    pdf_name: str
+    state: str
+    file_size: int
+    last_modified: datetime
+    classification_status: str = "pending"
+    classification_result: str = "unknown"
+    detected_on_page: Optional[int] = None
+    effective_date: Optional[datetime] = None
+    stage_failed: str = ""
+    confidence_score: float = 0.0
+    processing_time: float = 0.0
+    error_message: str = ""
+
+@dataclass
+class HealthcareContractResult:
+    """Result from Stage 1: Healthcare contract detection."""
+    is_relevant: bool
+    confidence: float
+    ai_response: str
+
+@dataclass
+class EffectiveDateResult:
+    """Result from Stage 2: Effective date validation."""
+    is_valid: bool
+    date: Optional[datetime]
+    reason: str
+    raw_date_text: str = ""
+
+@dataclass
+class ClassificationResult:
+    """Final classification result."""
+    is_relevant: bool
+    detected_on_page: Optional[int] = None
+    effective_date: Optional[datetime] = None
+    stage_failed: str = ""
+    stage_passed: str = ""
+    confidence: float = 0.0
+    processing_time: float = 0.0
+    total_pages_checked: int = 0
+
+# ==========================================
+# CLASSIFICATION CONFIGURATION
+# ==========================================
+
+class ClassificationConfig:
+    """Configuration for healthcare document classification."""
+    
+    def __init__(self):
+        # File discovery settings
+        self.agreements_folder = "AGREEMENTS-NON STANDARD"
+        self.hospital_subfolder = "HOSPITAL"
+        self.target_extensions = ['.pdf']
+        
+        # Page analysis settings
+        self.first_pages_count = 10
+        self.last_pages_count = 10
+        self.image_dpi = 150
+        
+        # Date filtering
+        self.min_effective_year = 2020
+        
+        # Processing settings
+        self.max_workers = 3
+        
+        # US States list for folder identification
+        self.us_states = {
+            'ALABAMA', 'ALASKA', 'ARIZONA', 'ARKANSAS', 'CALIFORNIA',
+            'COLORADO', 'CONNECTICUT', 'DELAWARE', 'FLORIDA', 'GEORGIA',
+            'HAWAII', 'IDAHO', 'ILLINOIS', 'INDIANA', 'IOWA',
+            'KANSAS', 'KENTUCKY', 'LOUISIANA', 'MAINE', 'MARYLAND',
+            'MASSACHUSETTS', 'MICHIGAN', 'MINNESOTA', 'MISSISSIPPI', 'MISSOURI',
+            'MONTANA', 'NEBRASKA', 'NEVADA', 'NEW HAMPSHIRE', 'NEW JERSEY',
+            'NEW MEXICO', 'NEW YORK', 'NORTH CAROLINA', 'NORTH DAKOTA', 'OHIO',
+            'OKLAHOMA', 'OREGON', 'PENNSYLVANIA', 'RHODE ISLAND', 'SOUTH CAROLINA',
+            'SOUTH DAKOTA', 'TENNESSEE', 'TEXAS', 'UTAH', 'VERMONT',
+            'VIRGINIA', 'WASHINGTON', 'WEST VIRGINIA', 'WISCONSIN', 'WYOMING',
+            'PUERTO RICO', 'DISTRICT OF COLUMBIA'
+        }
+        
+        # AI Prompts
+        self.healthcare_contract_prompt = """Analyze the image. Is this a formal letter from Aetna about a 'charge master increase' where they state 'we have received' a notification? Answer only YES or NO."""
+        
+        self.effective_date_prompt = """This is an Aetna charge master increase letter. Find the EFFECTIVE DATE mentioned in the letter (phrases like "effective January 1, 2024" or "to become effective 1/1/2025").
+
+Respond with just the date found, or "NOT_FOUND" if no effective date exists.
+
+Examples:
+- January 1, 2024
+- 1/1/2025
+- NOT_FOUND"""
+
+# ==========================================
+# FILE DISCOVERY SYSTEM
+# ==========================================
+
+class EnterpriseFileDiscovery:
+    """Discovers all healthcare documents in enterprise folder structure."""
+    
+    def __init__(self, root_path: str, config: ClassificationConfig):
+        self.root_path = Path(root_path)
+        self.config = config
+        self.discovered_documents: List[DocumentMetadata] = []
+        
+    def discover_all_documents(self) -> List[DocumentMetadata]:
+        """Discover all PDFs following enterprise folder structure."""
+        logger.info(f"Starting document discovery from: {self.root_path}")
+        
+        agreements_path = self.root_path / self.config.agreements_folder
+        if not agreements_path.exists():
+            logger.error(f"{self.config.agreements_folder} folder not found at: {agreements_path}")
+            return []
+        
+        total_states = 0
+        
+        # Walk through potential state folders
+        for folder in agreements_path.iterdir():
+            if not folder.is_dir():
+                continue
+                
+            # Check if this is a state folder
+            if self._is_state_folder(folder):
+                state_name = folder.name
+                total_states += 1
+                logger.info(f"Processing state {total_states}: {state_name}")
+                
+                # Look for HOSPITAL subfolder
+                hospital_folder_path = folder / self.config.hospital_subfolder
+                if hospital_folder_path.exists():
+                    self._process_hospital_directory(hospital_folder_path, state_name)
+                else:
+                    logger.warning(f"No {self.config.hospital_subfolder} folder found in state: {state_name}")
+            else:
+                logger.debug(f"Skipping non-state folder: {folder.name}")
+                
+        logger.info(f"Discovery completed:")
+        logger.info(f"  States processed: {total_states}")
+        logger.info(f"  Total documents found: {len(self.discovered_documents)}")
+        
+        return self.discovered_documents
+    
+    def _is_state_folder(self, folder_path: Path) -> bool:
+        """Identify state folders by checking for US state names."""
+        folder_name = folder_path.name.upper()
+        
+        # Check if any US state name appears in folder name
+        return any(state in folder_name for state in self.config.us_states)
+    
+    def _process_hospital_directory(self, hospital_path: Path, state_name: str):
+        """Process all PDF files in HOSPITAL directory and subdirectories."""
+        try:
+            # Find all PDFs recursively
+            for pdf_file in hospital_path.rglob("*.pdf"):
+                # Create document metadata
+                doc_metadata = DocumentMetadata(
+                    file_path=pdf_file,
+                    source_path=str(pdf_file),  # Full path structure
+                    pdf_name=pdf_file.name,    # Just filename
+                    state=state_name,
+                    file_size=pdf_file.stat().st_size,
+                    last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                )
+                
+                self.discovered_documents.append(doc_metadata)
+                logger.debug(f"Found: {pdf_file.name} in {state_name}")
+                
+        except Exception as e:
+            logger.error(f"Error processing hospital directory {hospital_path}: {e}")
+
+# ==========================================
+# TWO-STAGE DOCUMENT CLASSIFIER
+# ==========================================
+
+class HealthcareDocumentClassifier:
+    """Two-stage AI-powered healthcare document classifier."""
+    
+    def __init__(self, client, config: ClassificationConfig):
+        self.client = client
+        self.config = config
+        self.classification_cache = {}
+        
+    def classify_all_documents(self, documents: List[DocumentMetadata], 
+                             max_workers: int = 3) -> Dict[str, List[DocumentMetadata]]:
+        """Classify all documents using two-stage process."""
+        logger.info(f"Starting two-stage classification of {len(documents)} documents")
+        logger.info(f"Stage 1: Healthcare contract detection")
+        logger.info(f"Stage 2: Effective date validation (2020+)")
+        
+        relevant_docs = []
+        not_healthcare_docs = []
+        old_date_docs = []
+        no_date_docs = []
+        failed_docs = []
+        
+        processed_count = 0
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all classification tasks
+            future_to_doc = {
+                executor.submit(self._classify_single_document, doc): doc 
+                for doc in documents
+            }
+            
+            # Process completed classifications
+            for future in as_completed(future_to_doc):
+                doc = future_to_doc[future]
+                processed_count += 1
+                
+                try:
+                    classification_result = future.result()
+                    
+                    # Update document metadata
+                    doc.classification_status = "completed"
+                    doc.confidence_score = classification_result.confidence
+                    doc.detected_on_page = classification_result.detected_on_page
+                    doc.effective_date = classification_result.effective_date
+                    doc.stage_failed = classification_result.stage_failed
+                    doc.processing_time = classification_result.processing_time
+                    
+                    if classification_result.is_relevant:
+                        doc.classification_result = "relevant"
+                        relevant_docs.append(doc)
+                        logger.info(f"RELEVANT [{processed_count}/{len(documents)}]: {doc.pdf_name} "
+                                  f"(State: {doc.state}, Effective: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
+                    else:
+                        # Determine specific rejection reason
+                        if "Stage 1" in classification_result.stage_failed:
+                            doc.classification_result = "not_healthcare"
+                            not_healthcare_docs.append(doc)
+                        elif "before 2020" in classification_result.stage_failed:
+                            doc.classification_result = "old_date"
+                            old_date_docs.append(doc)
+                        elif "No effective date" in classification_result.stage_failed:
+                            doc.classification_result = "no_date"
+                            no_date_docs.append(doc)
+                        else:
+                            doc.classification_result = "not_relevant"
+                            not_healthcare_docs.append(doc)
+                            
+                        logger.debug(f"Rejected [{processed_count}/{len(documents)}]: {doc.pdf_name} - {classification_result.stage_failed}")
+                        
+                except Exception as e:
+                    logger.error(f"Classification failed [{processed_count}/{len(documents)}] for {doc.pdf_name}: {e}")
+                    doc.classification_status = "failed"
+                    doc.classification_result = "failed"
+                    doc.error_message = str(e)
+                    failed_docs.append(doc)
+        
+        logger.info(f"Two-stage classification completed:")
+        logger.info(f"  Relevant (healthcare + 2020+ date): {len(relevant_docs)}")
+        logger.info(f"  Not healthcare contracts: {len(not_healthcare_docs)}")
+        logger.info(f"  Old dates (before 2020): {len(old_date_docs)}")
+        logger.info(f"  No effective date found: {len(no_date_docs)}")
+        logger.info(f"  Failed classifications: {len(failed_docs)}")
+        
+        return {
+            'relevant': relevant_docs,
+            'not_healthcare': not_healthcare_docs,
+            'old_date': old_date_docs,
+            'no_date': no_date_docs,
+            'failed': failed_docs
+        }
+    
+    def _classify_single_document(self, doc: DocumentMetadata) -> ClassificationResult:
+        """Two-stage classification of a single document."""
+        start_time = time.time()
+        
+        try:
+            # Check cache first
+            cache_key = f"{doc.source_path}_{doc.last_modified.timestamp()}"
+            if cache_key in self.classification_cache:
+                cached_result = self.classification_cache[cache_key]
+                cached_result.processing_time = time.time() - start_time
+                return cached_result
+            
+            # Open PDF and determine pages to analyze
+            pdf_doc = fitz.open(str(doc.file_path))
+            total_pages = len(pdf_doc)
+            pages_to_check = self._get_pages_to_analyze(total_pages)
+            
+            # STAGE 1: Healthcare contract detection
+            for page_idx in pages_to_check:
+                page = pdf_doc.load_page(page_idx)
+                
+                # Check if this page contains healthcare contract
+                healthcare_result = self._check_healthcare_contract(page, page_idx + 1)
+                
+                if healthcare_result.is_relevant:
+                    # Found healthcare contract - proceed to Stage 2
+                    logger.debug(f"Healthcare contract found on page {page_idx + 1} of {doc.pdf_name}")
+                    
+                    # STAGE 2: Effective date validation
+                    date_result = self._check_effective_date_2020_plus(page, page_idx + 1)
+                    
+                    pdf_doc.close()
+                    
+                    if date_result.is_valid:
+                        # Both stages passed
+                        result = ClassificationResult(
+                            is_relevant=True,
+                            detected_on_page=page_idx + 1,
+                            effective_date=date_result.date,
+                            stage_passed="Both stages passed",
+                            confidence=0.85,
+                            processing_time=time.time() - start_time,
+                            total_pages_checked=pages_to_check.index(page_idx) + 1
+                        )
+                    else:
+                        # Stage 1 passed, Stage 2 failed
+                        result = ClassificationResult(
+                            is_relevant=False,
+                            detected_on_page=page_idx + 1,
+                            effective_date=date_result.date,
+                            stage_failed=f"Stage 2: {date_result.reason}",
+                            confidence=0.85,
+                            processing_time=time.time() - start_time,
+                            total_pages_checked=pages_to_check.index(page_idx) + 1
+                        )
+                    
+                    # Cache and return result
+                    self.classification_cache[cache_key] = result
+                    return result
+            
+            # Stage 1 failed - not a healthcare contract
+            pdf_doc.close()
+            result = ClassificationResult(
+                is_relevant=False,
+                stage_failed="Stage 1: Not a healthcare contract",
+                confidence=0.9,
+                processing_time=time.time() - start_time,
+                total_pages_checked=len(pages_to_check)
+            )
+            
+            self.classification_cache[cache_key] = result
+            return result
+            
+        except Exception as e:
+            logger.error(f"Classification error for {doc.pdf_name}: {e}")
+            return ClassificationResult(
+                is_relevant=False,
+                stage_failed=f"Processing error: {str(e)}",
+                confidence=0.0,
+                processing_time=time.time() - start_time
+            )
+    
+    def _get_pages_to_analyze(self, total_pages: int) -> List[int]:
+        """Determine which pages to analyze (first 10 + last 10)."""
+        if total_pages <= 20:
+            # Small document - check all pages
+            return list(range(total_pages))
+        else:
+            # Large document - first 10 + last 10
+            first_pages = list(range(self.config.first_pages_count))
+            last_pages = list(range(total_pages - self.config.last_pages_count, total_pages))
+            return first_pages + last_pages
+    
+    def _check_healthcare_contract(self, page, page_number: int) -> HealthcareContractResult:
+        """Stage 1: Check if page contains healthcare contract."""
+        try:
+            # Convert page to image
+            mat = fitz.Matrix(self.config.image_dpi / 72, self.config.image_dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            image_bytes = pix.tobytes("png")
+            
+            # AI classification
+            response = self.client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/png'),
+                    self.config.healthcare_contract_prompt
+                ]
+            )
+            
+            ai_answer = response.text.strip().upper()
+            
+            return HealthcareContractResult(
+                is_relevant='YES' in ai_answer,
+                confidence=0.85 if 'YES' in ai_answer else 0.8,
+                ai_response=ai_answer
+            )
+            
+        except Exception as e:
+            logger.error(f"Healthcare contract check failed on page {page_number}: {e}")
+            return HealthcareContractResult(
+                is_relevant=False,
+                confidence=0.0,
+                ai_response=f"Error: {str(e)}"
+            )
+    
+    def _check_effective_date_2020_plus(self, page, page_number: int) -> EffectiveDateResult:
+        """Stage 2: Extract effective date and validate it's 2020+."""
+        try:
+            # Convert page to image
+            mat = fitz.Matrix(self.config.image_dpi / 72, self.config.image_dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            image_bytes = pix.tobytes("png")
+            
+            # AI date extraction
+            response = self.client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/png'),
+                    self.config.effective_date_prompt
+                ]
+            )
+            
+            date_text = response.text.strip()
+            
+            if date_text == "NOT_FOUND":
+                return EffectiveDateResult(
+                    is_valid=False,
+                    date=None,
+                    reason="No effective date found in document",
+                    raw_date_text=date_text
+                )
+            
+            # Parse the extracted date
+            parsed_date = self._parse_date_string(date_text)
+            
+            if parsed_date is None:
+                return EffectiveDateResult(
+                    is_valid=False,
+                    date=None,
+                    reason=f"Could not parse date: {date_text}",
+                    raw_date_text=date_text
+                )
+            
+            if parsed_date.year >= self.config.min_effective_year:
+                return EffectiveDateResult(
+                    is_valid=True,
+                    date=parsed_date,
+                    reason=f"Valid effective date: {parsed_date.year}",
+                    raw_date_text=date_text
+                )
+            else:
+                return EffectiveDateResult(
+                    is_valid=False,
+                    date=parsed_date,
+                    reason=f"Effective date before 2020: {parsed_date.year}",
+                    raw_date_text=date_text
+                )
+                
+        except Exception as e:
+            logger.error(f"Effective date check failed on page {page_number}: {e}")
+            return EffectiveDateResult(
+                is_valid=False,
+                date=None,
+                reason=f"Date extraction error: {str(e)}",
+                raw_date_text=""
+            )
+    
+    def _parse_date_string(self, date_str: str) -> Optional[datetime]:
+        """Parse various date formats to datetime object."""
+        try:
+            # Try dateutil parser first (handles most formats)
+            return parser.parse(date_str)
+        except:
+            try:
+                # Try common manual patterns
+                patterns = [
+                    (r'(\d{1,2})/(\d{1,2})/(\d{4})', '%m/%d/%Y'),      # MM/DD/YYYY
+                    (r'(\d{4})-(\d{1,2})-(\d{1,2})', '%Y-%m-%d'),      # YYYY-MM-DD
+                    (r'(\d{1,2})-(\d{1,2})-(\d{4})', '%m-%d-%Y'),      # MM-DD-YYYY
+                ]
+                
+                for pattern, format_str in patterns:
+                    match = re.search(pattern, date_str)
+                    if match:
+                        return datetime.strptime(match.group(), format_str)
+                
+                return None
+            except:
+                return None
+
+# ==========================================
+# ENTERPRISE HEALTHCARE CLASSIFICATION SYSTEM
+# ==========================================
+
+class EnterpriseHealthcareClassificationSystem:
+    """Main system for enterprise healthcare document classification."""
+    
+    def __init__(self, client, output_dir: str = "healthcare_classification_results"):
+        self.client = client
+        self.config = ClassificationConfig()
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Processing statistics
+        self.stats = {
+            'start_time': None,
+            'end_time': None,
+            'total_documents_found': 0,
+            'total_states_processed': 0,
+            'relevant_documents_found': 0,
+            'classification_failures': 0,
+            'total_processing_time': 0.0
+        }
+    
+    def classify_enterprise_healthcare_documents(self, root_folder_path: str, 
+                                               max_workers: int = 3) -> Dict[str, Any]:
+        """Main method to discover and classify all healthcare documents."""
+        
+        self.stats['start_time'] = datetime.now()
+        logger.info("ENTERPRISE HEALTHCARE DOCUMENT CLASSIFICATION STARTED")
+        
+        try:
+            # PHASE 1: Document Discovery
+            logger.info("PHASE 1: Discovering healthcare documents...")
+            file_discovery = EnterpriseFileDiscovery(root_folder_path, self.config)
+            all_documents = file_discovery.discover_all_documents()
+            
+            if not all_documents:
+                logger.error("No documents found! Check the folder structure.")
+                return self.stats
+            
+            self.stats['total_documents_found'] = len(all_documents)
+            self.stats['total_states_processed'] = len(set(doc.state for doc in all_documents))
+            
+            # PHASE 2: Two-Stage AI Classification
+            logger.info("PHASE 2: Two-stage healthcare document classification...")
+            classifier = HealthcareDocumentClassifier(self.client, self.config)
+            classification_results = classifier.classify_all_documents(
+                all_documents, max_workers=max_workers
+            )
+            
+            relevant_docs = classification_results['relevant']
+            self.stats['relevant_documents_found'] = len(relevant_docs)
+            self.stats['classification_failures'] = len(classification_results['failed'])
+            
+            # PHASE 3: Save Results
+            logger.info("PHASE 3: Saving classification results...")
+            
+            # Save detailed classification report
+            self._save_detailed_classification_report(all_documents)
+            
+            # Save relevant documents list
+            relevant_files_list = self._save_relevant_documents_list(relevant_docs)
+            
+            # Generate summary statistics
+            self._generate_classification_summary(all_documents, classification_results)
+            
+            self.stats['end_time'] = datetime.now()
+            self.stats['total_processing_time'] = (
+                self.stats['end_time'] - self.stats['start_time']
+            ).total_seconds()
+            
+            logger.info("ENTERPRISE HEALTHCARE CLASSIFICATION COMPLETED")
+            self._print_final_statistics()
+            
+            return {
+                **self.stats,
+                'relevant_documents_list': relevant_files_list,
+                'classification_results': classification_results,
+                'output_directory': str(self.output_dir)
+            }
+            
+        except Exception as e:
+            logger.error(f"Critical error in healthcare classification system: {e}")
+            return {**self.stats, 'critical_error': str(e)}
+    
+    def _save_detailed_classification_report(self, all_documents: List[DocumentMetadata]):
+        """Save comprehensive classification report as CSV."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        report_path = self.output_dir / f"healthcare_classification_report_{timestamp}.csv"
+        
+        with open(report_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            # CSV Headers
+            writer.writerow([
+                'source_path', 'pdf_name', 'state', 'file_size_mb', 'last_modified',
+                'classification_result', 'confidence_score', 'detected_on_page',
+                'effective_date', 'stage_failed', 'processing_time_seconds', 'error_message'
+            ])
+            
+            # Write data for each document
+            for doc in all_documents:
+                writer.writerow([
+                    doc.source_path,
+                    doc.pdf_name,
+                    doc.state,
+                    round(doc.file_size / (1024*1024), 2),  # Convert to MB
+                    doc.last_modified.strftime('%Y-%m-%d %H:%M:%S'),
+                    doc.classification_result,
+                    doc.confidence_score,
+                    doc.detected_on_page or '',
+                    doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '',
+                    doc.stage_failed,
+                    round(doc.processing_time, 2),
+                    doc.error_message
+                ])
+        
+        logger.info(f"Detailed classification report saved: {report_path}")
+        return report_path
+    
+    def _save_relevant_documents_list(self, relevant_docs: List[DocumentMetadata]) -> str:
+        """Save list of relevant document paths for extraction processing."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Save as simple text file (one path per line) - for your extraction code
+        txt_path = self.output_dir / f"relevant_healthcare_documents_{timestamp}.txt"
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            for doc in relevant_docs:
+                f.write(f"{doc.source_path}\n")
+        
+        # Save as JSON with metadata
+        json_path = self.output_dir / f"relevant_healthcare_detailed_{timestamp}.json"
+        relevant_data = []
+        for doc in relevant_docs:
+            relevant_data.append({
+                'source_path': doc.source_path,
+                'pdf_name': doc.pdf_name,
+                'state': doc.state,
+                'effective_date': doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else None,
+                'detected_on_page': doc.detected_on_page,
+                'confidence_score': doc.confidence_score
+            })
+        
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(relevant_data, f, indent=2)
+        
+        logger.info(f"Relevant healthcare documents saved:")
+        logger.info(f"  Text file (for extraction): {txt_path}")
+        logger.info(f"  JSON file (with metadata): {json_path}")
+        
+        return str(txt_path)
+    
+    def _generate_classification_summary(self, all_documents: List[DocumentMetadata], 
+                                       classification_results: Dict[str, List[DocumentMetadata]]):
+        """Generate summary statistics by state and classification result."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        summary_path = self.output_dir / f"healthcare_classification_summary_{timestamp}.json"
+        
+        # Aggregate statistics
+        state_stats = {}
+        year_stats = {}
+        
+        for doc in all_documents:
+            # State-level stats
+            if doc.state not in state_stats:
+                state_stats[doc.state] = {
+                    'total_documents': 0,
+                    'relevant_documents': 0,
+                    'not_healthcare': 0,
+                    'old_date': 0,
+                    'no_date': 0,
+                    'failed': 0
+                }
+            
+            state_stats[doc.state]['total_documents'] += 1
+            state_stats[doc.state][doc.classification_result] += 1
+            
+            # Year-level stats for relevant documents
+            if doc.effective_date and doc.classification_result == 'relevant':
+                year = doc.effective_date.year
+                if year not in year_stats:
+                    year_stats[year] = 0
+                year_stats[year] += 1
+        
+        summary_data = {
+            'classification_timestamp': timestamp,
+            'overall_stats': {
+                'total_documents_processed': len(all_documents),
+                'relevant_healthcare_documents': len(classification_results['relevant']),
+                'not_healthcare_contracts': len(classification_results['not_healthcare']),
+                'old_dates_before_2020': len(classification_results['old_date']),
+                'no_effective_date_found': len(classification_results['no_date']),
+                'classification_failures': len(classification_results['failed']),
+                'total_states': len(state_stats),
+                'success_rate_percent': round(
+                    (len(all_documents) - len(classification_results['failed'])) / len(all_documents) * 100, 2
+                ) if all_documents else 0
+            },
+            'state_breakdown': state_stats,
+            'effective_date_years': dict(sorted(year_stats.items()))
+        }
+        
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2)
+        
+        logger.info(f"Classification summary saved: {summary_path}")
+    
+    def _print_final_statistics(self):
+        """Print comprehensive final statistics."""
+        print("\nENTERPRISE HEALTHCARE DOCUMENT CLASSIFICATION - FINAL RESULTS")
+        print("="*80)
+        print(f"Total Documents Found: {self.stats['total_documents_found']:,}")
+        print(f"States Processed: {self.stats['total_states_processed']:,}")
+        print(f"Relevant Healthcare Documents (2020+): {self.stats['relevant_documents_found']:,}")
+        print(f"Classification Failures: {self.stats['classification_failures']:,}")
+        print(f"Total Processing Time: {self.stats['total_processing_time']:.2f} seconds")
+        print(f"Success Rate: {((self.stats['total_documents_found'] - self.stats['classification_failures']) / self.stats['total_documents_found'] * 100):.1f}%" if self.stats['total_documents_found'] > 0 else "N/A")
+        print(f"Output Directory: {self.output_dir}")
+        print("="*80)
+
+# ==========================================
+# CLIENT SETUP & MAIN EXECUTION
+# ==========================================
+
+def create_client():
+    """Create Google AI client."""
+    return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+
+def run_enterprise_healthcare_classification(
+    root_folder_path: str,
+    output_dir: str = "healthcare_classification_results",
+    max_workers: int = 3
+) -> Dict[str, Any]:
+    """
+    Main function to run enterprise healthcare document classification.
+    
+    Args:
+        root_folder_path: Path to root folder containing AGREEMENTS-NON STANDARD
+        output_dir: Directory to save classification results
+        max_workers: Number of parallel workers for classification
+    
+    Returns:
+        Dictionary with classification results and statistics
+    """
+    
+    client = create_client()
+    classification_system = EnterpriseHealthcareClassificationSystem(
+        client=client,
+        output_dir=output_dir
+    )
+    
+    return classification_system.classify_enterprise_healthcare_documents(
+        root_folder_path=root_folder_path,
+        max_workers=max_workers
+    )
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+if __name__ == "__main__":
+    # Configure for your enterprise environment
+    ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"  # Your network path
+    OUTPUT_DIR = "healthcare_classification_results"
+    MAX_WORKERS = 3  # Adjust based on your system capacity
+    
+    try:
+        # Run the healthcare document classification
+        results = run_enterprise_healthcare_classification(
+            root_folder_path=ROOT_FOLDER_PATH,
+            output_dir=OUTPUT_DIR,
+            max_workers=MAX_WORKERS
+        )
+        
+        print("\nHEALTHCARE CLASSIFICATION COMPLETED SUCCESSFULLY!")
+        print(f"Check the output directory: {results.get('output_directory')}")
+        print(f"Use 'relevant_healthcare_documents_*.txt' with your extraction code")
+        print(f"Found {results.get('relevant_documents_found', 0)} relevant healthcare documents with 2020+ effective dates")
+        
+    except Exception as e:
+        logger.error(f"Critical error in main execution: {e}")
+        print(f"Error: {e}")
