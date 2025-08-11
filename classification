@@ -19,7 +19,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('healthcare_classification.log'),
+        logging.FileHandler('healthcare_classification.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -203,9 +203,9 @@ class EnterpriseFileDiscovery:
                 docs_found = docs_after - docs_before
                 
                 if docs_found > 0:
-                    logger.info(f"    ✓ Found {docs_found} PDFs in {hospital_subfolder.name}")
+                    logger.info(f"    Found {docs_found} PDFs in {hospital_subfolder.name}")
                 else:
-                    logger.info(f"    - No PDFs found in {hospital_subfolder.name}")
+                    logger.info(f"    No PDFs found in {hospital_subfolder.name}")
             
             # Summary for this state
             total_state_docs = sum(1 for doc in self.discovered_documents if doc.state == state_name)
@@ -996,7 +996,7 @@ class EnterpriseHealthcareClassificationSystem:
     
     def _print_final_statistics(self):
         """Print comprehensive final statistics."""
-        print("\nENTERPRISE HEALTHCARE DOCUMENT CLASSIFICATION - FINAL RESULTS")
+        print("ENTERPRISE HEALTHCARE DOCUMENT CLASSIFICATION - FINAL RESULTS")
         print("="*80)
         print(f"Total Documents Found: {self.stats['total_documents_found']:,}")
         print(f"States Processed: {self.stats['total_states_processed']:,}")
