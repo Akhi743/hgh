@@ -374,11 +374,28 @@ class EnterpriseFileDiscovery:
             # Remove any duplicates based on string path
             unique_pdf_paths = list(set(all_pdf_paths))
             
+            # =================================================================
+            # === SOLUTION: Add this block to handle long paths on Windows ===
+            # =================================================================
+            # Prepend the UNC path prefix for long path support
+            long_path_prefixed_pdfs = []
+            for path_str in unique_pdf_paths:
+                # Check if it's a network path and not already prefixed
+                if path_str.startswith('\\\\') and not path_str.startswith('\\\\?\\'):
+                    # The format is \\?\UNC\server\share\path...
+                    # So, \\server\share becomes \\?\UNC\server\share
+                    long_path_prefixed_pdfs.append('\\\\?\\UNC\\' + path_str[2:])
+                else:
+                    long_path_prefixed_pdfs.append(path_str)
+            
+            # Use the corrected list for further processing
+            unique_pdf_paths = long_path_prefixed_pdfs
+            # =================================================================
+            # ======================= END OF SOLUTION =========================
+            # =================================================================
+            
             total_found = len(unique_pdf_paths)
             logger.info(f"    TOTAL UNIQUE PDFs found in {hospital_name}: {total_found}")
-            logger.info(f"      Method 1 (direct glob): {len(method1_pdfs)}")
-            logger.info(f"      Method 2 (recursive): {len(method2_pdfs)}")
-            logger.info(f"      Method 3 (manual): {len(method3_pdfs)}")
             
             if total_found == 0:
                 logger.warning(f"    NO PDFs found anywhere in {hospital_name} using any method!")
@@ -495,237 +512,12 @@ class EnterpriseFileDiscovery:
             logger.error(f"    Error type: {type(e).__name__}")
             return
     
-    def _validate_pdfs_in_folder(self, folder_path: Path, processed_paths: set) -> List[str]:
-        """Recursively find and validate PDFs in a folder."""
-        validated_pdfs = []
-        
-        try:
-            # Get all PDFs in this folder recursively
-            potential_pdfs = list(folder_path.rglob("*.pdf"))
-            
-            for pdf in potential_pdfs:
-                try:
-                    pdf_str = str(pdf)
-                    # Validate each PDF exists and is accessible
-                    if os.path.exists(pdf_str) and os.path.isfile(pdf_str):
-                        if pdf_str not in processed_paths:
-                            validated_pdfs.append(pdf_str)
-                            processed_paths.add(pdf_str)
-                            logger.debug(f"        Validated subfolder PDF: {pdf.name}")
-                    else:
-                        logger.debug(f"        Skipped non-existent subfolder PDF: {pdf.name}")
-                except Exception as pdf_error:
-                    logger.debug(f"        Error validating PDF {pdf}: {pdf_error}")
-                    continue
-                    
-        except Exception as e:
-            logger.debug(f"        Error scanning folder {folder_path.name}: {e}")
-        
-        return validated_pdfs
-    
-    def _manual_pdf_search(self, folder_path: Path, processed_paths: set) -> List[Path]:
-        """Manually search for PDFs with better error handling for problematic paths."""
-        pdf_files = []
-        
-        try:
-            # First, get all PDFs directly in this folder
-            for item in folder_path.iterdir():
-                try:
-                    if item.is_file() and item.suffix.lower() == '.pdf':
-                        if str(item) not in processed_paths:
-                            pdf_files.append(item)
-                            processed_paths.add(str(item))
-                    elif item.is_dir():
-                        # Recursively search subfolders
-                        subfolder_pdfs = self._manual_pdf_search(item, processed_paths)
-                        pdf_files.extend(subfolder_pdfs)
-                except Exception as item_error:
-                    logger.debug(f"        Error processing item {item}: {item_error}")
-                    continue
-        except Exception as folder_error:
-            logger.debug(f"      Error listing folder {folder_path}: {folder_error}")
-        
-        return pdf_files
-    
-    def _process_potential_hospital_directory(self, directory_path: Path, state_name: str, subfolder_name: str):
-        """Process a directory that might contain hospital PDFs."""
-        try:
-            pdf_count = 0
-            # Look for PDFs in this directory and subdirectories
-            for pdf_file in directory_path.rglob("*.pdf"):
-                try:
-                    if pdf_file.exists() and pdf_file.is_file():
-                        doc_metadata = DocumentMetadata(
-                            file_path=pdf_file,
-                            source_path=str(pdf_file),
-                            pdf_name=pdf_file.name,
-                            state=state_name,
-                            file_size=pdf_file.stat().st_size,
-                            last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                        )
-                        
-                        self.discovered_documents.append(doc_metadata)
-                        pdf_count += 1
-                        logger.debug(f"Found PDF in {subfolder_name}: {pdf_file.name}")
-                
-                except Exception as file_error:
-                    logger.debug(f"Error processing file {pdf_file}: {file_error}")
-                    continue
-            
-            if pdf_count > 0:
-                logger.info(f"  SUCCESS: Found {pdf_count} PDFs in {state_name}/{subfolder_name}")
-            
-        except Exception as e:
-            logger.error(f"Error processing potential hospital directory {directory_path}: {e}")
-    
     def _is_state_folder(self, folder_path: Path) -> bool:
         """Identify state folders by checking for US state names."""
         folder_name = folder_path.name.upper()
         
         # Check if any US state name appears in folder name
         return any(state in folder_name for state in self.config.us_states)
-    
-    def _process_hospital_directory(self, hospital_path: Path, state_name: str):
-        """Process all PDF files in HOSPITAL directory and subdirectories."""
-        try:
-            # First, check if we can access the hospital directory
-            if not hospital_path.exists():
-                logger.warning(f"Hospital directory does not exist: {hospital_path}")
-                return
-                
-            if not hospital_path.is_dir():
-                logger.warning(f"Hospital path is not a directory: {hospital_path}")
-                return
-            
-            # Try to list the contents first with shorter path handling
-            try:
-                # Use a shorter path representation for Windows long path issues
-                hospital_path_str = str(hospital_path)
-                if len(hospital_path_str) > 200:
-                    logger.warning(f"Very long path detected for {state_name}: {len(hospital_path_str)} characters")
-                
-                items = list(hospital_path.iterdir())
-                logger.info(f"Hospital directory {state_name} contains {len(items)} items")
-                
-                # Log first few items to see what's there
-                for i, item in enumerate(items[:5]):
-                    item_type = "DIR" if item.is_dir() else "FILE"
-                    logger.info(f"  {item_type}: {item.name}")
-                if len(items) > 5:
-                    logger.info(f"  ... and {len(items) - 5} more items")
-                    
-            except PermissionError as pe:
-                logger.error(f"Permission denied accessing hospital directory for {state_name}: {pe}")
-                return
-            except OSError as ose:
-                logger.error(f"OS Error accessing hospital directory for {state_name}: {ose}")
-                return
-            except Exception as e:
-                logger.error(f"Cannot list contents of hospital directory for {state_name}: {e}")
-                return
-            
-            pdf_count = 0
-            processed_folders = 0
-            
-            # Process each item in the hospital directory
-            for item in items:
-                try:
-                    if item.is_dir():
-                        processed_folders += 1
-                        logger.debug(f"Processing hospital subfolder: {item.name}")
-                        
-                        # Look for PDFs in this hospital subfolder
-                        try:
-                            # Use non-recursive approach first for better compatibility
-                            subfolder_pdfs = list(item.glob("*.pdf"))
-                            if subfolder_pdfs:
-                                logger.info(f"  Found {len(subfolder_pdfs)} PDFs in {item.name}")
-                                
-                                for pdf_file in subfolder_pdfs:
-                                    try:
-                                        if pdf_file.exists() and pdf_file.is_file():
-                                            doc_metadata = DocumentMetadata(
-                                                file_path=pdf_file,
-                                                source_path=str(pdf_file),
-                                                pdf_name=pdf_file.name,
-                                                state=state_name,
-                                                file_size=pdf_file.stat().st_size,
-                                                last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                                            )
-                                            
-                                            self.discovered_documents.append(doc_metadata)
-                                            pdf_count += 1
-                                            logger.debug(f"Added PDF: {pdf_file.name}")
-                                    
-                                    except Exception as pdf_error:
-                                        logger.debug(f"Error processing PDF {pdf_file}: {pdf_error}")
-                                        continue
-                            
-                            # Also try recursive search in this subfolder (if non-recursive found some)
-                            if subfolder_pdfs:
-                                try:
-                                    recursive_pdfs = list(item.rglob("*.pdf"))
-                                    additional_pdfs = [p for p in recursive_pdfs if p not in subfolder_pdfs]
-                                    
-                                    if additional_pdfs:
-                                        logger.info(f"  Found {len(additional_pdfs)} additional PDFs in subfolders of {item.name}")
-                                        
-                                        for pdf_file in additional_pdfs:
-                                            try:
-                                                if pdf_file.exists() and pdf_file.is_file():
-                                                    doc_metadata = DocumentMetadata(
-                                                        file_path=pdf_file,
-                                                        source_path=str(pdf_file),
-                                                        pdf_name=pdf_file.name,
-                                                        state=state_name,
-                                                        file_size=pdf_file.stat().st_size,
-                                                        last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                                                    )
-                                                    
-                                                    self.discovered_documents.append(doc_metadata)
-                                                    pdf_count += 1
-                                            
-                                            except Exception as pdf_error:
-                                                logger.debug(f"Error processing recursive PDF {pdf_file}: {pdf_error}")
-                                                continue
-                                except Exception as recursive_error:
-                                    logger.debug(f"Recursive search failed for {item.name}: {recursive_error}")
-                        
-                        except Exception as subfolder_error:
-                            logger.debug(f"Error processing subfolder {item.name}: {subfolder_error}")
-                            continue
-                    
-                    elif item.is_file() and item.suffix.lower() == '.pdf':
-                        # Direct PDF in hospital folder
-                        try:
-                            doc_metadata = DocumentMetadata(
-                                file_path=item,
-                                source_path=str(item),
-                                pdf_name=item.name,
-                                state=state_name,
-                                file_size=item.stat().st_size,
-                                last_modified=datetime.fromtimestamp(item.stat().st_mtime)
-                            )
-                            
-                            self.discovered_documents.append(doc_metadata)
-                            pdf_count += 1
-                            logger.debug(f"Added direct PDF: {item.name}")
-                        
-                        except Exception as pdf_error:
-                            logger.debug(f"Error processing direct PDF {item}: {pdf_error}")
-                            continue
-                
-                except Exception as item_error:
-                    logger.debug(f"Error processing item {item}: {item_error}")
-                    continue
-            
-            logger.info(f"Successfully processed {state_name}: {processed_folders} hospital folders, {pdf_count} PDFs found")
-                
-        except Exception as e:
-            logger.error(f"Critical error processing hospital directory for {state_name}: {e}")
-            logger.error(f"Hospital path: {hospital_path}")
-            logger.error(f"Error type: {type(e).__name__}")
-            logger.error(f"Path length: {len(str(hospital_path))} characters")
 
 # ==========================================
 # TWO-STAGE DOCUMENT CLASSIFIER
@@ -740,7 +532,7 @@ class HealthcareDocumentClassifier:
         self.classification_cache = {}
         
     def classify_all_documents(self, documents: List[DocumentMetadata], 
-                             max_workers: int = 3) -> Dict[str, List[DocumentMetadata]]:
+                               max_workers: int = 3) -> Dict[str, List[DocumentMetadata]]:
         """Classify all documents using systematic sequential processing."""
         logger.info(f"Starting systematic two-stage classification of {len(documents)} documents")
         logger.info(f"Stage 1: Healthcare contract detection")
@@ -872,7 +664,7 @@ class HealthcareDocumentClassifier:
                 return cached_result
             
             # Open PDF and determine pages to analyze
-            pdf_doc = fitz.open(str(doc.file_path))
+            pdf_doc = fitz.open(str(doc.source_path)) # Use source_path which is long-path ready
             total_pages = len(pdf_doc)
             pages_to_check = self._get_pages_to_analyze(total_pages)
             
@@ -1056,9 +848,9 @@ class HealthcareDocumentClassifier:
             try:
                 # Try common manual patterns
                 patterns = [
-                    (r'(\d{1,2})/(\d{1,2})/(\d{4})', '%m/%d/%Y'),      # MM/DD/YYYY
-                    (r'(\d{4})-(\d{1,2})-(\d{1,2})', '%Y-%m-%d'),      # YYYY-MM-DD
-                    (r'(\d{1,2})-(\d{1,2})-(\d{4})', '%m-%d-%Y'),      # MM-DD-YYYY
+                    (r'(\d{1,2})/(\d{1,2})/(\d{4})', '%m/%d/%Y'),     # MM/DD/YYYY
+                    (r'(\d{4})-(\d{1,2})-(\d{1,2})', '%Y-%m-%d'),     # YYYY-MM-DD
+                    (r'(\d{1,2})-(\d{1,2})-(\d{4})', '%m-%d-%Y'),     # MM-DD-YYYY
                 ]
                 
                 for pattern, format_str in patterns:
@@ -1095,7 +887,7 @@ class EnterpriseHealthcareClassificationSystem:
         }
     
     def classify_enterprise_healthcare_documents(self, root_folder_path: str, 
-                                               max_workers: int = 3) -> Dict[str, Any]:
+                                                 max_workers: int = 3) -> Dict[str, Any]:
         """Main method to discover and classify all healthcare documents."""
         
         self.stats['start_time'] = datetime.now()
@@ -1224,7 +1016,7 @@ class EnterpriseHealthcareClassificationSystem:
         return str(txt_path)
     
     def _generate_classification_summary(self, all_documents: List[DocumentMetadata], 
-                                       classification_results: Dict[str, List[DocumentMetadata]]):
+                                         classification_results: Dict[str, List[DocumentMetadata]]):
         """Generate summary statistics by state and classification result."""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         summary_path = self.output_dir / f"healthcare_classification_summary_{timestamp}.json"
@@ -1238,7 +1030,7 @@ class EnterpriseHealthcareClassificationSystem:
             if doc.state not in state_stats:
                 state_stats[doc.state] = {
                     'total_documents': 0,
-                    'relevant_documents': 0,
+                    'relevant': 0,
                     'not_healthcare': 0,
                     'old_date': 0,
                     'no_date': 0,
@@ -1246,7 +1038,8 @@ class EnterpriseHealthcareClassificationSystem:
                 }
             
             state_stats[doc.state]['total_documents'] += 1
-            state_stats[doc.state][doc.classification_result] += 1
+            if doc.classification_result in state_stats[doc.state]:
+                state_stats[doc.state][doc.classification_result] += 1
             
             # Year-level stats for relevant documents
             if doc.effective_date and doc.classification_result == 'relevant':
@@ -1297,6 +1090,8 @@ class EnterpriseHealthcareClassificationSystem:
 
 def create_client():
     """Create Google AI client."""
+    # NOTE: Ensure your environment is authenticated. For Vertex AI, this might mean running
+    # `gcloud auth application-default login` in your terminal.
     return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
 
 def run_enterprise_healthcare_classification(
@@ -1333,6 +1128,7 @@ def run_enterprise_healthcare_classification(
 
 if __name__ == "__main__":
     # Configure for your enterprise environment
+    # IMPORTANT: Use a raw string (r"...") for Windows paths to avoid issues with backslashes.
     ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"  # Your network path
     OUTPUT_DIR = "healthcare_classification_results"
     MAX_WORKERS = 3  # Adjust based on your system capacity
