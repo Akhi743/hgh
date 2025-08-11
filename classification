@@ -138,41 +138,161 @@ class EnterpriseFileDiscovery:
         self.discovered_documents: List[DocumentMetadata] = []
         
     def discover_all_documents(self) -> List[DocumentMetadata]:
-        """Discover all PDFs following enterprise folder structure."""
-        logger.info(f"Starting document discovery from: {self.root_path}")
+        """Discover all PDFs following systematic state-by-state, hospital-by-hospital approach."""
+        logger.info(f"Starting systematic document discovery from: {self.root_path}")
         
         agreements_path = self.root_path / self.config.agreements_folder
         if not agreements_path.exists():
             logger.error(f"{self.config.agreements_folder} folder not found at: {agreements_path}")
             return []
         
-        total_states = 0
+        logger.info(f"Found AGREEMENTS-NON STANDARD folder")
         
-        # Walk through potential state folders
+        # Get all state folders first
+        state_folders = []
         for folder in agreements_path.iterdir():
-            if not folder.is_dir():
-                continue
-                
-            # Check if this is a state folder
-            if self._is_state_folder(folder):
-                state_name = folder.name
-                total_states += 1
-                logger.info(f"Processing state {total_states}: {state_name}")
-                
-                # Look for HOSPITAL subfolder
-                hospital_folder_path = folder / self.config.hospital_subfolder
-                if hospital_folder_path.exists():
-                    self._process_hospital_directory(hospital_folder_path, state_name)
-                else:
-                    logger.warning(f"No {self.config.hospital_subfolder} folder found in state: {state_name}")
-            else:
-                logger.debug(f"Skipping non-state folder: {folder.name}")
-                
-        logger.info(f"Discovery completed:")
-        logger.info(f"  States processed: {total_states}")
-        logger.info(f"  Total documents found: {len(self.discovered_documents)}")
+            if folder.is_dir() and self._is_state_folder(folder):
+                state_folders.append(folder)
+        
+        logger.info(f"Found {len(state_folders)} state folders to process")
+        
+        # Process each state sequentially
+        for state_index, state_folder in enumerate(state_folders, 1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"PROCESSING STATE {state_index}/{len(state_folders)}: {state_folder.name}")
+            logger.info(f"{'='*60}")
+            
+            self._process_single_state(state_folder, state_index, len(state_folders))
+        
+        logger.info(f"\n{'='*80}")
+        logger.info(f"DISCOVERY COMPLETED")
+        logger.info(f"Total states processed: {len(state_folders)}")
+        logger.info(f"Total documents discovered: {len(self.discovered_documents)}")
+        logger.info(f"{'='*80}")
         
         return self.discovered_documents
+    
+    def _process_single_state(self, state_folder: Path, state_index: int, total_states: int):
+        """Process a single state folder completely before moving to next state."""
+        state_name = state_folder.name
+        
+        # Check for HOSPITAL subfolder
+        hospital_folder_path = state_folder / self.config.hospital_subfolder
+        if not hospital_folder_path.exists():
+            logger.warning(f"No HOSPITAL folder found in {state_name}")
+            return
+        
+        logger.info(f"Found HOSPITAL folder in {state_name}")
+        
+        # Get all hospital subfolders
+        try:
+            hospital_subfolders = [item for item in hospital_folder_path.iterdir() if item.is_dir()]
+            logger.info(f"Found {len(hospital_subfolders)} hospital subfolders in {state_name}")
+            
+            if not hospital_subfolders:
+                logger.warning(f"No hospital subfolders found in {state_name}/HOSPITAL")
+                return
+            
+            # Process each hospital subfolder sequentially
+            for hospital_index, hospital_subfolder in enumerate(hospital_subfolders, 1):
+                logger.info(f"\n  Processing Hospital {hospital_index}/{len(hospital_subfolders)}: {hospital_subfolder.name}")
+                
+                docs_before = len(self.discovered_documents)
+                self._process_single_hospital_folder(hospital_subfolder, state_name, hospital_index, len(hospital_subfolders))
+                docs_after = len(self.discovered_documents)
+                docs_found = docs_after - docs_before
+                
+                if docs_found > 0:
+                    logger.info(f"    ✓ Found {docs_found} PDFs in {hospital_subfolder.name}")
+                else:
+                    logger.info(f"    - No PDFs found in {hospital_subfolder.name}")
+            
+            # Summary for this state
+            total_state_docs = sum(1 for doc in self.discovered_documents if doc.state == state_name)
+            logger.info(f"\nSTATE {state_index} SUMMARY:")
+            logger.info(f"  State: {state_name}")
+            logger.info(f"  Hospital subfolders processed: {len(hospital_subfolders)}")
+            logger.info(f"  Total PDFs found in state: {total_state_docs}")
+            
+        except Exception as e:
+            logger.error(f"Error processing HOSPITAL folder for {state_name}: {e}")
+    
+    def _process_single_hospital_folder(self, hospital_subfolder: Path, state_name: str, hospital_index: int, total_hospitals: int):
+        """Process all PDFs in a single hospital subfolder completely."""
+        hospital_name = hospital_subfolder.name
+        
+        try:
+            # Find all PDFs in this hospital subfolder (including subdirectories)
+            pdf_files = list(hospital_subfolder.rglob("*.pdf"))
+            
+            if not pdf_files:
+                logger.debug(f"    No PDFs found in {hospital_name}")
+                return
+            
+            logger.info(f"    Found {len(pdf_files)} PDFs to process in {hospital_name}")
+            
+            # Process each PDF sequentially
+            for pdf_index, pdf_file in enumerate(pdf_files, 1):
+                logger.debug(f"      Processing PDF {pdf_index}/{len(pdf_files)}: {pdf_file.name}")
+                
+                try:
+                    if pdf_file.exists() and pdf_file.is_file():
+                        # Create document metadata
+                        doc_metadata = DocumentMetadata(
+                            file_path=pdf_file,
+                            source_path=str(pdf_file),
+                            pdf_name=pdf_file.name,
+                            state=state_name,
+                            file_size=pdf_file.stat().st_size,
+                            last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                        )
+                        
+                        self.discovered_documents.append(doc_metadata)
+                        logger.debug(f"        ✓ Added: {pdf_file.name}")
+                    else:
+                        logger.debug(f"        ✗ Invalid file: {pdf_file.name}")
+                
+                except Exception as pdf_error:
+                    logger.debug(f"        ✗ Error processing {pdf_file.name}: {pdf_error}")
+                    continue
+            
+            # Summary for this hospital folder
+            logger.info(f"    Completed {hospital_name}: Processed {len(pdf_files)} PDFs")
+            
+        except Exception as e:
+            logger.error(f"    Error processing hospital folder {hospital_name}: {e}")
+            return
+    
+    def _process_potential_hospital_directory(self, directory_path: Path, state_name: str, subfolder_name: str):
+        """Process a directory that might contain hospital PDFs."""
+        try:
+            pdf_count = 0
+            # Look for PDFs in this directory and subdirectories
+            for pdf_file in directory_path.rglob("*.pdf"):
+                try:
+                    if pdf_file.exists() and pdf_file.is_file():
+                        doc_metadata = DocumentMetadata(
+                            file_path=pdf_file,
+                            source_path=str(pdf_file),
+                            pdf_name=pdf_file.name,
+                            state=state_name,
+                            file_size=pdf_file.stat().st_size,
+                            last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                        )
+                        
+                        self.discovered_documents.append(doc_metadata)
+                        pdf_count += 1
+                        logger.debug(f"Found PDF in {subfolder_name}: {pdf_file.name}")
+                
+                except Exception as file_error:
+                    logger.debug(f"Error processing file {pdf_file}: {file_error}")
+                    continue
+            
+            if pdf_count > 0:
+                logger.info(f"  SUCCESS: Found {pdf_count} PDFs in {state_name}/{subfolder_name}")
+            
+        except Exception as e:
+            logger.error(f"Error processing potential hospital directory {directory_path}: {e}")
     
     def _is_state_folder(self, folder_path: Path) -> bool:
         """Identify state folders by checking for US state names."""
@@ -184,23 +304,144 @@ class EnterpriseFileDiscovery:
     def _process_hospital_directory(self, hospital_path: Path, state_name: str):
         """Process all PDF files in HOSPITAL directory and subdirectories."""
         try:
-            # Find all PDFs recursively
-            for pdf_file in hospital_path.rglob("*.pdf"):
-                # Create document metadata
-                doc_metadata = DocumentMetadata(
-                    file_path=pdf_file,
-                    source_path=str(pdf_file),  # Full path structure
-                    pdf_name=pdf_file.name,    # Just filename
-                    state=state_name,
-                    file_size=pdf_file.stat().st_size,
-                    last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                )
+            # First, check if we can access the hospital directory
+            if not hospital_path.exists():
+                logger.warning(f"Hospital directory does not exist: {hospital_path}")
+                return
                 
-                self.discovered_documents.append(doc_metadata)
-                logger.debug(f"Found: {pdf_file.name} in {state_name}")
+            if not hospital_path.is_dir():
+                logger.warning(f"Hospital path is not a directory: {hospital_path}")
+                return
+            
+            # Try to list the contents first with shorter path handling
+            try:
+                # Use a shorter path representation for Windows long path issues
+                hospital_path_str = str(hospital_path)
+                if len(hospital_path_str) > 200:
+                    logger.warning(f"Very long path detected for {state_name}: {len(hospital_path_str)} characters")
+                
+                items = list(hospital_path.iterdir())
+                logger.info(f"Hospital directory {state_name} contains {len(items)} items")
+                
+                # Log first few items to see what's there
+                for i, item in enumerate(items[:5]):
+                    item_type = "DIR" if item.is_dir() else "FILE"
+                    logger.info(f"  {item_type}: {item.name}")
+                if len(items) > 5:
+                    logger.info(f"  ... and {len(items) - 5} more items")
+                    
+            except PermissionError as pe:
+                logger.error(f"Permission denied accessing hospital directory for {state_name}: {pe}")
+                return
+            except OSError as ose:
+                logger.error(f"OS Error accessing hospital directory for {state_name}: {ose}")
+                return
+            except Exception as e:
+                logger.error(f"Cannot list contents of hospital directory for {state_name}: {e}")
+                return
+            
+            pdf_count = 0
+            processed_folders = 0
+            
+            # Process each item in the hospital directory
+            for item in items:
+                try:
+                    if item.is_dir():
+                        processed_folders += 1
+                        logger.debug(f"Processing hospital subfolder: {item.name}")
+                        
+                        # Look for PDFs in this hospital subfolder
+                        try:
+                            # Use non-recursive approach first for better compatibility
+                            subfolder_pdfs = list(item.glob("*.pdf"))
+                            if subfolder_pdfs:
+                                logger.info(f"  Found {len(subfolder_pdfs)} PDFs in {item.name}")
+                                
+                                for pdf_file in subfolder_pdfs:
+                                    try:
+                                        if pdf_file.exists() and pdf_file.is_file():
+                                            doc_metadata = DocumentMetadata(
+                                                file_path=pdf_file,
+                                                source_path=str(pdf_file),
+                                                pdf_name=pdf_file.name,
+                                                state=state_name,
+                                                file_size=pdf_file.stat().st_size,
+                                                last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                                            )
+                                            
+                                            self.discovered_documents.append(doc_metadata)
+                                            pdf_count += 1
+                                            logger.debug(f"Added PDF: {pdf_file.name}")
+                                    
+                                    except Exception as pdf_error:
+                                        logger.debug(f"Error processing PDF {pdf_file}: {pdf_error}")
+                                        continue
+                            
+                            # Also try recursive search in this subfolder (if non-recursive found some)
+                            if subfolder_pdfs:
+                                try:
+                                    recursive_pdfs = list(item.rglob("*.pdf"))
+                                    additional_pdfs = [p for p in recursive_pdfs if p not in subfolder_pdfs]
+                                    
+                                    if additional_pdfs:
+                                        logger.info(f"  Found {len(additional_pdfs)} additional PDFs in subfolders of {item.name}")
+                                        
+                                        for pdf_file in additional_pdfs:
+                                            try:
+                                                if pdf_file.exists() and pdf_file.is_file():
+                                                    doc_metadata = DocumentMetadata(
+                                                        file_path=pdf_file,
+                                                        source_path=str(pdf_file),
+                                                        pdf_name=pdf_file.name,
+                                                        state=state_name,
+                                                        file_size=pdf_file.stat().st_size,
+                                                        last_modified=datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                                                    )
+                                                    
+                                                    self.discovered_documents.append(doc_metadata)
+                                                    pdf_count += 1
+                                            
+                                            except Exception as pdf_error:
+                                                logger.debug(f"Error processing recursive PDF {pdf_file}: {pdf_error}")
+                                                continue
+                                except Exception as recursive_error:
+                                    logger.debug(f"Recursive search failed for {item.name}: {recursive_error}")
+                        
+                        except Exception as subfolder_error:
+                            logger.debug(f"Error processing subfolder {item.name}: {subfolder_error}")
+                            continue
+                    
+                    elif item.is_file() and item.suffix.lower() == '.pdf':
+                        # Direct PDF in hospital folder
+                        try:
+                            doc_metadata = DocumentMetadata(
+                                file_path=item,
+                                source_path=str(item),
+                                pdf_name=item.name,
+                                state=state_name,
+                                file_size=item.stat().st_size,
+                                last_modified=datetime.fromtimestamp(item.stat().st_mtime)
+                            )
+                            
+                            self.discovered_documents.append(doc_metadata)
+                            pdf_count += 1
+                            logger.debug(f"Added direct PDF: {item.name}")
+                        
+                        except Exception as pdf_error:
+                            logger.debug(f"Error processing direct PDF {item}: {pdf_error}")
+                            continue
+                
+                except Exception as item_error:
+                    logger.debug(f"Error processing item {item}: {item_error}")
+                    continue
+            
+            logger.info(f"Successfully processed {state_name}: {processed_folders} hospital folders, {pdf_count} PDFs found")
                 
         except Exception as e:
-            logger.error(f"Error processing hospital directory {hospital_path}: {e}")
+            logger.error(f"Critical error processing hospital directory for {state_name}: {e}")
+            logger.error(f"Hospital path: {hospital_path}")
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Path length: {len(str(hospital_path))} characters")
 
 # ==========================================
 # TWO-STAGE DOCUMENT CLASSIFIER
@@ -216,10 +457,19 @@ class HealthcareDocumentClassifier:
         
     def classify_all_documents(self, documents: List[DocumentMetadata], 
                              max_workers: int = 3) -> Dict[str, List[DocumentMetadata]]:
-        """Classify all documents using two-stage process."""
-        logger.info(f"Starting two-stage classification of {len(documents)} documents")
+        """Classify all documents using systematic sequential processing."""
+        logger.info(f"Starting systematic two-stage classification of {len(documents)} documents")
         logger.info(f"Stage 1: Healthcare contract detection")
         logger.info(f"Stage 2: Effective date validation (2020+)")
+        
+        # Group documents by state for systematic processing
+        documents_by_state = {}
+        for doc in documents:
+            if doc.state not in documents_by_state:
+                documents_by_state[doc.state] = []
+            documents_by_state[doc.state].append(doc)
+        
+        logger.info(f"Documents grouped into {len(documents_by_state)} states")
         
         relevant_docs = []
         not_healthcare_docs = []
@@ -227,66 +477,95 @@ class HealthcareDocumentClassifier:
         no_date_docs = []
         failed_docs = []
         
-        processed_count = 0
+        total_processed = 0
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all classification tasks
-            future_to_doc = {
-                executor.submit(self._classify_single_document, doc): doc 
-                for doc in documents
-            }
+        # Process each state systematically
+        for state_index, (state_name, state_docs) in enumerate(documents_by_state.items(), 1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"CLASSIFYING STATE {state_index}/{len(documents_by_state)}: {state_name}")
+            logger.info(f"Documents in this state: {len(state_docs)}")
+            logger.info(f"{'='*60}")
             
-            # Process completed classifications
-            for future in as_completed(future_to_doc):
-                doc = future_to_doc[future]
-                processed_count += 1
+            # Group by hospital within the state
+            docs_by_hospital = {}
+            for doc in state_docs:
+                hospital_folder = doc.file_path.parent.name
+                if hospital_folder not in docs_by_hospital:
+                    docs_by_hospital[hospital_folder] = []
+                docs_by_hospital[hospital_folder].append(doc)
+            
+            # Process each hospital folder systematically
+            for hospital_index, (hospital_name, hospital_docs) in enumerate(docs_by_hospital.items(), 1):
+                logger.info(f"\n  Processing Hospital {hospital_index}/{len(docs_by_hospital)}: {hospital_name}")
+                logger.info(f"  Documents in this hospital: {len(hospital_docs)}")
                 
-                try:
-                    classification_result = future.result()
+                # Process each document in this hospital folder
+                for doc_index, doc in enumerate(hospital_docs, 1):
+                    total_processed += 1
+                    logger.info(f"    Classifying PDF {doc_index}/{len(hospital_docs)}: {doc.pdf_name}")
+                    logger.info(f"    Overall progress: {total_processed}/{len(documents)}")
                     
-                    # Update document metadata
-                    doc.classification_status = "completed"
-                    doc.confidence_score = classification_result.confidence
-                    doc.detected_on_page = classification_result.detected_on_page
-                    doc.effective_date = classification_result.effective_date
-                    doc.stage_failed = classification_result.stage_failed
-                    doc.processing_time = classification_result.processing_time
-                    
-                    if classification_result.is_relevant:
-                        doc.classification_result = "relevant"
-                        relevant_docs.append(doc)
-                        logger.info(f"RELEVANT [{processed_count}/{len(documents)}]: {doc.pdf_name} "
-                                  f"(State: {doc.state}, Effective: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
-                    else:
-                        # Determine specific rejection reason
-                        if "Stage 1" in classification_result.stage_failed:
-                            doc.classification_result = "not_healthcare"
-                            not_healthcare_docs.append(doc)
-                        elif "before 2020" in classification_result.stage_failed:
-                            doc.classification_result = "old_date"
-                            old_date_docs.append(doc)
-                        elif "No effective date" in classification_result.stage_failed:
-                            doc.classification_result = "no_date"
-                            no_date_docs.append(doc)
-                        else:
-                            doc.classification_result = "not_relevant"
-                            not_healthcare_docs.append(doc)
-                            
-                        logger.debug(f"Rejected [{processed_count}/{len(documents)}]: {doc.pdf_name} - {classification_result.stage_failed}")
+                    try:
+                        # Classify this single document
+                        classification_result = self._classify_single_document(doc)
                         
-                except Exception as e:
-                    logger.error(f"Classification failed [{processed_count}/{len(documents)}] for {doc.pdf_name}: {e}")
-                    doc.classification_status = "failed"
-                    doc.classification_result = "failed"
-                    doc.error_message = str(e)
-                    failed_docs.append(doc)
+                        # Update document metadata
+                        doc.classification_status = "completed"
+                        doc.confidence_score = classification_result.confidence
+                        doc.detected_on_page = classification_result.detected_on_page
+                        doc.effective_date = classification_result.effective_date
+                        doc.stage_failed = classification_result.stage_failed
+                        doc.processing_time = classification_result.processing_time
+                        
+                        if classification_result.is_relevant:
+                            doc.classification_result = "relevant"
+                            relevant_docs.append(doc)
+                            logger.info(f"      ✓ RELEVANT: {doc.pdf_name} (Effective: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
+                        else:
+                            # Determine specific rejection reason
+                            if "Stage 1" in classification_result.stage_failed:
+                                doc.classification_result = "not_healthcare"
+                                not_healthcare_docs.append(doc)
+                                logger.info(f"      ✗ Not healthcare contract: {doc.pdf_name}")
+                            elif "before 2020" in classification_result.stage_failed:
+                                doc.classification_result = "old_date"
+                                old_date_docs.append(doc)
+                                logger.info(f"      ✗ Old date: {doc.pdf_name} ({doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
+                            elif "No effective date" in classification_result.stage_failed:
+                                doc.classification_result = "no_date"
+                                no_date_docs.append(doc)
+                                logger.info(f"      ✗ No effective date: {doc.pdf_name}")
+                            else:
+                                doc.classification_result = "not_relevant"
+                                not_healthcare_docs.append(doc)
+                                logger.info(f"      ✗ Not relevant: {doc.pdf_name}")
+                            
+                    except Exception as e:
+                        logger.error(f"      ✗ Classification failed: {doc.pdf_name} - {e}")
+                        doc.classification_status = "failed"
+                        doc.classification_result = "failed"
+                        doc.error_message = str(e)
+                        failed_docs.append(doc)
+                
+                # Hospital summary
+                hospital_relevant = sum(1 for doc in hospital_docs if doc.classification_result == "relevant")
+                logger.info(f"  Hospital Summary: {hospital_relevant}/{len(hospital_docs)} relevant documents")
+            
+            # State summary
+            state_relevant = sum(1 for doc in state_docs if doc.classification_result == "relevant")
+            logger.info(f"\nSTATE {state_index} SUMMARY:")
+            logger.info(f"  Relevant documents: {state_relevant}/{len(state_docs)}")
         
-        logger.info(f"Two-stage classification completed:")
-        logger.info(f"  Relevant (healthcare + 2020+ date): {len(relevant_docs)}")
-        logger.info(f"  Not healthcare contracts: {len(not_healthcare_docs)}")
-        logger.info(f"  Old dates (before 2020): {len(old_date_docs)}")
-        logger.info(f"  No effective date found: {len(no_date_docs)}")
-        logger.info(f"  Failed classifications: {len(failed_docs)}")
+        logger.info(f"\n{'='*80}")
+        logger.info(f"SYSTEMATIC CLASSIFICATION COMPLETED")
+        logger.info(f"{'='*80}")
+        logger.info(f"Total documents processed: {len(documents)}")
+        logger.info(f"Relevant (healthcare + 2020+ date): {len(relevant_docs)}")
+        logger.info(f"Not healthcare contracts: {len(not_healthcare_docs)}")
+        logger.info(f"Old dates (before 2020): {len(old_date_docs)}")
+        logger.info(f"No effective date found: {len(no_date_docs)}")
+        logger.info(f"Failed classifications: {len(failed_docs)}")
+        logger.info(f"{'='*80}")
         
         return {
             'relevant': relevant_docs,
