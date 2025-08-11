@@ -279,34 +279,50 @@ class EnterpriseFileDiscovery:
             
             # Step 1: Get PDFs directly in the main hospital folder
             direct_pdfs = []
+            subfolders_to_process = []
+            
             try:
-                for item in hospital_subfolder.iterdir():
-                    if item.is_file() and item.suffix.lower() == '.pdf':
-                        if str(item) not in processed_paths:
-                            direct_pdfs.append(item)
-                            processed_paths.add(str(item))
+                # First pass: separate files from folders
+                folder_items = list(hospital_subfolder.iterdir())
+                logger.debug(f"    Found {len(folder_items)} items in {hospital_name}")
                 
-                logger.debug(f"    Found {len(direct_pdfs)} PDFs directly in {hospital_name}")
+                for item in folder_items:
+                    try:
+                        if item.is_file() and item.suffix.lower() == '.pdf':
+                            if str(item) not in processed_paths:
+                                direct_pdfs.append(item)
+                                processed_paths.add(str(item))
+                                logger.debug(f"      Direct PDF: {item.name}")
+                        elif item.is_dir():
+                            subfolders_to_process.append(item)
+                            logger.debug(f"      Subfolder: {item.name}")
+                    except Exception as item_error:
+                        logger.debug(f"      Error checking item {item}: {item_error}")
+                        continue
+                
+                logger.info(f"    Found {len(direct_pdfs)} PDFs directly in {hospital_name}")
+                logger.info(f"    Found {len(subfolders_to_process)} subfolders to process")
                 all_pdf_files.extend(direct_pdfs)
                 
             except Exception as e:
-                logger.debug(f"    Error getting direct PDFs from {hospital_name}: {e}")
+                logger.error(f"    Error getting direct PDFs from {hospital_name}: {e}")
             
             # Step 2: Get PDFs from ALL subfolders (including Supplemental Documents, etc.)
             subfolder_pdfs = []
             try:
-                for item in hospital_subfolder.iterdir():
-                    if item.is_dir():
-                        logger.debug(f"      Scanning subfolder: {item.name}")
-                        subfolder_pdf_count = self._collect_pdfs_from_subfolder(item, processed_paths, subfolder_pdfs)
-                        if subfolder_pdf_count > 0:
-                            logger.debug(f"        Found {subfolder_pdf_count} PDFs in {item.name}")
+                for subfolder in subfolders_to_process:
+                    logger.debug(f"      Scanning subfolder: {subfolder.name}")
+                    subfolder_pdf_count = self._collect_pdfs_from_subfolder(subfolder, processed_paths, subfolder_pdfs)
+                    if subfolder_pdf_count > 0:
+                        logger.info(f"        Found {subfolder_pdf_count} PDFs in {subfolder.name}")
+                    else:
+                        logger.debug(f"        No PDFs in {subfolder.name}")
                 
-                logger.debug(f"    Found {len(subfolder_pdfs)} PDFs in subfolders of {hospital_name}")
+                logger.info(f"    Found {len(subfolder_pdfs)} PDFs in subfolders of {hospital_name}")
                 all_pdf_files.extend(subfolder_pdfs)
                 
             except Exception as e:
-                logger.debug(f"    Error getting subfolder PDFs from {hospital_name}: {e}")
+                logger.error(f"    Error getting subfolder PDFs from {hospital_name}: {e}")
             
             # Step 3: Final verification - use recursive search as backup
             if not all_pdf_files:
@@ -397,17 +413,38 @@ class EnterpriseFileDiscovery:
         pdf_count = 0
         
         try:
-            # First get PDFs directly in this subfolder
-            for item in subfolder_path.iterdir():
-                if item.is_file() and item.suffix.lower() == '.pdf':
-                    if str(item) not in processed_paths:
-                        pdf_list.append(item)
-                        processed_paths.add(str(item))
-                        pdf_count += 1
-                elif item.is_dir():
-                    # Recursively process subdirectories
-                    sub_count = self._collect_pdfs_from_subfolder(item, processed_paths, pdf_list)
-                    pdf_count += sub_count
+            logger.debug(f"        Entering subfolder: {subfolder_path.name}")
+            
+            # Get all items in this subfolder
+            try:
+                subfolder_items = list(subfolder_path.iterdir())
+                logger.debug(f"        Found {len(subfolder_items)} items in {subfolder_path.name}")
+            except Exception as e:
+                logger.debug(f"        Cannot list contents of {subfolder_path.name}: {e}")
+                return 0
+            
+            # Process each item in the subfolder
+            for item in subfolder_items:
+                try:
+                    if item.is_file() and item.suffix.lower() == '.pdf':
+                        if str(item) not in processed_paths:
+                            pdf_list.append(item)
+                            processed_paths.add(str(item))
+                            pdf_count += 1
+                            logger.debug(f"          Added PDF: {item.name}")
+                    elif item.is_dir():
+                        # Recursively process subdirectories
+                        logger.debug(f"          Entering subdirectory: {item.name}")
+                        sub_count = self._collect_pdfs_from_subfolder(item, processed_paths, pdf_list)
+                        pdf_count += sub_count
+                        if sub_count > 0:
+                            logger.debug(f"          Subdirectory {item.name} contributed {sub_count} PDFs")
+                
+                except Exception as item_error:
+                    logger.debug(f"          Error processing item {item}: {item_error}")
+                    continue
+            
+            logger.debug(f"        Subfolder {subfolder_path.name} total: {pdf_count} PDFs")
                     
         except Exception as e:
             logger.debug(f"        Error processing subfolder {subfolder_path.name}: {e}")
