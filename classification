@@ -389,42 +389,78 @@ class EnterpriseFileDiscovery:
                 logger.debug(f"      Processing PDF {pdf_index}/{total_found}: {pdf_file.name}")
                 
                 try:
-                    # Verify file still exists and is accessible
+                    # Step 1: Verify file still exists and is accessible
+                    logger.debug(f"        Step 1: Checking if file exists: {pdf_file}")
                     if not pdf_file.exists():
-                        logger.debug(f"        File no longer exists: {pdf_file.name}")
-                        failed_count += 1
-                        continue
-                        
-                    if not pdf_file.is_file():
-                        logger.debug(f"        Not a file: {pdf_file.name}")
+                        logger.error(f"        FAILED Step 1: File no longer exists: {pdf_file.name}")
                         failed_count += 1
                         continue
                     
-                    # Get file stats
+                    logger.debug(f"        Step 2: Checking if it's a file")
+                    if not pdf_file.is_file():
+                        logger.error(f"        FAILED Step 2: Not a file: {pdf_file.name}")
+                        failed_count += 1
+                        continue
+                    
+                    # Step 2: Get file stats with detailed error handling
+                    logger.debug(f"        Step 3: Getting file stats")
                     try:
                         file_size = pdf_file.stat().st_size
-                        last_modified = datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                    except Exception as stat_error:
-                        logger.debug(f"        Cannot get file stats for {pdf_file.name}: {stat_error}")
+                        logger.debug(f"        File size: {file_size} bytes")
+                    except Exception as size_error:
+                        logger.error(f"        FAILED Step 3a: Cannot get file size for {pdf_file.name}: {size_error}")
                         failed_count += 1
                         continue
                     
-                    # Create document metadata
-                    doc_metadata = DocumentMetadata(
-                        file_path=pdf_file,
-                        source_path=str(pdf_file),
-                        pdf_name=pdf_file.name,
-                        state=state_name,
-                        file_size=file_size,
-                        last_modified=last_modified
-                    )
+                    try:
+                        last_modified = datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                        logger.debug(f"        Last modified: {last_modified}")
+                    except Exception as time_error:
+                        logger.error(f"        FAILED Step 3b: Cannot get modification time for {pdf_file.name}: {time_error}")
+                        failed_count += 1
+                        continue
                     
-                    self.discovered_documents.append(doc_metadata)
-                    processed_count += 1
-                    logger.debug(f"        Successfully added: {pdf_file.name}")
+                    # Step 3: Create source path string
+                    logger.debug(f"        Step 4: Creating source path")
+                    try:
+                        source_path_str = str(pdf_file)
+                        logger.debug(f"        Source path: {source_path_str[:100]}...")  # First 100 chars
+                    except Exception as path_error:
+                        logger.error(f"        FAILED Step 4: Cannot create source path for {pdf_file.name}: {path_error}")
+                        failed_count += 1
+                        continue
+                    
+                    # Step 4: Create document metadata
+                    logger.debug(f"        Step 5: Creating DocumentMetadata object")
+                    try:
+                        doc_metadata = DocumentMetadata(
+                            file_path=pdf_file,
+                            source_path=source_path_str,
+                            pdf_name=pdf_file.name,
+                            state=state_name,
+                            file_size=file_size,
+                            last_modified=last_modified
+                        )
+                        logger.debug(f"        DocumentMetadata created successfully")
+                    except Exception as metadata_error:
+                        logger.error(f"        FAILED Step 5: Cannot create metadata for {pdf_file.name}: {metadata_error}")
+                        failed_count += 1
+                        continue
+                    
+                    # Step 5: Add to discovered documents list
+                    logger.debug(f"        Step 6: Adding to discovered documents list")
+                    try:
+                        self.discovered_documents.append(doc_metadata)
+                        processed_count += 1
+                        logger.debug(f"        SUCCESS: Added {pdf_file.name} to discovered documents")
+                    except Exception as append_error:
+                        logger.error(f"        FAILED Step 6: Cannot add to list {pdf_file.name}: {append_error}")
+                        failed_count += 1
+                        continue
                 
                 except Exception as pdf_error:
-                    logger.debug(f"        Error processing {pdf_file.name}: {pdf_error}")
+                    logger.error(f"        CRITICAL ERROR processing {pdf_file.name}: {pdf_error}")
+                    logger.error(f"        Error type: {type(pdf_error).__name__}")
                     failed_count += 1
                     continue
             
