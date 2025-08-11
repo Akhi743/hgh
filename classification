@@ -176,54 +176,110 @@ class EnterpriseFileDiscovery:
         """Process a single state folder completely before moving to next state."""
         state_name = state_folder.name
         
-        # Check for HOSPITAL subfolder
-        hospital_folder_path = state_folder / self.config.hospital_subfolder
-        if not hospital_folder_path.exists():
-            logger.warning(f"No HOSPITAL folder found in {state_name}")
-            return
-        
-        logger.info(f"Found HOSPITAL folder in {state_name}")
-        
-        # Get all hospital subfolders
         try:
-            hospital_subfolders = [item for item in hospital_folder_path.iterdir() if item.is_dir()]
-            logger.info(f"Found {len(hospital_subfolders)} hospital subfolders in {state_name}")
+            # Check for HOSPITAL subfolder with better error handling
+            hospital_folder_path = state_folder / self.config.hospital_subfolder
             
-            if not hospital_subfolders:
-                logger.warning(f"No hospital subfolders found in {state_name}/HOSPITAL")
-                return
-            
-            # Process each hospital subfolder sequentially
-            for hospital_index, hospital_subfolder in enumerate(hospital_subfolders, 1):
-                logger.info(f"\n  Processing Hospital {hospital_index}/{len(hospital_subfolders)}: {hospital_subfolder.name}")
+            # Try different approaches to handle problematic folder names
+            if not hospital_folder_path.exists():
+                logger.warning(f"No HOSPITAL folder found in {state_name}")
                 
-                docs_before = len(self.discovered_documents)
-                self._process_single_hospital_folder(hospital_subfolder, state_name, hospital_index, len(hospital_subfolders))
-                docs_after = len(self.discovered_documents)
-                docs_found = docs_after - docs_before
+                # Try alternative: look for any folder containing "HOSPITAL" in name
+                try:
+                    for item in state_folder.iterdir():
+                        if item.is_dir() and "HOSPITAL" in item.name.upper():
+                            logger.info(f"Found alternative hospital folder: {item.name}")
+                            hospital_folder_path = item
+                            break
+                    else:
+                        logger.warning(f"No hospital-related folders found in {state_name}")
+                        return
+                except Exception as e:
+                    logger.error(f"Error scanning state folder {state_name}: {e}")
+                    return
+            
+            logger.info(f"Found HOSPITAL folder in {state_name}")
+            
+            # Get all hospital subfolders with robust error handling
+            try:
+                hospital_subfolders = []
                 
-                if docs_found > 0:
-                    logger.info(f"    Found {docs_found} PDFs in {hospital_subfolder.name}")
-                else:
-                    logger.info(f"    No PDFs found in {hospital_subfolder.name}")
-            
-            # Summary for this state
-            total_state_docs = sum(1 for doc in self.discovered_documents if doc.state == state_name)
-            logger.info(f"\nSTATE {state_index} SUMMARY:")
-            logger.info(f"  State: {state_name}")
-            logger.info(f"  Hospital subfolders processed: {len(hospital_subfolders)}")
-            logger.info(f"  Total PDFs found in state: {total_state_docs}")
-            
-        except Exception as e:
-            logger.error(f"Error processing HOSPITAL folder for {state_name}: {e}")
+                for item in hospital_folder_path.iterdir():
+                    if item.is_dir():
+                        hospital_subfolders.append(item)
+                        logger.debug(f"  Found subfolder: {item.name}")
+                
+                logger.info(f"Found {len(hospital_subfolders)} subfolders in {state_name}/HOSPITAL")
+                
+                if not hospital_subfolders:
+                    logger.warning(f"No subfolders found in {state_name}/HOSPITAL")
+                    return
+                
+                # Process each hospital subfolder sequentially
+                for hospital_index, hospital_subfolder in enumerate(hospital_subfolders, 1):
+                    try:
+                        logger.info(f"\n  Processing Hospital {hospital_index}/{len(hospital_subfolders)}: {hospital_subfolder.name}")
+                        
+                        docs_before = len(self.discovered_documents)
+                        self._process_single_hospital_folder(hospital_subfolder, state_name, hospital_index, len(hospital_subfolders))
+                        docs_after = len(self.discovered_documents)
+                        docs_found = docs_after - docs_before
+                        
+                        if docs_found > 0:
+                            logger.info(f"    Found {docs_found} PDFs in {hospital_subfolder.name}")
+                        else:
+                            logger.info(f"    No PDFs found in {hospital_subfolder.name}")
+                    
+                    except Exception as hospital_error:
+                        logger.error(f"    Error processing hospital {hospital_subfolder.name}: {hospital_error}")
+                        continue
+                
+                # Summary for this state
+                total_state_docs = sum(1 for doc in self.discovered_documents if doc.state == state_name)
+                logger.info(f"\nSTATE {state_index} SUMMARY:")
+                logger.info(f"  State: {state_name}")
+                logger.info(f"  Hospital subfolders processed: {len(hospital_subfolders)}")
+                logger.info(f"  Total PDFs found in state: {total_state_docs}")
+                
+            except PermissionError as pe:
+                logger.error(f"Permission denied accessing HOSPITAL folder for {state_name}: {pe}")
+            except OSError as ose:
+                logger.error(f"OS Error accessing HOSPITAL folder for {state_name}: {ose}")
+            except Exception as e:
+                logger.error(f"Error listing hospital subfolders for {state_name}: {e}")
+                
+        except Exception as state_error:
+            logger.error(f"Critical error processing state {state_name}: {state_error}")
     
     def _process_single_hospital_folder(self, hospital_subfolder: Path, state_name: str, hospital_index: int, total_hospitals: int):
         """Process all PDFs in a single hospital subfolder completely."""
         hospital_name = hospital_subfolder.name
         
         try:
-            # Find all PDFs in this hospital subfolder (including subdirectories)
-            pdf_files = list(hospital_subfolder.rglob("*.pdf"))
+            # Use multiple strategies to find ALL PDFs in this folder and all its subfolders
+            pdf_files = []
+            processed_paths = set()
+            
+            # Strategy 1: Try recursive search (most comprehensive)
+            try:
+                logger.debug(f"    Attempting recursive PDF search in {hospital_name}")
+                recursive_pdfs = list(hospital_subfolder.rglob("*.pdf"))
+                for pdf in recursive_pdfs:
+                    if str(pdf) not in processed_paths:
+                        pdf_files.append(pdf)
+                        processed_paths.add(str(pdf))
+                logger.debug(f"    Recursive search found {len(recursive_pdfs)} PDFs")
+            except Exception as e:
+                logger.debug(f"    Recursive search failed: {e}")
+            
+            # Strategy 2: Manual deep traversal (fallback for path issues)
+            if not pdf_files:
+                try:
+                    logger.debug(f"    Attempting manual traversal in {hospital_name}")
+                    pdf_files = self._manual_pdf_search(hospital_subfolder, processed_paths)
+                    logger.debug(f"    Manual traversal found {len(pdf_files)} PDFs")
+                except Exception as e:
+                    logger.debug(f"    Manual traversal failed: {e}")
             
             if not pdf_files:
                 logger.debug(f"    No PDFs found in {hospital_name}")
@@ -232,6 +288,7 @@ class EnterpriseFileDiscovery:
             logger.info(f"    Found {len(pdf_files)} PDFs to process in {hospital_name}")
             
             # Process each PDF sequentially
+            processed_count = 0
             for pdf_index, pdf_file in enumerate(pdf_files, 1):
                 logger.debug(f"      Processing PDF {pdf_index}/{len(pdf_files)}: {pdf_file.name}")
                 
@@ -248,6 +305,7 @@ class EnterpriseFileDiscovery:
                         )
                         
                         self.discovered_documents.append(doc_metadata)
+                        processed_count += 1
                         logger.debug(f"        Added: {pdf_file.name}")
                     else:
                         logger.debug(f"        Invalid file: {pdf_file.name}")
@@ -257,11 +315,35 @@ class EnterpriseFileDiscovery:
                     continue
             
             # Summary for this hospital folder
-            logger.info(f"    Completed {hospital_name}: Processed {len(pdf_files)} PDFs")
+            logger.info(f"    Completed {hospital_name}: Processed {processed_count}/{len(pdf_files)} PDFs successfully")
             
         except Exception as e:
             logger.error(f"    Error processing hospital folder {hospital_name}: {e}")
             return
+    
+    def _manual_pdf_search(self, folder_path: Path, processed_paths: set) -> List[Path]:
+        """Manually search for PDFs with better error handling for problematic paths."""
+        pdf_files = []
+        
+        try:
+            # First, get all PDFs directly in this folder
+            for item in folder_path.iterdir():
+                try:
+                    if item.is_file() and item.suffix.lower() == '.pdf':
+                        if str(item) not in processed_paths:
+                            pdf_files.append(item)
+                            processed_paths.add(str(item))
+                    elif item.is_dir():
+                        # Recursively search subfolders
+                        subfolder_pdfs = self._manual_pdf_search(item, processed_paths)
+                        pdf_files.extend(subfolder_pdfs)
+                except Exception as item_error:
+                    logger.debug(f"        Error processing item {item}: {item_error}")
+                    continue
+        except Exception as folder_error:
+            logger.debug(f"      Error listing folder {folder_path}: {folder_error}")
+        
+        return pdf_files
     
     def _process_potential_hospital_directory(self, directory_path: Path, state_name: str, subfolder_name: str):
         """Process a directory that might contain hospital PDFs."""
