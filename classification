@@ -495,48 +495,33 @@ class EnterpriseFileDiscovery:
             logger.error(f"    Error type: {type(e).__name__}")
             return
     
-    def _collect_pdfs_from_subfolder(self, subfolder_path: Path, processed_paths: set, pdf_list: List[Path]) -> int:
-        """Recursively collect all PDFs from a subfolder and its subdirectories."""
-        pdf_count = 0
+    def _validate_pdfs_in_folder(self, folder_path: Path, processed_paths: set) -> List[str]:
+        """Recursively find and validate PDFs in a folder."""
+        validated_pdfs = []
         
         try:
-            logger.debug(f"        Entering subfolder: {subfolder_path.name}")
+            # Get all PDFs in this folder recursively
+            potential_pdfs = list(folder_path.rglob("*.pdf"))
             
-            # Get all items in this subfolder
-            try:
-                subfolder_items = list(subfolder_path.iterdir())
-                logger.debug(f"        Found {len(subfolder_items)} items in {subfolder_path.name}")
-            except Exception as e:
-                logger.debug(f"        Cannot list contents of {subfolder_path.name}: {e}")
-                return 0
-            
-            # Process each item in the subfolder
-            for item in subfolder_items:
+            for pdf in potential_pdfs:
                 try:
-                    if item.is_file() and item.suffix.lower() == '.pdf':
-                        if str(item) not in processed_paths:
-                            pdf_list.append(item)
-                            processed_paths.add(str(item))
-                            pdf_count += 1
-                            logger.debug(f"          Added PDF: {item.name}")
-                    elif item.is_dir():
-                        # Recursively process subdirectories
-                        logger.debug(f"          Entering subdirectory: {item.name}")
-                        sub_count = self._collect_pdfs_from_subfolder(item, processed_paths, pdf_list)
-                        pdf_count += sub_count
-                        if sub_count > 0:
-                            logger.debug(f"          Subdirectory {item.name} contributed {sub_count} PDFs")
-                
-                except Exception as item_error:
-                    logger.debug(f"          Error processing item {item}: {item_error}")
+                    pdf_str = str(pdf)
+                    # Validate each PDF exists and is accessible
+                    if os.path.exists(pdf_str) and os.path.isfile(pdf_str):
+                        if pdf_str not in processed_paths:
+                            validated_pdfs.append(pdf_str)
+                            processed_paths.add(pdf_str)
+                            logger.debug(f"        Validated subfolder PDF: {pdf.name}")
+                    else:
+                        logger.debug(f"        Skipped non-existent subfolder PDF: {pdf.name}")
+                except Exception as pdf_error:
+                    logger.debug(f"        Error validating PDF {pdf}: {pdf_error}")
                     continue
-            
-            logger.debug(f"        Subfolder {subfolder_path.name} total: {pdf_count} PDFs")
                     
         except Exception as e:
-            logger.debug(f"        Error processing subfolder {subfolder_path.name}: {e}")
+            logger.debug(f"        Error scanning folder {folder_path.name}: {e}")
         
-        return pdf_count
+        return validated_pdfs
     
     def _manual_pdf_search(self, folder_path: Path, processed_paths: set) -> List[Path]:
         """Manually search for PDFs with better error handling for problematic paths."""
