@@ -360,18 +360,21 @@ class EnterpriseFileDiscovery:
             except Exception as e:
                 logger.debug(f"    METHOD 3 failed: {e}")
             
-            # Combine all methods
-            all_pdf_files = method1_pdfs + method2_pdfs + method3_pdfs
+            # Combine all methods - but convert to string paths immediately
+            all_pdf_paths = []
             
-            # Remove any duplicates based on path
-            unique_pdfs = []
-            unique_paths = set()
-            for pdf in all_pdf_files:
-                if str(pdf) not in unique_paths:
-                    unique_pdfs.append(pdf)
-                    unique_paths.add(str(pdf))
+            # Convert all Path objects to strings to avoid Windows network path issues
+            for pdf in method1_pdfs:
+                all_pdf_paths.append(str(pdf))
+            for pdf in method2_pdfs:
+                all_pdf_paths.append(str(pdf))
+            for pdf in method3_pdfs:
+                all_pdf_paths.append(str(pdf))
             
-            total_found = len(unique_pdfs)
+            # Remove any duplicates based on string path
+            unique_pdf_paths = list(set(all_pdf_paths))
+            
+            total_found = len(unique_pdf_paths)
             logger.info(f"    TOTAL UNIQUE PDFs found in {hospital_name}: {total_found}")
             logger.info(f"      Method 1 (direct glob): {len(method1_pdfs)}")
             logger.info(f"      Method 2 (recursive): {len(method2_pdfs)}")
@@ -381,61 +384,77 @@ class EnterpriseFileDiscovery:
                 logger.warning(f"    NO PDFs found anywhere in {hospital_name} using any method!")
                 return
             
-            # Process all found PDFs
+            # Process all found PDFs using string paths
             processed_count = 0
             failed_count = 0
             
-            for pdf_index, pdf_file in enumerate(unique_pdfs, 1):
-                logger.debug(f"      Processing PDF {pdf_index}/{total_found}: {pdf_file.name}")
+            for pdf_index, pdf_path_str in enumerate(unique_pdf_paths, 1):
+                logger.debug(f"      Processing PDF {pdf_index}/{total_found}: {Path(pdf_path_str).name}")
                 
                 try:
-                    # Step 1: Verify file still exists and is accessible
-                    logger.debug(f"        Step 1: Checking if file exists: {pdf_file}")
-                    if not pdf_file.exists():
-                        logger.error(f"        FAILED Step 1: File no longer exists: {pdf_file.name}")
+                    # Step 1: Create fresh Path object from string
+                    logger.debug(f"        Step 1: Creating Path object from string")
+                    pdf_file = Path(pdf_path_str)
+                    logger.debug(f"        Path created: {pdf_path_str[:100]}...")
+                    
+                    # Step 2: Verify file exists using both Path and os.path methods
+                    logger.debug(f"        Step 2: Checking if file exists")
+                    
+                    # Try multiple existence checks
+                    exists_via_path = pdf_file.exists()
+                    exists_via_os = os.path.exists(pdf_path_str)
+                    
+                    logger.debug(f"        Path.exists(): {exists_via_path}")
+                    logger.debug(f"        os.path.exists(): {exists_via_os}")
+                    
+                    if not exists_via_path and not exists_via_os:
+                        logger.error(f"        FAILED Step 2: File does not exist via any method: {pdf_file.name}")
                         failed_count += 1
                         continue
                     
-                    logger.debug(f"        Step 2: Checking if it's a file")
-                    if not pdf_file.is_file():
-                        logger.error(f"        FAILED Step 2: Not a file: {pdf_file.name}")
-                        failed_count += 1
-                        continue
+                    # Use os.path methods for network paths (more reliable)
+                    if exists_via_os:
+                        logger.debug(f"        Step 3: Using os.path methods for file operations")
+                        
+                        # Step 3a: Get file size using os.path
+                        try:
+                            import os
+                            file_size = os.path.getsize(pdf_path_str)
+                            logger.debug(f"        File size: {file_size} bytes")
+                        except Exception as size_error:
+                            logger.error(f"        FAILED Step 3a: Cannot get file size: {size_error}")
+                            failed_count += 1
+                            continue
+                        
+                        # Step 3b: Get modification time using os.path
+                        try:
+                            import os
+                            mtime = os.path.getmtime(pdf_path_str)
+                            last_modified = datetime.fromtimestamp(mtime)
+                            logger.debug(f"        Last modified: {last_modified}")
+                        except Exception as time_error:
+                            logger.error(f"        FAILED Step 3b: Cannot get modification time: {time_error}")
+                            failed_count += 1
+                            continue
                     
-                    # Step 2: Get file stats with detailed error handling
-                    logger.debug(f"        Step 3: Getting file stats")
-                    try:
-                        file_size = pdf_file.stat().st_size
-                        logger.debug(f"        File size: {file_size} bytes")
-                    except Exception as size_error:
-                        logger.error(f"        FAILED Step 3a: Cannot get file size for {pdf_file.name}: {size_error}")
-                        failed_count += 1
-                        continue
-                    
-                    try:
-                        last_modified = datetime.fromtimestamp(pdf_file.stat().st_mtime)
-                        logger.debug(f"        Last modified: {last_modified}")
-                    except Exception as time_error:
-                        logger.error(f"        FAILED Step 3b: Cannot get modification time for {pdf_file.name}: {time_error}")
-                        failed_count += 1
-                        continue
-                    
-                    # Step 3: Create source path string
-                    logger.debug(f"        Step 4: Creating source path")
-                    try:
-                        source_path_str = str(pdf_file)
-                        logger.debug(f"        Source path: {source_path_str[:100]}...")  # First 100 chars
-                    except Exception as path_error:
-                        logger.error(f"        FAILED Step 4: Cannot create source path for {pdf_file.name}: {path_error}")
-                        failed_count += 1
-                        continue
+                    else:
+                        # Fallback to Path methods
+                        logger.debug(f"        Step 3: Using Path methods as fallback")
+                        try:
+                            file_size = pdf_file.stat().st_size
+                            last_modified = datetime.fromtimestamp(pdf_file.stat().st_mtime)
+                            logger.debug(f"        File size: {file_size}, Modified: {last_modified}")
+                        except Exception as stat_error:
+                            logger.error(f"        FAILED Step 3: Cannot get file stats: {stat_error}")
+                            failed_count += 1
+                            continue
                     
                     # Step 4: Create document metadata
-                    logger.debug(f"        Step 5: Creating DocumentMetadata object")
+                    logger.debug(f"        Step 4: Creating DocumentMetadata object")
                     try:
                         doc_metadata = DocumentMetadata(
                             file_path=pdf_file,
-                            source_path=source_path_str,
+                            source_path=pdf_path_str,
                             pdf_name=pdf_file.name,
                             state=state_name,
                             file_size=file_size,
@@ -443,23 +462,23 @@ class EnterpriseFileDiscovery:
                         )
                         logger.debug(f"        DocumentMetadata created successfully")
                     except Exception as metadata_error:
-                        logger.error(f"        FAILED Step 5: Cannot create metadata for {pdf_file.name}: {metadata_error}")
+                        logger.error(f"        FAILED Step 4: Cannot create metadata: {metadata_error}")
                         failed_count += 1
                         continue
                     
                     # Step 5: Add to discovered documents list
-                    logger.debug(f"        Step 6: Adding to discovered documents list")
+                    logger.debug(f"        Step 5: Adding to discovered documents list")
                     try:
                         self.discovered_documents.append(doc_metadata)
                         processed_count += 1
                         logger.debug(f"        SUCCESS: Added {pdf_file.name} to discovered documents")
                     except Exception as append_error:
-                        logger.error(f"        FAILED Step 6: Cannot add to list {pdf_file.name}: {append_error}")
+                        logger.error(f"        FAILED Step 5: Cannot add to list: {append_error}")
                         failed_count += 1
                         continue
                 
                 except Exception as pdf_error:
-                    logger.error(f"        CRITICAL ERROR processing {pdf_file.name}: {pdf_error}")
+                    logger.error(f"        CRITICAL ERROR processing {Path(pdf_path_str).name}: {pdf_error}")
                     logger.error(f"        Error type: {type(pdf_error).__name__}")
                     failed_count += 1
                     continue
