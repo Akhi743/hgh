@@ -1,0 +1,827 @@
+"""
+classification.py - Enhanced Document Classification Module for Healthcare Contracts
+
+This module contains your existing classification system with enhancements for 
+integration with the two-stage pipeline automation.
+"""
+
+import fitz
+import csv
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+from google.genai import types
+import google.genai as genai
+from datetime import datetime
+from dataclasses import dataclass
+from dateutil import parser
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+@dataclass
+class DocumentMetadata:
+    """Represents a single PDF, holding all its metadata and final classification details."""
+    source_path: str
+    pdf_name: str
+    state: str
+    file_size: int
+    last_modified: datetime
+    classification_status: str = "pending"
+    classification_result: str = "unknown"
+    detected_on_page: Optional[int] = None
+    effective_date: Optional[datetime] = None
+    stage_failed: str = ""
+    confidence_score: float = 0.0
+    processing_time: float = 0.0
+    error_message: str = ""
+    pdf_complexity_level: str = ""
+    pdf_issues: List[str] = None
+
+    def __post_init__(self):
+        if self.pdf_issues is None:
+            self.pdf_issues = []
+
+@dataclass
+class ClassificationResult:
+    """A simple structure to pass results between classification methods."""
+    is_relevant: bool
+    detected_on_page: Optional[int] = None
+    effective_date: Optional[datetime] = None
+    stage_failed: str = ""
+    confidence: float = 0.0
+    processing_time: float = 0.0
+
+@dataclass
+class PDFComplexityInfo:
+    """Structure to hold PDF complexity analysis results."""
+    has_form_fields: bool = False
+    has_digital_signatures: bool = False
+    has_encryption: bool = False
+    has_embedded_files: bool = False
+    page_count: int = 0
+    complexity_level: str = 'simple'
+    potential_issues: List[str] = None
+    analysis_successful: bool = True
+    
+    def __post_init__(self):
+        if self.potential_issues is None:
+            self.potential_issues = []
+
+class ClassificationConfig:
+    """A central configuration class to make tweaking settings easy without digging through the code."""
+    def __init__(self):
+        # Folder names the script will look for.
+        self.agreements_folder = "AGREEMENTS-NON STANDARD"
+        self.hospital_subfolder = "HOSPITAL"
+        
+        # Key business logic setting: the minimum year for a document to be considered relevant.
+        self.min_effective_year = 2020
+        
+        # Settings for AI processing.
+        self.image_dpi = 150
+        self.first_pages_count = 10
+        self.last_pages_count = 10
+        
+        # PDF error handling settings
+        self.max_repair_attempts = 3
+        self.skip_corrupted_pages = True
+        self.enable_complexity_analysis = True  # Can be disabled for performance
+        
+        # Prompts are carefully worded to guide the AI's response for each task.
+        self.healthcare_contract_prompt = "Analyze the image. Is this a formal letter from Aetna about a 'charge master increase' where they state 'we have received' a notification? Answer only YES or NO."
+        self.effective_date_prompt = 'This is an Aetna charge master increase letter. Find the EFFECTIVE DATE mentioned in the letter (phrases like "effective January 1, 2024" or "to become effective 1/1/2025"). Respond with just the date found, or "NOT_FOUND" if no effective date exists.'
+        
+        # A static set of US states used to identify state-level folders.
+        self.us_states = {
+            'ALABAMA', 'ALASKA', 'ARIZONA', 'ARKANSAS', 'CALIFORNIA', 'COLORADO', 
+            'CONNECTICUT', 'DELAWARE', 'FLORIDA', 'GEORGIA', 'HAWAII', 'IDAHO', 
+            'ILLINOIS', 'INDIANA', 'IOWA', 'KANSAS', 'KENTUCKY', 'LOUISIANA', 
+            'MAINE', 'MARYLAND', 'MASSACHUSETTS', 'MICHIGAN', 'MINNESOTA', 
+            'MISSISSIPPI', 'MISSOURI', 'MONTANA', 'NEBRASKA', 'NEVADA', 
+            'NEW HAMPSHIRE', 'NEW JERSEY', 'NEW MEXICO', 'NEW YORK', 
+            'NORTH CAROLINA', 'NORTH DAKOTA', 'OHIO', 'OKLAHOMA', 'OREGON', 
+            'PENNSYLVANIA', 'RHODE ISLAND', 'SOUTH CAROLINA', 'SOUTH DAKOTA', 
+            'TENNESSEE', 'TEXAS', 'UTAH', 'VERMONT', 'VIRGINIA', 'WASHINGTON', 
+            'WEST VIRGINIA', 'WISCONSIN', 'WYOMING', 'PUERTO RICO', 'DISTRICT OF COLUMBIA'
+        }
+
+class EnhancedPDFHandler:
+    """
+    Enhanced PDF handler that deals with form fields, digital signatures, 
+    and complex PDF structures that cause xref errors.
+    """
+    
+    @staticmethod
+    def quick_complexity_check(pdf_doc: fitz.Document) -> PDFComplexityInfo:
+        """Performs complexity analysis on an already-opened document."""
+        complexity_info = PDFComplexityInfo()
+        
+        try:
+            complexity_info.page_count = len(pdf_doc)
+            
+            # Check for form fields (sample first few pages for performance)
+            pages_to_check = min(5, len(pdf_doc))
+            for page_num in range(pages_to_check):
+                try:
+                    page = pdf_doc.load_page(page_num)
+                    if page.get_widgets():  # Form fields/widgets detected
+                        complexity_info.has_form_fields = True
+                        complexity_info.potential_issues.append('form_fields')
+                        break
+                except Exception:
+                    continue
+            
+            # Check for encryption
+            if pdf_doc.needs_pass:
+                complexity_info.has_encryption = True
+                complexity_info.potential_issues.append('password_protected')
+            
+            # Check for embedded files
+            if pdf_doc.embfile_count() > 0:
+                complexity_info.has_embedded_files = True
+                complexity_info.potential_issues.append('embedded_files')
+            
+            # Check metadata for signatures
+            try:
+                metadata = pdf_doc.metadata
+                if metadata and any(sig_indicator in str(metadata).lower() 
+                                  for sig_indicator in ['signature', 'signed', 'certif']):
+                    complexity_info.has_digital_signatures = True
+                    complexity_info.potential_issues.append('digital_signatures')
+            except Exception:
+                pass
+            
+            # Determine complexity level
+            issue_count = len(complexity_info.potential_issues)
+            if issue_count == 0:
+                complexity_info.complexity_level = 'simple'
+            elif issue_count <= 2:
+                complexity_info.complexity_level = 'moderate'
+            else:
+                complexity_info.complexity_level = 'complex'
+                
+        except Exception as e:
+            complexity_info.potential_issues.append(f'analysis_error: {str(e)}')
+            complexity_info.complexity_level = 'problematic'
+            complexity_info.analysis_successful = False
+        
+        return complexity_info
+
+    @staticmethod
+    def attempt_pdf_open_with_strategies(pdf_path: str) -> Optional[fitz.Document]:
+        """Multiple strategies specifically designed for problematic enterprise PDFs."""
+        logger.debug(f"Attempting to open PDF: {os.path.basename(pdf_path)}")
+        
+        # Strategy 1: Standard open (fastest)
+        try:
+            doc = fitz.open(pdf_path)
+            logger.debug("Standard open successful")
+            return doc
+        except Exception as e:
+            logger.debug(f"Standard open failed: {e}")
+        
+        # Strategy 2: Open with repair flag
+        try:
+            doc = fitz.open(pdf_path, filetype="pdf")
+            logger.debug("Repair mode open successful")
+            return doc
+        except Exception as e:
+            logger.debug(f"Repair mode open failed: {e}")
+        
+        # Strategy 3: Memory-based opening (handles file locking issues)
+        try:
+            with open(pdf_path, 'rb') as f:
+                pdf_data = f.read()
+            doc = fitz.open(stream=pdf_data, filetype="pdf")
+            logger.debug("Memory stream open successful")
+            return doc
+        except Exception as e:
+            logger.debug(f"Memory stream open failed: {e}")
+        
+        # Strategy 4: Page reconstruction
+        try:
+            source_doc = fitz.open(pdf_path)
+            clean_doc = fitz.open()
+            
+            successful_pages = 0
+            for page_num in range(min(len(source_doc), 20)):  # Limit for safety
+                try:
+                    clean_doc.insert_pdf(source_doc, from_page=page_num, to_page=page_num)
+                    successful_pages += 1
+                except Exception as page_error:
+                    logger.debug(f"Skipped page {page_num + 1}: {page_error}")
+                    continue
+            
+            source_doc.close()
+            
+            if successful_pages > 0:
+                logger.debug(f"Page reconstruction successful ({successful_pages} pages)")
+                return clean_doc
+            else:
+                clean_doc.close()
+                
+        except Exception as e:
+            logger.debug(f"Page reconstruction failed: {e}")
+        
+        # Strategy 5: Form field flattening (convert to images)
+        try:
+            source_doc = fitz.open(pdf_path)
+            temp_doc = fitz.open()
+            
+            successful_pages = 0
+            for page_num in range(min(len(source_doc), 10)):  # Limit for performance
+                try:
+                    page = source_doc.load_page(page_num)
+                    # Create high-res image to preserve visual fidelity
+                    mat = fitz.Matrix(2.0, 2.0)  # 2x scale for AI readability
+                    pix = page.get_pixmap(matrix=mat)
+                    
+                    # Create new page from image
+                    img_pdf = fitz.open("pdf", pix.tobytes("pdf"))
+                    temp_doc.insert_pdf(img_pdf, from_page=0, to_page=0)
+                    img_pdf.close()
+                    successful_pages += 1
+                    
+                except Exception as page_error:
+                    logger.debug(f"Flattening failed for page {page_num + 1}: {page_error}")
+                    continue
+            
+            source_doc.close()
+            
+            if successful_pages > 0:
+                logger.debug(f"Form field flattening successful ({successful_pages} pages)")
+                return temp_doc
+            else:
+                temp_doc.close()
+                
+        except Exception as e:
+            logger.debug(f"Form field flattening failed: {e}")
+        
+        logger.warning(f"All repair strategies failed for: {os.path.basename(pdf_path)}")
+        return None
+
+    @staticmethod
+    def safe_page_access(doc: fitz.Document, page_idx: int) -> Optional[fitz.Page]:
+        """Safely access a page, handling corruption at the page level."""
+        try:
+            page = doc.load_page(page_idx)
+            # Test if page can be rendered by trying to get its rect
+            _ = page.rect
+            return page
+        except Exception as e:
+            logger.debug(f"Page {page_idx + 1} corrupted or inaccessible: {e}")
+            return None
+
+class EnterpriseFileDiscovery:
+    """Handles the logic of finding all target PDF documents within the specified folder structure."""
+    def __init__(self, root_path: str, config: ClassificationConfig):
+        self.root_path = Path(root_path)
+        self.config = config
+
+    def discover_all_documents(self) -> List[DocumentMetadata]:
+        """Runs the discovery process by scanning through each state folder."""
+        logger.info(f"Starting document discovery from: {self.root_path}")
+        agreements_path = self.root_path / self.config.agreements_folder
+        if not agreements_path.exists():
+            logger.error(f"'{self.config.agreements_folder}' folder not found at: {agreements_path}")
+            return []
+
+        all_documents = []
+        state_folders = [f for f in agreements_path.iterdir() if f.is_dir() and self._is_state_folder(f)]
+        logger.info(f"Found {len(state_folders)} state folders to process.")
+
+        for state_folder in state_folders:
+            all_documents.extend(self._process_single_state(state_folder))
+
+        logger.info(f"Discovery complete. Total documents found: {len(all_documents)}")
+        return all_documents
+
+    def _process_single_state(self, state_folder: Path) -> List[DocumentMetadata]:
+        """Processes a single state folder to find its hospital subfolders and their PDFs."""
+        logger.info(f"Processing State: {state_folder.name}")
+        hospital_base_path = state_folder / self.config.hospital_subfolder
+        if not hospital_base_path.exists():
+            logger.warning(f"No '{self.config.hospital_subfolder}' folder found in {state_folder.name}.")
+            return []
+
+        state_documents = []
+        hospital_subfolders = [d for d in hospital_base_path.iterdir() if d.is_dir()]
+        logger.info(f"Found {len(hospital_subfolders)} hospital subfolders in {state_folder.name}.")
+
+        for hospital_folder in hospital_subfolders:
+            try:
+                logger.info(f"  Scanning hospital: {hospital_folder.name}")
+                pdf_paths = hospital_folder.rglob("*.pdf")
+                
+                for pdf_path in pdf_paths:
+                    path_str = str(pdf_path)
+                    if path_str.startswith('\\\\') and not path_str.startswith('\\\\?\\'):
+                        path_str = '\\\\?\\UNC\\' + path_str[2:]
+                    
+                    if os.path.exists(path_str):
+                        stats = os.stat(path_str)
+                        doc = DocumentMetadata(
+                            source_path=path_str,
+                            pdf_name=pdf_path.name,
+                            state=state_folder.name,
+                            file_size=stats.st_size,
+                            last_modified=datetime.fromtimestamp(stats.st_mtime)
+                        )
+                        state_documents.append(doc)
+                    else:
+                        logger.warning(f"    Path discovered but not found: {pdf_path.name}")
+
+            except Exception as e:
+                logger.error(f"  Could not process hospital folder {hospital_folder.name}: {e}")
+        
+        logger.info(f"  Found {len(state_documents)} documents in {state_folder.name}.")
+        return state_documents
+
+    def _is_state_folder(self, folder_path: Path) -> bool:
+        """A helper to identify state folders based on the configured list of names."""
+        return any(state in folder_path.name.upper() for state in self.config.us_states)
+
+class HealthcareDocumentClassifier:
+    """Enhanced classifier with proper initialization and single-pass processing."""
+    def __init__(self, client, config: ClassificationConfig):
+        self.client = client
+        self.config = config
+        self.pdf_handler = EnhancedPDFHandler()
+        
+        # Statistics tracking
+        self.complexity_stats = {
+            'simple': 0,
+            'moderate': 0, 
+            'complex': 0,
+            'problematic': 0
+        }
+        self.issue_frequency = {}
+
+    def classify_all_documents(self, documents: List[DocumentMetadata]) -> Dict[str, List[DocumentMetadata]]:
+        """Single-pass classification that analyzes complexity and classifies in one operation."""
+        logger.info(f"Starting optimized single-pass classification of {len(documents)} documents...")
+        
+        results = {
+            'relevant': [], 
+            'not_healthcare': [], 
+            'old_date': [], 
+            'no_date': [], 
+            'failed': [],
+            'pdf_corrupted': [],
+            'form_field_issues': []
+        }
+        
+        for i, doc in enumerate(documents, 1):
+            logger.info(f"--> Processing {i}/{len(documents)}: {doc.pdf_name} (State: {doc.state})")
+            
+            try:
+                classification_result = self._classify_single_document_optimized(doc)
+                
+                # Update the original document object with the classification outcome
+                doc.processing_time = classification_result.processing_time
+                doc.confidence_score = classification_result.confidence
+                doc.detected_on_page = classification_result.detected_on_page
+                doc.effective_date = classification_result.effective_date
+                doc.stage_failed = classification_result.stage_failed
+                doc.classification_status = "completed"
+                
+                # Update complexity statistics
+                self.complexity_stats[doc.pdf_complexity_level] += 1
+                for issue in doc.pdf_issues:
+                    self.issue_frequency[issue] = self.issue_frequency.get(issue, 0) + 1
+
+                if classification_result.is_relevant:
+                    doc.classification_result = "relevant"
+                    results['relevant'].append(doc)
+                    logger.info(f"    └── SUCCESS: Document is relevant. Effective Date: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'}")
+                else:
+                    # Enhanced categorization
+                    if "form field" in doc.stage_failed.lower():
+                        reason_key = 'form_field_issues'
+                    elif "Stage 2: No effective date" in doc.stage_failed:
+                        reason_key = 'no_date'
+                    elif "Stage 2: Effective date before" in doc.stage_failed:
+                        reason_key = 'old_date'
+                    elif "PDF corruption" in doc.stage_failed or "Unable to open" in doc.stage_failed:
+                        reason_key = 'pdf_corrupted'
+                    else:
+                        reason_key = 'not_healthcare'
+                    
+                    doc.classification_result = reason_key
+                    results[reason_key].append(doc)
+                    logger.info(f"    └── REJECTED: {doc.stage_failed}")
+
+            except Exception as e:
+                logger.error(f"    └── CLASSIFICATION FAILED for {doc.pdf_name}: {e}")
+                doc.classification_result = "failed"
+                doc.error_message = str(e)
+                doc.pdf_complexity_level = "problematic"
+                self.complexity_stats["problematic"] += 1
+                results['failed'].append(doc)
+        
+        # Add complexity analysis summary to results
+        total_docs = len(documents)
+        results['complexity_analysis'] = {
+            'total_analyzed': total_docs,
+            'complexity_distribution': {
+                level: {'count': count, 'percentage': (count/total_docs)*100 if total_docs > 0 else 0}
+                for level, count in self.complexity_stats.items()
+            },
+            'common_issues': dict(sorted(self.issue_frequency.items(), 
+                                       key=lambda x: x[1], reverse=True)),
+            'recommendations': self._generate_recommendations()
+        }
+        
+        return results
+
+    def _classify_single_document_optimized(self, doc: DocumentMetadata) -> ClassificationResult:
+        """Optimized single-pass classification that combines complexity analysis and processing."""
+        start_time = time.time()
+        pdf_doc = None
+        
+        try:
+            # Step 1: Attempt to open PDF with repair strategies
+            pdf_doc = self.pdf_handler.attempt_pdf_open_with_strategies(doc.source_path)
+            
+            if pdf_doc is None:
+                doc.pdf_complexity_level = "problematic"
+                doc.pdf_issues = ["unable_to_open"]
+                return ClassificationResult(
+                    False, 
+                    stage_failed="PDF corruption: Unable to open PDF after all repair attempts",
+                    processing_time=time.time() - start_time
+                )
+            
+            # Step 2: Analyze complexity on the already-opened document
+            if self.config.enable_complexity_analysis:
+                complexity_info = self.pdf_handler.quick_complexity_check(pdf_doc)
+                doc.pdf_complexity_level = complexity_info.complexity_level
+                doc.pdf_issues = complexity_info.potential_issues.copy()
+            else:
+                doc.pdf_complexity_level = "simple"
+                doc.pdf_issues = []
+            
+            # Check if PDF has any accessible pages
+            if len(pdf_doc) == 0:
+                doc.pdf_complexity_level = "problematic"
+                doc.pdf_issues.append("no_pages")
+                return ClassificationResult(
+                    False, 
+                    stage_failed="PDF corruption: No accessible pages found",
+                    processing_time=time.time() - start_time
+                )
+            
+            # Step 3: Process based on complexity level
+            pages_to_check = self._get_pages_to_analyze_safely(pdf_doc)
+            
+            if not pages_to_check:
+                doc.pdf_issues.append("no_accessible_pages")
+                return ClassificationResult(
+                    False, 
+                    stage_failed="PDF corruption: No accessible pages for analysis",
+                    processing_time=time.time() - start_time
+                )
+
+            accessible_pages_count = 0
+            for page_idx in pages_to_check:
+                page = self.pdf_handler.safe_page_access(pdf_doc, page_idx)
+                if page is None:
+                    logger.debug(f"Skipping corrupted page {page_idx + 1} in {doc.pdf_name}")
+                    continue
+                
+                accessible_pages_count += 1
+                
+                # Stage 1: Check if the page contains a relevant healthcare contract
+                if not self._is_healthcare_contract_safe(page):
+                    continue
+
+                # Stage 2: If it is a contract, check for a valid effective date
+                date_result = self._get_effective_date_safe(page)
+                processing_time = time.time() - start_time
+                
+                if date_result and date_result.year >= self.config.min_effective_year:
+                    confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                    return ClassificationResult(True, page_idx + 1, date_result, confidence=confidence, processing_time=processing_time)
+                elif date_result:
+                    confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                    stage_failed_msg = f"Stage 2: Effective date before {self.config.min_effective_year} ({date_result.year})"
+                    if doc.pdf_complexity_level in ['complex', 'moderate']:
+                        stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
+                    return ClassificationResult(False, page_idx + 1, date_result, stage_failed=stage_failed_msg, confidence=confidence, processing_time=processing_time)
+                else: 
+                    confidence = 0.8 if doc.pdf_complexity_level == 'simple' else 0.7
+                    stage_failed_msg = "Stage 2: No effective date found on relevant page"
+                    if doc.pdf_complexity_level in ['complex', 'moderate']:
+                        stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
+                    return ClassificationResult(False, page_idx + 1, None, stage_failed=stage_failed_msg, confidence=confidence, processing_time=processing_time)
+
+            # If we processed some pages but found no contracts
+            if accessible_pages_count > 0:
+                confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                stage_failed_msg = "Stage 1: Not a healthcare contract"
+                if doc.pdf_complexity_level in ['complex', 'moderate']:
+                    stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
+                return ClassificationResult(False, stage_failed=stage_failed_msg, confidence=confidence, processing_time=time.time() - start_time)
+            else:
+                doc.pdf_issues.append("no_processable_pages")
+                return ClassificationResult(False, stage_failed="PDF corruption: No pages could be processed", processing_time=time.time() - start_time)
+                
+        except Exception as e:
+            raise RuntimeError(f"Failed to process PDF {doc.pdf_name}") from e
+        finally:
+            if pdf_doc:
+                try:
+                    pdf_doc.close()
+                except:
+                    pass
+
+    def _get_pages_to_analyze_safely(self, pdf_doc: fitz.Document) -> List[int]:
+        """Enhanced page selection that prioritizes accessible pages."""
+        total_pages = len(pdf_doc)
+        
+        if total_pages <= (self.config.first_pages_count + self.config.last_pages_count):
+            candidate_pages = list(range(total_pages))
+        else:
+            first = list(range(self.config.first_pages_count))
+            last = list(range(total_pages - self.config.last_pages_count, total_pages))
+            candidate_pages = sorted(list(set(first + last)))
+        
+        # Filter out pages that can't be accessed
+        accessible_pages = []
+        for page_idx in candidate_pages:
+            if self.pdf_handler.safe_page_access(pdf_doc, page_idx) is not None:
+                accessible_pages.append(page_idx)
+        
+        logger.debug(f"Selected {len(accessible_pages)} accessible pages out of {len(candidate_pages)} candidates")
+        return accessible_pages
+
+    def _call_gemini_safe(self, page: fitz.Page, prompt: str) -> Optional[str]:
+        """Enhanced Gemini API call with better error handling."""
+        try:
+            mat = fitz.Matrix(self.config.image_dpi / 72, self.config.image_dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Verify the pixmap is valid
+            if pix.width == 0 or pix.height == 0:
+                logger.debug("Generated pixmap has zero dimensions")
+                return None
+                
+            image_bytes = pix.tobytes("png")
+            
+            if len(image_bytes) == 0:
+                logger.debug("Generated image bytes are empty")
+                return None
+            
+            response = self.client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[types.Part.from_bytes(data=image_bytes, mime_type='image/png'), prompt]
+            )
+            return response.text.strip()
+            
+        except Exception as e:
+            logger.debug(f"Gemini API call failed: {e}")
+            return None
+
+    def _is_healthcare_contract_safe(self, page: fitz.Page) -> bool:
+        """Safe healthcare contract detection with error handling."""
+        try:
+            answer = self._call_gemini_safe(page, self.config.healthcare_contract_prompt)
+            return answer and 'YES' in answer.upper()
+        except Exception as e:
+            logger.debug(f"Healthcare contract check failed: {e}")
+            return False
+
+    def _get_effective_date_safe(self, page: fitz.Page) -> Optional[datetime]:
+        """Safe effective date extraction with error handling."""
+        try:
+            date_text = self._call_gemini_safe(page, self.config.effective_date_prompt)
+            if not date_text or "NOT_FOUND" in date_text:
+                return None
+            return parser.parse(date_text)
+        except (parser.ParserError, TypeError, Exception) as e:
+            logger.debug(f"Could not parse date from AI response '{date_text}': {e}")
+            return None
+
+    def _generate_recommendations(self) -> List[str]:
+        """Generate processing recommendations based on complexity analysis."""
+        recommendations = []
+        
+        if self.issue_frequency.get('form_fields', 0) > 0:
+            recommendations.append(
+                f"Form fields detected in {self.issue_frequency['form_fields']} documents. "
+                "Consider implementing form field flattening for these documents."
+            )
+        
+        if self.issue_frequency.get('digital_signatures', 0) > 0:
+            recommendations.append(
+                f"Digital signatures detected in {self.issue_frequency['digital_signatures']} documents. "
+                "These may cause xref errors during processing."
+            )
+        
+        if self.complexity_stats['problematic'] > self.complexity_stats['simple']:
+            recommendations.append(
+                "High proportion of problematic PDFs detected. "
+                "Consider implementing additional PDF repair strategies."
+            )
+        
+        total_complex = self.complexity_stats['complex'] + self.complexity_stats['moderate']
+        total_processed = sum(self.complexity_stats.values())
+        if total_processed > 0 and (total_complex / total_processed) > 0.3:
+            recommendations.append(
+                f"30%+ of documents are moderately to highly complex. "
+                f"Consider enabling specialized processing pipelines."
+            )
+        
+        return recommendations
+
+class EnterpriseHealthcareClassificationSystem:
+    """Enhanced main class with optimized processing and better error reporting."""
+    def __init__(self, client, output_dir: str = "classification_results"):
+        self.client = client
+        self.config = ClassificationConfig()
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def run_classification(self, root_folder_path: str) -> Dict[str, Any]:
+        """Executes the optimized end-to-end process and returns comprehensive results."""
+        start_time = time.time()
+        logger.info("STARTING OPTIMIZED ENTERPRISE CLASSIFICATION")
+
+        # Step 1: Discover all potential documents
+        discovery = EnterpriseFileDiscovery(root_folder_path, self.config)
+        all_documents = discovery.discover_all_documents()
+        if not all_documents:
+            logger.error("No documents were found. Exiting.")
+            return {
+                'success': False,
+                'error': 'No documents found',
+                'output_directory': str(self.output_dir)
+            }
+
+        # Step 2: Single-pass classification with integrated complexity analysis
+        classifier = HealthcareDocumentClassifier(self.client, self.config)
+        results = classifier.classify_all_documents(all_documents)
+
+        # Step 3: Save the results to output files
+        output_files = self._save_reports(all_documents, results)
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        logger.info("CLASSIFICATION COMPLETE")
+        logger.info(f"Total time: {total_time:.2f} seconds")
+        self._print_summary(results)
+        
+        # Return comprehensive results for the caller
+        return {
+            'success': True,
+            'output_directory': str(self.output_dir),
+            'total_documents_processed': len(all_documents),
+            'relevant_documents_found': len(results['relevant']),
+            'processing_time_seconds': total_time,
+            'output_files': output_files,
+            'classification_breakdown': {
+                'relevant': len(results['relevant']),
+                'not_healthcare': len(results['not_healthcare']),
+                'old_date': len(results['old_date']),
+                'no_date': len(results['no_date']),
+                'form_field_issues': len(results['form_field_issues']),
+                'pdf_corrupted': len(results['pdf_corrupted']),
+                'failed': len(results['failed'])
+            },
+            'complexity_analysis': results.get('complexity_analysis', {}),
+            'success_rate_percentage': (len(results['relevant']) / len(all_documents)) * 100 if all_documents else 0
+        }
+
+    def _save_reports(self, all_docs: List[DocumentMetadata], results: Dict[str, List[DocumentMetadata]]) -> Dict[str, str]:
+        """Enhanced reporting with complexity tracking and performance metrics."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_files = {}
+        
+        # Enhanced detailed report with complexity information
+        report_path = self.output_dir / f"full_classification_report_{timestamp}.csv"
+        with open(report_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'source_path', 'pdf_name', 'state', 'classification_result', 
+                'effective_date', 'detected_on_page', 'stage_failed', 'error_message', 
+                'complexity_level', 'pdf_issues', 'processing_time', 'confidence_score'
+            ])
+            for doc in all_docs:
+                writer.writerow([
+                    doc.source_path, 
+                    doc.pdf_name, 
+                    doc.state, 
+                    doc.classification_result, 
+                    doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '', 
+                    doc.detected_on_page or '', 
+                    doc.stage_failed, 
+                    doc.error_message,
+                    doc.pdf_complexity_level,
+                    '; '.join(doc.pdf_issues) if doc.pdf_issues else '',
+                    f"{doc.processing_time:.2f}s",
+                    f"{doc.confidence_score:.2f}"
+                ])
+        output_files['detailed_report'] = str(report_path)
+        logger.info(f"Enhanced CSV report saved to: {report_path}")
+
+        # Simple text file for relevant documents (for extraction pipeline)
+        relevant_paths = self.output_dir / f"relevant_healthcare_documents_{timestamp}.txt"
+        with open(relevant_paths, 'w', encoding='utf-8') as f:
+            for doc in results['relevant']:
+                f.write(f"{doc.source_path}\n")
+        output_files['relevant_documents'] = str(relevant_paths)
+        logger.info(f"Relevant healthcare documents list saved to: {relevant_paths}")
+
+        # Summary statistics file
+        summary_path = self.output_dir / f"processing_summary_{timestamp}.json"
+        summary_data = {
+            'total_documents': len(all_docs),
+            'processing_results': {category: len(docs) for category, docs in results.items() 
+                                 if category != 'complexity_analysis'},
+            'complexity_analysis': results.get('complexity_analysis', {}),
+            'average_processing_time': sum(doc.processing_time for doc in all_docs) / len(all_docs) if all_docs else 0,
+            'success_rate': (len(results['relevant']) / len(all_docs)) * 100 if all_docs else 0
+        }
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2, default=str)
+        output_files['processing_summary'] = str(summary_path)
+        logger.info(f"Processing summary saved to: {summary_path}")
+        
+        return output_files
+
+    def _print_summary(self, results: Dict[str, List[DocumentMetadata]]):
+        """Enhanced summary with complexity and performance statistics."""
+        print("\n" + "="*60)
+        print("FINAL CLASSIFICATION SUMMARY")
+        print("="*60)
+        print(f"  Relevant Documents (2020+):     {len(results['relevant'])}")
+        print(f"  Not Healthcare Contracts:       {len(results['not_healthcare'])}")
+        print(f"  Old Dates (< 2020):             {len(results['old_date'])}")
+        print(f"  No Date Found:                  {len(results['no_date'])}")
+        print(f"  Form Field Issues:              {len(results['form_field_issues'])}")
+        print(f"  PDF Corrupted/Unreadable:       {len(results['pdf_corrupted'])}")
+        print(f"  Failed Processing:              {len(results['failed'])}")
+        print("="*60)
+
+# ==========================================
+# MAIN CLASSIFICATION FUNCTIONS
+# ==========================================
+
+def create_classification_client():
+    """Create Google AI client for classification."""
+    return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+
+def run_enterprise_healthcare_classification(
+    root_folder_path: str, 
+    output_dir: str = "healthcare_classification_results"
+) -> Dict[str, Any]:
+    """
+    Main function to run enterprise healthcare document classification.
+    
+    Args:
+        root_folder_path: Path to root folder containing AGREEMENTS-NON STANDARD
+        output_dir: Directory to save classification results
+        
+    Returns:
+        Dictionary with classification results and statistics
+    """
+    client = create_classification_client()
+    classification_system = EnterpriseHealthcareClassificationSystem(
+        client=client, 
+        output_dir=output_dir
+    )
+    
+    # Execute the classification process
+    return classification_system.run_classification(
+        root_folder_path=root_folder_path
+    )
+
+# ==========================================
+# MAIN EXECUTION FOR TESTING
+# ==========================================
+
+if __name__ == "__main__":
+    # This allows the module to be run independently for testing
+    ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"  # Your network path
+    OUTPUT_DIR = "healthcare_classification_results"
+
+    try:
+        # Run the healthcare document classification
+        results = run_enterprise_healthcare_classification(
+            root_folder_path=ROOT_FOLDER_PATH,
+            output_dir=OUTPUT_DIR
+        )
+        
+        print("\nHEALTHCARE CLASSIFICATION COMPLETED SUCCESSFULLY!")
+        print(f"Check the output directory: {results.get('output_directory')}")
+        print(f"Use 'relevant_healthcare_documents_*.txt' with your extraction code")
+        print(f"Found {results.get('relevant_documents_found', 0)} relevant healthcare documents with 2020+ effective dates")
+        
+    except Exception as e:
+        logger.error(f"Critical error in main execution: {e}")
+        print(f"Error: {e}")
