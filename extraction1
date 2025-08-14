@@ -1,0 +1,515 @@
+"""
+extraction.py - Enhanced Document Extraction Module for Healthcare Contracts
+
+This module contains your existing extraction system with enhancements for 
+integration with the two-stage pipeline automation.
+"""
+
+import fitz
+import csv
+import json
+import logging
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Type
+from pydantic import BaseModel, Field, create_model, ValidationError
+from google.genai import types
+import google.genai as genai
+from datetime import datetime
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# CONFIGURATION SYSTEM
+# ==========================================
+
+class ExtractionField(BaseModel):
+    """Configuration for a single extraction field."""
+    name: str
+    description: str
+    field_type: str = "Optional[str]"
+    examples: List[str] = Field(default_factory=list)
+
+class DocumentTypeConfig(BaseModel):
+    """Configuration for a specific document type, making the extractor generic."""
+    document_type: str
+    description: str
+    document_fields: List[ExtractionField] = Field(default_factory=list)
+    row_fields: List[ExtractionField] = Field(default_factory=list)
+    detection_prompt: str
+    extraction_instructions: str
+    csv_columns: List[str]
+
+# Healthcare Contract Configuration
+HEALTHCARE_CONTRACT_CONFIG = DocumentTypeConfig(
+    document_type="HealthcareContract",
+    description="Aetna healthcare contract for charge master increases.",
+    document_fields=[
+        ExtractionField(
+            name="notification_received_date", 
+            description="The date mentioned in the sentence 'We have received your email dated [DATE]' in the letter body - NOT the letter header date.", 
+            examples=["December 6, 2024", "11/13/2024"]
+        ),
+        ExtractionField(name="contract_duration", description="The contract term or period.", examples=["12-month period"]),
+        ExtractionField(name="effective_date", description="The effective date for all charge master increases mentioned in this letter.", examples=["January 1, 2025", "1/1/2025"])
+    ],
+    row_fields=[
+        ExtractionField(name="hospital_name", description="The name of the facility from a table row."),
+        ExtractionField(
+            name="charge_master_limit", 
+            description="The complete contractual limit information including both Commercial and Medicare rates if present. Format as 'Commercial X%, Medicare Y%' or single percentage if only one rate.",
+            examples=["Commercial 4%, Medicare 3%", "CP 4.5%/ME 3.0%", "4%"]
+        ),
+        ExtractionField(name="charge_master_increase", description="The increase percentage from the same row.")
+    ],
+    detection_prompt="""Analyze the image. Is this a formal letter from Aetna about a 'charge master increase' where they state 'we have received' a notification? Answer only YES or NO.""",
+    extraction_instructions="""Extract ALL relevant data from this Aetna charge master increase notification letter. 
+
+CRITICAL INSTRUCTIONS:
+1. For 'notification_received_date': Look for the phrase 'We have received your email dated [DATE]' in the letter body paragraphs - DO NOT use the letter header date.
+2. For 'charge_master_limit': Capture the COMPLETE limit information including both Commercial and Medicare rates when present. Examples:
+   - If you see "Commercial 4% and Medicare 3%" → extract as "Commercial 4%, Medicare 3%"
+   - If you see "CP 4.5%/ME 3.0%" → extract as "CP 4.5%/ME 3.0%"
+   - If only one rate is shown → extract that single rate
+3. For 'effective_date': Extract the effective date that applies to all facilities in this letter - usually mentioned as "effective [DATE]" or "to become effective [DATE]"
+4. Create one row for each facility mentioned, ensuring no fields are left empty when information is available.""",
+    csv_columns=[
+        "hospital_name", "charge_master_limit", "charge_master_increase", # Row Fields
+        "notification_received_date", "contract_duration", "effective_date", # Document Fields
+        "document_source", "page_number" # Metadata
+    ]
+)
+
+# ==========================================
+# DYNAMIC MODEL FACTORY
+# ==========================================
+
+def create_dynamic_models(config: DocumentTypeConfig) -> (Type[BaseModel], Type[BaseModel]):
+    """Dynamically creates Pydantic models for row and document data based on the config."""
+    
+    # Create the RowModel
+    row_model_fields = {
+        field.name: (Optional[str], Field(None, description=field.description))
+        for field in config.row_fields
+    }
+    RowModel = create_model(f"{config.document_type}Row", **row_model_fields)
+
+    # Create the DocumentExtractionModel
+    doc_model_fields = {
+        field.name: (Optional[str], Field(None, description=field.description))
+        for field in config.document_fields
+    }
+    doc_model_fields['rows'] = (List[RowModel], Field(default_factory=list, description="All extracted table rows."))
+    DocumentModel = create_model(f"{config.document_type}Extraction", **doc_model_fields)
+    
+    logger.info(f"Dynamically created Pydantic models for document type: {config.document_type}")
+    return RowModel, DocumentModel
+
+# ==========================================
+# STATE MANAGER - HANDLES MULTIPLE LETTERS PER PDF
+# ==========================================
+
+class StateManager:
+    """State manager that properly handles multiple separate letters in one PDF."""
+    def __init__(self, config: DocumentTypeConfig):
+        self.config = config
+        self.columns = config.csv_columns
+        self._csv_file = None
+        self._csv_writer = None
+        self.all_letter_data = []  # Store complete letter data separately
+
+    def start_csv(self, output_path: Path):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._csv_file = open(output_path, 'w', newline='', encoding='utf-8')
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow(self.columns)
+
+    def process_letter_page(self, extraction_data: BaseModel, document_name: str, page_num: int):
+        """Process each letter page as a potentially separate letter."""
+        
+        # Check if this page starts a NEW letter by looking for key identifiers
+        is_new_letter = getattr(extraction_data, 'notification_received_date', None) is not None
+        
+        if is_new_letter:
+            # This is a new letter - create new letter entry
+            letter_data = {
+                "doc_fields": {},
+                "rows": [],
+                "start_page": page_num
+            }
+            
+            # Collect document-level fields from this page
+            for field in self.config.document_fields:
+                value = getattr(extraction_data, field.name, None)
+                letter_data["doc_fields"][field.name] = value
+                if value:
+                    logger.info(f"New letter detected on page {page_num} - {field.name}: {value}")
+            
+            # Add any rows from this page
+            for row_data in extraction_data.rows:
+                row_dict = {field.name: getattr(row_data, field.name, "N/A") for field in self.config.row_fields}
+                row_dict["document_source"] = document_name
+                row_dict["page_number"] = page_num
+                letter_data["rows"].append(row_dict)
+            
+            self.all_letter_data.append(letter_data)
+            logger.info(f"Started new letter #{len(self.all_letter_data)} on page {page_num} with {len(extraction_data.rows)} rows")
+            
+        else:
+            # This is a continuation page - add to the most recent letter
+            if self.all_letter_data:
+                current_letter = self.all_letter_data[-1]
+                
+                # Update missing document fields from continuation pages (if any)
+                for field in self.config.document_fields:
+                    value = getattr(extraction_data, field.name, None)
+                    if value and not current_letter["doc_fields"].get(field.name):
+                        current_letter["doc_fields"][field.name] = value
+                        logger.info(f"Updated letter #{len(self.all_letter_data)} with {field.name}: {value} from page {page_num}")
+                
+                # Add rows if any
+                if extraction_data.rows:
+                    for row_data in extraction_data.rows:
+                        row_dict = {field.name: getattr(row_data, field.name, "N/A") for field in self.config.row_fields}
+                        row_dict["document_source"] = document_name
+                        row_dict["page_number"] = page_num
+                        current_letter["rows"].append(row_dict)
+                    
+                    logger.info(f"Added {len(extraction_data.rows)} rows to letter #{len(self.all_letter_data)} from page {page_num}")
+                else:
+                    logger.info(f"Page {page_num} is continuation page of letter #{len(self.all_letter_data)} (no additional rows)")
+            else:
+                # Edge case: continuation page without a previous letter - treat as new letter
+                logger.warning(f"Page {page_num} appears to be continuation but no current letter exists - treating as new letter")
+                letter_data = {
+                    "doc_fields": {field.name: getattr(extraction_data, field.name, None) for field in self.config.document_fields},
+                    "rows": [],
+                    "start_page": page_num
+                }
+                
+                for row_data in extraction_data.rows:
+                    row_dict = {field.name: getattr(row_data, field.name, "N/A") for field in self.config.row_fields}
+                    row_dict["document_source"] = document_name
+                    row_dict["page_number"] = page_num
+                    letter_data["rows"].append(row_dict)
+                
+                self.all_letter_data.append(letter_data)
+
+    def write_all_letters(self) -> int:
+        """Write all letters with their respective document-level fields."""
+        total_rows_written = 0
+        
+        logger.info(f"Writing {len(self.all_letter_data)} separate letters to CSV")
+        
+        for letter_idx, letter_data in enumerate(self.all_letter_data, 1):
+            logger.info(f"Writing letter #{letter_idx} with {len(letter_data['rows'])} rows")
+            
+            # Write each row of this letter with its specific document-level fields
+            for row_dict in letter_data["rows"]:
+                csv_row_data = {}
+                
+                # Add row-level data
+                for field in self.config.row_fields:
+                    csv_row_data[field.name] = row_dict.get(field.name, "N/A")
+                
+                # Add THIS LETTER'S document-level data
+                for field in self.config.document_fields:
+                    csv_row_data[field.name] = letter_data["doc_fields"].get(field.name, "N/A")
+                
+                # Add metadata
+                csv_row_data["document_source"] = row_dict.get("document_source", "N/A")
+                csv_row_data["page_number"] = row_dict.get("page_number", "N/A")
+                
+                # Write in the order specified by config
+                self._csv_writer.writerow([csv_row_data.get(col, "N/A") for col in self.columns])
+                total_rows_written += 1
+        
+        if self._csv_file:
+            self._csv_file.flush()
+            
+        logger.info(f"Successfully wrote {total_rows_written} rows from {len(self.all_letter_data)} separate letters")
+        return total_rows_written
+
+    def close_csv(self):
+        if self._csv_file:
+            self._csv_file.close()
+
+# ==========================================
+# DOCUMENT EXTRACTOR WITH LETTER DETECTION
+# ==========================================
+
+class DocumentExtractor:
+    def __init__(self, client, config: DocumentTypeConfig, output_dir: str = "document_extraction"):
+        self.client = client
+        self.config = config
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create components from config
+        self.RowModel, self.DocumentModel = create_dynamic_models(config)
+        self.state_manager = StateManager(config)
+        self.extraction_prompt = self._build_extraction_prompt()
+
+    def _build_extraction_prompt(self) -> str:
+        """Builds extraction prompt optimized for detecting new letters."""
+        doc_fields_str = "\n".join(
+            f"- **{f.name}**: {f.description} (e.g., '{', '.join(f.examples)}')" for f in self.config.document_fields
+        )
+        row_fields_str = "\n".join(
+            f"- **{f.name}**: {f.description} (e.g., '{', '.join(f.examples)}')" for f in self.config.row_fields
+        )
+        json_schema = json.dumps(self.DocumentModel.model_json_schema(), indent=2)
+        
+        return f"""
+You are an expert data extraction AI. {self.config.extraction_instructions}
+
+### CRITICAL: LETTER BOUNDARY DETECTION
+- A NEW letter starts with "Dear..." greeting AND "We have received your letter/email" phrase
+- Extract ALL data that appears BEFORE the words "Enclosure" or "Sincerely" 
+- COMPLETELY IGNORE any tables, data, or content that appears AFTER "Enclosure" or "Sincerely"
+- If you see "Enclosure" or "Sincerely", treat that as the END of the letter - do not extract anything below those words
+- Summary tables, rate sheets, or facility details that appear AFTER letter closing should be completely ignored
+
+### EXTRACTION RULES:
+1. If this page has "Dear..." and "We have received..." → extract document-level fields from letter portion only
+2. Extract facility/hospital rows ONLY from the letter content (before "Enclosure"/"Sincerely")  
+3. If content appears after "Enclosure"/"Sincerely", pretend it doesn't exist
+
+### EXTRACTION SCHEMA
+Follow this JSON schema precisely. Use `null` for any missing values.
+
+#### Document-Level Fields (from letter content only):
+{doc_fields_str}
+
+#### Row-Level Fields (from letter content only, BEFORE "Enclosure"/"Sincerely"):
+{row_fields_str}
+
+### JSON OUTPUT SCHEMA:
+{json_schema}
+"""
+
+    def _find_target_pages_with_ai(self, doc: fitz.Document, image_dir: Path, dpi: int) -> List[int]:
+        """Uses AI to classify each page and identify relevant healthcare contract pages."""
+        logger.info("Starting AI-powered page classification...")
+        pages_to_process = []
+        created_images = []
+        
+        for i in range(len(doc)):
+            page_num = i + 1
+            try:
+                page = doc.load_page(i)
+                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                pix = page.get_pixmap(matrix=mat)
+                
+                pdf_name = Path(doc.name).stem if doc.name else "document"
+                image_path = image_dir / f"{pdf_name}_page_{page_num:03d}.png"
+                pix.save(str(image_path))
+                created_images.append(image_path)
+                
+                logger.debug(f"Created image: {image_path}")
+
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+                
+                response = self.client.models.generate_content(
+                    model='gemini-1.5-flash',
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
+                        self.config.detection_prompt
+                    ]
+                )
+                answer = response.text.strip().upper()
+                
+                if 'YES' in answer:
+                    logger.info(f"AI classified page {page_num} as '{self.config.document_type}'.")
+                    pages_to_process.append(i)
+                else:
+                    logger.debug(f"AI classified page {page_num} as NOT '{self.config.document_type}'.")
+                    
+            except Exception as e:
+                logger.error(f"Could not classify page {page_num}: {e}")
+                continue
+            
+        logger.info(f"Created {len(created_images)} image files, identified {len(pages_to_process)} target pages")
+        return sorted(list(set(pages_to_process)))
+
+    def process_page(self, image_path: Path, page_num: int, document_name: str):
+        """Processes a single page for data extraction."""
+        try:
+            if not image_path.exists():
+                logger.error(f"Image file not found: {image_path}")
+                return None
+                
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            logger.debug(f"Processing page {page_num} for data extraction...")
+            
+            response = self.client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
+                    self.extraction_prompt
+                ]
+            )
+            response_text = response.text.strip().replace("```json", "").replace("```", "")
+            
+            logger.debug(f"Raw AI response for page {page_num} (first 300 chars): {response_text[:300]}...")
+            
+            extraction = self.DocumentModel.model_validate_json(response_text)
+            
+            # Log extraction results for debugging
+            logger.debug(f"Extracted from page {page_num}:")
+            logger.debug(f"  notification_received_date: {getattr(extraction, 'notification_received_date', 'None')}")
+            logger.debug(f"  Number of rows: {len(extraction.rows)}")
+            
+            # Process each page as potentially separate letter
+            self.state_manager.process_letter_page(extraction, document_name, page_num)
+            logger.debug(f"Data from page {page_num} processed")
+            
+            return extraction
+        except (ValidationError, json.JSONDecodeError) as e:
+            logger.error(f"Pydantic/JSON validation failed on page {page_num}: {e}")
+            logger.error(f"Raw response was: {response_text}")
+        except Exception as e:
+            logger.error(f"Extraction failed on page {page_num}: {e}")
+        return None
+
+    def extract_from_pdf(self, pdf_path: str, dpi: int = 200) -> Dict:
+        """Main orchestration method that properly handles multiple letters per PDF."""
+        pdf_path = Path(pdf_path)
+        doc = None
+        
+        try:
+            logger.info(f"Starting extraction for: {pdf_path.name}")
+            doc = fitz.open(str(pdf_path))
+            
+            image_dir = self.output_dir / self.config.document_type / pdf_path.stem
+            image_dir.mkdir(parents=True, exist_ok=True)
+            
+            indices = self._find_target_pages_with_ai(doc, image_dir, dpi)
+            
+            if not indices:
+                logger.warning(f"No '{self.config.document_type}' pages found in '{pdf_path.name}'.")
+                return {'total_pages_in_pdf': len(doc), 'pages_processed': 0, 'total_rows': 0}
+
+            csv_path = image_dir / f"{pdf_path.stem}_data.csv"
+            self.state_manager.start_csv(csv_path)
+            
+            # Process each page and detect letter boundaries automatically
+            logger.info(f"Processing {len(indices)} pages with automatic letter detection...")
+            successful_extractions = 0
+            for i in indices:
+                pdf_name = pdf_path.stem
+                image_path = image_dir / f"{pdf_name}_page_{i + 1:03d}.png"
+                
+                logger.debug(f"Processing page {i + 1}")
+                extraction = self.process_page(image_path, i + 1, pdf_path.name)
+                if extraction:
+                    successful_extractions += 1
+            
+            # Write all letters with their respective document fields
+            total_rows = self.state_manager.write_all_letters()
+            
+            self.state_manager.close_csv()
+            
+            result = {
+                'pdf_name': pdf_path.name,
+                'pdf_path': str(pdf_path),
+                'document_type': self.config.document_type,
+                'total_pages_in_pdf': len(doc),
+                'pages_processed': len(indices),
+                'successful_extractions': successful_extractions,
+                'total_rows': total_rows,
+                'letters_detected': len(self.state_manager.all_letter_data),
+                'csv_path': str(csv_path),
+                'extraction_timestamp': datetime.now().isoformat()
+            }
+            
+            logger.info(f"Extraction completed successfully for {pdf_path.name}")
+            logger.info(f"Detected {len(self.state_manager.all_letter_data)} separate letters with {total_rows} total rows")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Critical error during PDF extraction: {e}")
+            return {
+                'error': str(e), 
+                'pdf_name': pdf_path.name,
+                'pdf_path': str(pdf_path),
+                'extraction_timestamp': datetime.now().isoformat()
+            }
+        finally:
+            if doc:
+                try:
+                    doc.close()
+                    logger.debug(f"Document {pdf_path.name} closed successfully")
+                except Exception as e:
+                    logger.error(f"Error closing document: {e}")
+
+# ==========================================
+# MAIN EXTRACTION FUNCTIONS
+# ==========================================
+
+def create_extraction_client():
+    """Create Google AI client for extraction."""
+    return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+
+def run_healthcare_document_extraction(pdf_path: str, output_dir: str = "healthcare_extraction_output", client=None) -> Dict:
+    """Run healthcare contract extraction that properly handles multiple letters per PDF."""
+    if client is None:
+        client = create_extraction_client()
+    
+    extractor = DocumentExtractor(client=client, config=HEALTHCARE_CONTRACT_CONFIG, output_dir=output_dir)
+    return extractor.extract_from_pdf(pdf_path)
+
+def run_batch_extraction(pdf_paths: List[str], output_dir: str = "batch_extraction_output", client=None) -> List[Dict]:
+    """Run extraction on multiple PDFs."""
+    if client is None:
+        client = create_extraction_client()
+    
+    extractor = DocumentExtractor(client=client, config=HEALTHCARE_CONTRACT_CONFIG, output_dir=output_dir)
+    results = []
+    
+    for pdf_path in pdf_paths:
+        try:
+            result = extractor.extract_from_pdf(pdf_path)
+            results.append(result)
+        except Exception as e:
+            logger.error(f"Failed to extract from {pdf_path}: {e}")
+            results.append({
+                'error': str(e),
+                'pdf_path': pdf_path,
+                'extraction_timestamp': datetime.now().isoformat()
+            })
+    
+    return results
+
+# ==========================================
+# MAIN EXECUTION FOR TESTING
+# ==========================================
+
+if __name__ == "__main__":
+    # This allows the module to be run independently for testing
+    pdf_file_path = "test_document.pdf"  # Replace with your test PDF
+    
+    try:
+        results = run_healthcare_document_extraction(pdf_file_path)
+        
+        print("\n" + "="*70)
+        print("HEALTHCARE CONTRACT EXTRACTION RESULTS")
+        print("="*70)
+        print(f"Document Type: {results.get('document_type', 'N/A')}")
+        print(f"PDF: {results.get('pdf_name', 'N/A')}")
+        print(f"Total Pages in PDF: {results.get('total_pages_in_pdf', 'N/A')}")
+        print(f"Pages Processed: {results.get('pages_processed', 'N/A')}")
+        print(f"Letters Detected: {results.get('letters_detected', 'N/A')}")
+        print(f"Total Rows Extracted: {results.get('total_rows', 'N/A')}")
+        print(f"CSV Output: {results.get('csv_path', 'N/A')}")
+        print("="*70)
+        
+        if 'error' in results:
+            print(f"Error: {results['error']}")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        logger.error(f"Error in main execution: {e}")
