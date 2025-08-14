@@ -823,19 +823,271 @@ class EnterpriseHealthcareClassificationSystem:
             if problematic_count > 0:
                 print(f"ATTENTION NEEDED: {problematic_count} documents require manual review")
 
-if __name__ == "__main__":
-    # --- Script Configuration ---
-    GCP_PROJECT_ID = "anbc-hcb-dev"
-    GCP_LOCATION = "us-central1"
+# ==========================================
+# CLIENT SETUP & MAIN EXECUTION
+# ==========================================
+
+def create_client():
+    """Create Google AI client."""
+    return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+
+def run_enterprise_healthcare_classification(
+    root_folder_path: str, 
+    output_dir: str = "healthcare_classification_results",
+    max_workers: int = 3
+) -> Dict[str, Any]:
+    """
+    Main function to run enterprise healthcare document classification.
     
-    ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"
+    Args:
+        root_folder_path: Path to root folder containing AGREEMENTS-NON STANDARD
+        output_dir: Directory to save classification results
+        max_workers: Number of parallel workers for classification (future enhancement)
+        
+    Returns:
+        Dictionary with classification results and statistics
+    """
+    client = create_client()
+    classification_system = EnterpriseHealthcareClassificationSystem(
+        client=client, 
+        output_dir=output_dir
+    )
+    
+    # Execute the classification process
+    return classification_system.run_classification(
+        root_folder_path=root_folder_path
+    )
+
+class EnterpriseHealthcareClassificationSystem:
+    """Enhanced main class with optimized processing and better error reporting."""
+    def __init__(self, client, output_dir: str = "classification_results"):
+        self.client = client
+        self.config = ClassificationConfig()
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def run_classification(self, root_folder_path: str) -> Dict[str, Any]:
+        """
+        Executes the optimized end-to-end process and returns comprehensive results.
+        """
+        start_time = time.time()
+        logger.info("STARTING OPTIMIZED ENTERPRISE CLASSIFICATION")
+
+        # Step 1: Discover all potential documents
+        discovery = EnterpriseFileDiscovery(root_folder_path, self.config)
+        all_documents = discovery.discover_all_documents()
+        if not all_documents:
+            logger.error("No documents were found. Exiting.")
+            return {
+                'success': False,
+                'error': 'No documents found',
+                'output_directory': str(self.output_dir)
+            }
+
+        # Step 2: Single-pass classification with integrated complexity analysis
+        classifier = HealthcareDocumentClassifier(self.client, self.config)
+        results = classifier.classify_all_documents(all_documents)
+
+        # Step 3: Save the results to output files
+        output_files = self._save_reports(all_documents, results)
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        logger.info("CLASSIFICATION COMPLETE")
+        logger.info(f"Total time: {total_time:.2f} seconds")
+        self._print_summary(results)
+        
+        # Return comprehensive results for the caller
+        return {
+            'success': True,
+            'output_directory': str(self.output_dir),
+            'total_documents_processed': len(all_documents),
+            'relevant_documents_found': len(results['relevant']),
+            'processing_time_seconds': total_time,
+            'output_files': output_files,
+            'classification_breakdown': {
+                'relevant': len(results['relevant']),
+                'not_healthcare': len(results['not_healthcare']),
+                'old_date': len(results['old_date']),
+                'no_date': len(results['no_date']),
+                'form_field_issues': len(results['form_field_issues']),
+                'pdf_corrupted': len(results['pdf_corrupted']),
+                'failed': len(results['failed'])
+            },
+            'complexity_analysis': results.get('complexity_analysis', {}),
+            'success_rate_percentage': (len(results['relevant']) / len(all_documents)) * 100 if all_documents else 0
+        }
+
+    def run(self, root_folder_path: str):
+        """Legacy method for backwards compatibility."""
+        return self.run_classification(root_folder_path)
+
+    def _save_reports(self, all_docs: List[DocumentMetadata], results: Dict[str, List[DocumentMetadata]]) -> Dict[str, str]:
+        """Enhanced reporting with complexity tracking and performance metrics."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_files = {}
+        
+        # Enhanced detailed report with complexity information
+        report_path = self.output_dir / f"full_classification_report_{timestamp}.csv"
+        with open(report_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'source_path', 'pdf_name', 'state', 'classification_result', 
+                'effective_date', 'detected_on_page', 'stage_failed', 'error_message', 
+                'complexity_level', 'pdf_issues', 'processing_time', 'confidence_score'
+            ])
+            for doc in all_docs:
+                writer.writerow([
+                    doc.source_path, 
+                    doc.pdf_name, 
+                    doc.state, 
+                    doc.classification_result, 
+                    doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '', 
+                    doc.detected_on_page or '', 
+                    doc.stage_failed, 
+                    doc.error_message,
+                    doc.pdf_complexity_level,
+                    '; '.join(doc.pdf_issues) if doc.pdf_issues else '',
+                    f"{doc.processing_time:.2f}s",
+                    f"{doc.confidence_score:.2f}"
+                ])
+        output_files['detailed_report'] = str(report_path)
+        logger.info(f"Enhanced CSV report saved to: {report_path}")
+
+        # Complexity analysis report
+        complexity_analysis = results.get('complexity_analysis', {})
+        complexity_report_path = self.output_dir / f"complexity_analysis_{timestamp}.json"
+        with open(complexity_report_path, 'w', encoding='utf-8') as f:
+            json.dump(complexity_analysis, f, indent=2, default=str)
+        output_files['complexity_analysis'] = str(complexity_report_path)
+        logger.info(f"Complexity analysis saved to: {complexity_report_path}")
+
+        # Separate report for problematic PDFs
+        problematic_pdfs = [doc for doc in all_docs 
+                           if doc.pdf_complexity_level in ['problematic', 'complex'] 
+                           or doc.classification_result in ['pdf_corrupted', 'form_field_issues']]
+        
+        if problematic_pdfs:
+            problematic_report_path = self.output_dir / f"problematic_pdfs_report_{timestamp}.csv"
+            with open(problematic_report_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['source_path', 'pdf_name', 'state', 'complexity_level', 
+                               'issues', 'classification_result', 'file_size'])
+                for doc in problematic_pdfs:
+                    writer.writerow([
+                        doc.source_path, 
+                        doc.pdf_name, 
+                        doc.state, 
+                        doc.pdf_complexity_level,
+                        '; '.join(doc.pdf_issues) if doc.pdf_issues else '', 
+                        doc.classification_result, 
+                        doc.file_size
+                    ])
+            output_files['problematic_pdfs'] = str(problematic_report_path)
+            logger.info(f"Problematic PDFs report saved to: {problematic_report_path}")
+
+        # Simple text file for relevant documents (for extraction pipeline)
+        relevant_paths = self.output_dir / f"relevant_healthcare_documents_{timestamp}.txt"
+        with open(relevant_paths, 'w', encoding='utf-8') as f:
+            for doc in results['relevant']:
+                f.write(f"{doc.source_path}\n")
+        output_files['relevant_documents'] = str(relevant_paths)
+        logger.info(f"Relevant healthcare documents list saved to: {relevant_paths}")
+
+        # Summary statistics file
+        summary_path = self.output_dir / f"processing_summary_{timestamp}.json"
+        summary_data = {
+            'total_documents': len(all_docs),
+            'processing_results': {category: len(docs) for category, docs in results.items() 
+                                 if category != 'complexity_analysis'},
+            'complexity_analysis': complexity_analysis,
+            'average_processing_time': sum(doc.processing_time for doc in all_docs) / len(all_docs) if all_docs else 0,
+            'success_rate': (len(results['relevant']) / len(all_docs)) * 100 if all_docs else 0
+        }
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2, default=str)
+        output_files['processing_summary'] = str(summary_path)
+        logger.info(f"Processing summary saved to: {summary_path}")
+        
+        return output_files
+
+    def _print_summary(self, results: Dict[str, List[DocumentMetadata]]):
+        """Enhanced summary with complexity and performance statistics."""
+        print("\n" + "="*60)
+        print("FINAL CLASSIFICATION SUMMARY")
+        print("="*60)
+        print(f"  Relevant Documents (2020+):     {len(results['relevant'])}")
+        print(f"  Not Healthcare Contracts:       {len(results['not_healthcare'])}")
+        print(f"  Old Dates (< 2020):             {len(results['old_date'])}")
+        print(f"  No Date Found:                  {len(results['no_date'])}")
+        print(f"  Form Field Issues:              {len(results['form_field_issues'])}")
+        print(f"  PDF Corrupted/Unreadable:       {len(results['pdf_corrupted'])}")
+        print(f"  Failed Processing:              {len(results['failed'])}")
+        print("-" * 60)
+        
+        # Complexity distribution
+        complexity_analysis = results.get('complexity_analysis', {})
+        if complexity_analysis:
+            print("\nCOMPLEXITY DISTRIBUTION:")
+            distribution = complexity_analysis.get('complexity_distribution', {})
+            for level, stats in distribution.items():
+                count = stats.get('count', 0)
+                percentage = stats.get('percentage', 0)
+                print(f"  {level.capitalize():<12}: {count:>4} ({percentage:>5.1f}%)")
+            
+            # Common issues
+            common_issues = complexity_analysis.get('common_issues', {})
+            if common_issues:
+                print(f"\nCOMMON ISSUES:")
+                for issue, count in list(common_issues.items())[:5]:  # Top 5 issues
+                    print(f"  {issue.replace('_', ' ').title():<20}: {count}")
+            
+            # Recommendations
+            recommendations = complexity_analysis.get('recommendations', [])
+            if recommendations:
+                print(f"\nRECOMMENDATIONS:")
+                for i, rec in enumerate(recommendations, 1):
+                    print(f"  {i}. {rec}")
+        
+        print("="*60)
+        
+        # Performance metrics
+        total_docs = sum(len(docs) for category, docs in results.items() 
+                        if category != 'complexity_analysis')
+        if total_docs > 0:
+            success_rate = (len(results['relevant']) / total_docs) * 100
+            print(f"\nSUCCESS RATE: {success_rate:.1f}% ({len(results['relevant'])}/{total_docs})")
+            
+            problematic_count = (len(results['pdf_corrupted']) + 
+                               len(results['form_field_issues']) + 
+                               len(results['failed']))
+            if problematic_count > 0:
+                print(f"ATTENTION NEEDED: {problematic_count} documents require manual review")
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+if __name__ == "__main__":
+    # Configure for your enterprise environment
+    ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"  # Your network path
     OUTPUT_DIR = "healthcare_classification_results"
+    MAX_WORKERS = 3  # Adjust based on your system capacity
 
     try:
-        client = genai.Client(project=GCP_PROJECT_ID, location=GCP_LOCATION)
-        system = EnterpriseHealthcareClassificationSystem(client=client, output_dir=OUTPUT_DIR)
-        system.run(root_folder_path=ROOT_FOLDER_PATH)
-
+        # Run the healthcare document classification
+        results = run_enterprise_healthcare_classification(
+            root_folder_path=ROOT_FOLDER_PATH,
+            output_dir=OUTPUT_DIR,
+            max_workers=MAX_WORKERS
+        )
+        
+        print("\nHEALTHCARE CLASSIFICATION COMPLETED SUCCESSFULLY!")
+        print(f"Check the output directory: {results.get('output_directory')}")
+        print(f"Use 'relevant_healthcare_documents_*.txt' with your extraction code")
+        print(f"Found {results.get('relevant_documents_found', 0)} relevant healthcare documents with 2020+ effective dates")
+        
     except Exception as e:
-        logger.error(f"A critical error occurred in the main execution block: {e}", exc_info=True)
-        print(f"CRITICAL ERROR: {e}. Check healthcare_classification.log for details.")
+        logger.error(f"Critical error in main execution: {e}")
+        print(f"Error: {e}")
