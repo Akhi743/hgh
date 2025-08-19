@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from google.genai import types
 import google.genai as genai
-from datetime import datetime
+from datetime import datetime, date
 from dataclasses import dataclass
 from dateutil import parser
 
@@ -41,10 +41,17 @@ class DocumentMetadata:
     error_message: str = ""
     pdf_complexity_level: str = ""
     pdf_issues: List[str] = None
+    
+    # NEW: Enhanced file date tracking
+    file_modification_date: date = None
+    file_date_meets_criteria: bool = False
+    is_newly_modified: bool = False  # For incremental processing
 
     def __post_init__(self):
         if self.pdf_issues is None:
             self.pdf_issues = []
+        # Set file modification date for easy access
+        self.file_modification_date = self.last_modified.date()
 
 @dataclass
 class ClassificationResult:
@@ -73,14 +80,23 @@ class PDFComplexityInfo:
             self.potential_issues = []
 
 class ClassificationConfig:
-    """A central configuration class to make tweaking settings easy without digging through the code."""
+    """Enhanced configuration class with incremental processing capabilities."""
     def __init__(self):
         # Folder names the script will look for.
         self.agreements_folder = "AGREEMENTS-NON STANDARD"
         self.hospital_subfolder = "HOSPITAL"
         
-        # Key business logic setting: the minimum year for a document to be considered relevant.
-        self.min_effective_year = 2020
+        # Key business logic settings
+        self.min_effective_year = 2020  # Minimum year for effective date to be considered relevant
+        
+        # NEW: Enhanced file modification date filtering with incremental processing
+        self.min_file_modification_date = date(2019, 1, 1)  # Only process files modified from 01/01/2019
+        self.enable_file_date_prefilter = True  # Can be disabled for testing/debugging
+        self.enable_incremental_processing = True  # Only process files modified after last run
+        
+        # NEW: State persistence for incremental processing
+        self.state_file_path = "classification_state.json"
+        self.last_run_date = None  # Will be loaded from state file
         
         # Settings for AI processing.
         self.image_dpi = 150
@@ -110,6 +126,85 @@ class ClassificationConfig:
             'WEST VIRGINIA', 'WISCONSIN', 'WYOMING', 'PUERTO RICO', 'DISTRICT OF COLUMBIA'
         }
 
+class IncrementalStateManager:
+    """Manages state for incremental processing to avoid reprocessing unchanged files."""
+    
+    def __init__(self, state_file_path: str):
+        self.state_file_path = Path(state_file_path)
+        self.processed_files = {}  # file_path -> {last_modified, classification_result}
+        self.last_run_date = None
+        self.load_state()
+    
+    def load_state(self):
+        """Load the previous run state from disk."""
+        try:
+            if self.state_file_path.exists():
+                with open(self.state_file_path, 'r', encoding='utf-8') as f:
+                    state_data = json.load(f)
+                    
+                self.last_run_date = parser.parse(state_data.get('last_run_date')).date() if state_data.get('last_run_date') else None
+                self.processed_files = state_data.get('processed_files', {})
+                
+                logger.info(f"Loaded state: Last run = {self.last_run_date}, {len(self.processed_files)} previously processed files")
+            else:
+                logger.info("No previous state found. Will process all files.")
+        except Exception as e:
+            logger.warning(f"Could not load previous state: {e}. Starting fresh.")
+            self.processed_files = {}
+            self.last_run_date = None
+    
+    def save_state(self, current_run_date: date):
+        """Save the current run state to disk."""
+        try:
+            state_data = {
+                'last_run_date': current_run_date.isoformat(),
+                'processed_files': self.processed_files,
+                'total_files_processed': len(self.processed_files)
+            }
+            
+            with open(self.state_file_path, 'w', encoding='utf-8') as f:
+                json.dump(state_data, f, indent=2, default=str)
+                
+            logger.info(f"Saved state: {len(self.processed_files)} processed files as of {current_run_date}")
+        except Exception as e:
+            logger.error(f"Could not save state: {e}")
+    
+    def should_process_file(self, file_path: str, file_modified_date: date) -> bool:
+        """Determine if a file needs processing based on modification date."""
+        file_info = self.processed_files.get(file_path)
+        
+        if not file_info:
+            # File never processed before
+            return True
+        
+        # Check if file was modified since last processing
+        last_processed_date = parser.parse(file_info['last_modified']).date()
+        return file_modified_date > last_processed_date
+    
+    def update_file_status(self, file_path: str, file_modified_date: date, classification_result: str):
+        """Update the processing status of a file."""
+        self.processed_files[file_path] = {
+            'last_modified': file_modified_date.isoformat(),
+            'classification_result': classification_result,
+            'processed_on': datetime.now().isoformat()
+        }
+    
+    def get_processing_stats(self) -> Dict[str, Any]:
+        """Get statistics about incremental processing."""
+        if not self.processed_files:
+            return {'total_files': 0, 'classification_breakdown': {}}
+        
+        classification_counts = {}
+        for file_info in self.processed_files.values():
+            result = file_info.get('classification_result', 'unknown')
+            classification_counts[result] = classification_counts.get(result, 0) + 1
+        
+        return {
+            'total_files': len(self.processed_files),
+            'last_run_date': self.last_run_date.isoformat() if self.last_run_date else None,
+            'classification_breakdown': classification_counts
+        }
+
 class EnhancedPDFHandler:
     """
     Enhanced PDF handler that deals with form fields, digital signatures, 
@@ -119,7 +214,7 @@ class EnhancedPDFHandler:
     @staticmethod
     def quick_complexity_check(pdf_doc: fitz.Document) -> PDFComplexityInfo:
         """
-        FIXED: Performs complexity analysis on an already-opened document.
+        Performs complexity analysis on an already-opened document.
         This avoids redundant file operations.
         """
         complexity_info = PDFComplexityInfo()
@@ -355,12 +450,16 @@ class EnterpriseFileDiscovery:
         return any(state in folder_path.name.upper() for state in self.config.us_states)
 
 class HealthcareDocumentClassifier:
-    """FIXED: Enhanced classifier with proper initialization and single-pass processing."""
+    """Enhanced classifier with incremental processing and file date pre-filtering."""
     def __init__(self, client, config: ClassificationConfig):
         self.client = client
         self.config = config
-        # FIXED: Properly initialize the PDF handler
         self.pdf_handler = EnhancedPDFHandler()
+        
+        # NEW: Initialize incremental state manager
+        self.state_manager = IncrementalStateManager(config.state_file_path)
+        if self.config.enable_incremental_processing:
+            self.config.last_run_date = self.state_manager.last_run_date
         
         # Statistics tracking
         self.complexity_stats = {
@@ -370,13 +469,24 @@ class HealthcareDocumentClassifier:
             'problematic': 0
         }
         self.issue_frequency = {}
+        
+        # NEW: Incremental processing stats
+        self.incremental_stats = {
+            'total_discovered': 0,
+            'skipped_old_files': 0,
+            'skipped_unchanged': 0,
+            'newly_processed': 0
+        }
 
     def classify_all_documents(self, documents: List[DocumentMetadata]) -> Dict[str, List[DocumentMetadata]]:
         """
-        FIXED: Single-pass classification that analyzes complexity and classifies in one operation.
-        This eliminates redundant file operations.
+        Enhanced classification with incremental processing and file date pre-filtering.
         """
-        logger.info(f"Starting optimized single-pass classification of {len(documents)} documents...")
+        logger.info(f"Starting enhanced classification of {len(documents)} documents...")
+        self.incremental_stats['total_discovered'] = len(documents)
+        
+        # NEW: Apply file date and incremental filtering
+        documents_to_process = self._apply_pre_filtering(documents)
         
         results = {
             'relevant': [], 
@@ -385,15 +495,19 @@ class HealthcareDocumentClassifier:
             'no_date': [], 
             'failed': [],
             'pdf_corrupted': [],
-            'form_field_issues': []
+            'form_field_issues': [],
+            'old_file_date': [],        # NEW: Files modified before min_file_modification_date
+            'skipped_unchanged': []      # NEW: Files skipped due to incremental processing
         }
         
-        for i, doc in enumerate(documents, 1):
-            logger.info(f"--> Processing {i}/{len(documents)}: {doc.pdf_name} (State: {doc.state})")
+        logger.info(f"After pre-filtering: {len(documents_to_process)} documents to process")
+        
+        for i, doc in enumerate(documents_to_process, 1):
+            logger.info(f"--> Processing {i}/{len(documents_to_process)}: {doc.pdf_name} (State: {doc.state})")
             
             try:
-                # FIXED: Single operation that opens file once, analyzes complexity, and classifies
-                classification_result = self._classify_single_document_optimized(doc)
+                # Enhanced classification with pre-filtering
+                classification_result = self._classify_single_document_enhanced(doc)
                 
                 # Update the original document object with the classification outcome
                 doc.processing_time = classification_result.processing_time
@@ -404,7 +518,8 @@ class HealthcareDocumentClassifier:
                 doc.classification_status = "completed"
                 
                 # Update complexity statistics
-                self.complexity_stats[doc.pdf_complexity_level] += 1
+                if doc.pdf_complexity_level:
+                    self.complexity_stats[doc.pdf_complexity_level] += 1
                 for issue in doc.pdf_issues:
                     self.issue_frequency[issue] = self.issue_frequency.get(issue, 0) + 1
 
@@ -414,7 +529,9 @@ class HealthcareDocumentClassifier:
                     logger.info(f"    └── SUCCESS: Document is relevant. Effective Date: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'}")
                 else:
                     # Enhanced categorization
-                    if "form field" in doc.stage_failed.lower():
+                    if "old_file_date" in doc.stage_failed.lower():
+                        reason_key = 'old_file_date'
+                    elif "form field" in doc.stage_failed.lower():
                         reason_key = 'form_field_issues'
                     elif "Stage 2: No effective date" in doc.stage_failed:
                         reason_key = 'no_date'
@@ -429,6 +546,14 @@ class HealthcareDocumentClassifier:
                     results[reason_key].append(doc)
                     logger.info(f"    └── REJECTED: {doc.stage_failed}")
 
+                # NEW: Update incremental state
+                if self.config.enable_incremental_processing:
+                    self.state_manager.update_file_status(
+                        doc.source_path, 
+                        doc.file_modification_date, 
+                        doc.classification_result
+                    )
+
             except Exception as e:
                 logger.error(f"    └── CLASSIFICATION FAILED for {doc.pdf_name}: {e}")
                 doc.classification_result = "failed"
@@ -437,10 +562,15 @@ class HealthcareDocumentClassifier:
                 self.complexity_stats["problematic"] += 1
                 results['failed'].append(doc)
         
-        # Add complexity analysis summary to results
+        # NEW: Add skipped documents to results for reporting
+        skipped_docs = [doc for doc in documents if not doc.is_newly_modified and doc not in documents_to_process]
+        results['skipped_unchanged'].extend(skipped_docs)
+        
+        # Add comprehensive analysis summary to results
         total_docs = len(documents)
         results['complexity_analysis'] = {
             'total_analyzed': total_docs,
+            'incremental_stats': self.incremental_stats,
             'complexity_distribution': {
                 level: {'count': count, 'percentage': (count/total_docs)*100 if total_docs > 0 else 0}
                 for level, count in self.complexity_stats.items()
@@ -450,11 +580,58 @@ class HealthcareDocumentClassifier:
             'recommendations': self._generate_recommendations()
         }
         
+        # NEW: Save state after processing
+        if self.config.enable_incremental_processing:
+            self.state_manager.save_state(date.today())
+        
         return results
 
-    def _classify_single_document_optimized(self, doc: DocumentMetadata) -> ClassificationResult:
+    def _apply_pre_filtering(self, documents: List[DocumentMetadata]) -> List[DocumentMetadata]:
         """
-        FIXED: Optimized single-pass classification that combines complexity analysis and processing.
+        Apply file date pre-filtering and incremental processing logic.
+        """
+        documents_to_process = []
+        
+        for doc in documents:
+            # Check file modification date criteria
+            doc.file_date_meets_criteria = doc.file_modification_date >= self.config.min_file_modification_date
+            
+            # Check if file needs processing (incremental logic)
+            if self.config.enable_incremental_processing:
+                doc.is_newly_modified = self.state_manager.should_process_file(
+                    doc.source_path, 
+                    doc.file_modification_date
+                )
+            else:
+                doc.is_newly_modified = True  # Process all if incremental disabled
+            
+            # Apply filtering logic
+            if not doc.file_date_meets_criteria:
+                self.incremental_stats['skipped_old_files'] += 1
+                doc.classification_result = "old_file_date"
+                doc.stage_failed = f"File modified before {self.config.min_file_modification_date} ({doc.file_modification_date})"
+                continue
+            
+            if not doc.is_newly_modified:
+                self.incremental_stats['skipped_unchanged'] += 1
+                doc.classification_result = "skipped_unchanged"
+                doc.stage_failed = f"File unchanged since last run ({self.config.last_run_date})"
+                continue
+            
+            documents_to_process.append(doc)
+            self.incremental_stats['newly_processed'] += 1
+        
+        logger.info(f"Pre-filtering results:")
+        logger.info(f"  Total discovered: {self.incremental_stats['total_discovered']}")
+        logger.info(f"  Skipped (old file date): {self.incremental_stats['skipped_old_files']}")
+        logger.info(f"  Skipped (unchanged): {self.incremental_stats['skipped_unchanged']}")
+        logger.info(f"  To process: {self.incremental_stats['newly_processed']}")
+        
+        return documents_to_process
+
+    def _classify_single_document_enhanced(self, doc: DocumentMetadata) -> ClassificationResult:
+        """
+        Enhanced single document classification with all pre-filtering already applied.
         """
         start_time = time.time()
         pdf_doc = None
@@ -504,7 +681,6 @@ class HealthcareDocumentClassifier:
 
             accessible_pages_count = 0
             for page_idx in pages_to_check:
-                # FIXED: Use the handler's safe_page_access method
                 page = self.pdf_handler.safe_page_access(pdf_doc, page_idx)
                 if page is None:
                     logger.debug(f"Skipping corrupted page {page_idx + 1} in {doc.pdf_name}")
@@ -655,211 +831,23 @@ class HealthcareDocumentClassifier:
                 f"Consider enabling specialized processing pipelines."
             )
         
+        # NEW: Incremental processing recommendations
+        if self.incremental_stats['skipped_unchanged'] > 0:
+            recommendations.append(
+                f"Incremental processing skipped {self.incremental_stats['skipped_unchanged']} unchanged files, "
+                f"saving significant processing time and API costs."
+            )
+        
+        if self.incremental_stats['skipped_old_files'] > 0:
+            recommendations.append(
+                f"Pre-filtering excluded {self.incremental_stats['skipped_old_files']} files "
+                f"modified before {self.config.min_file_modification_date}, optimizing processing efficiency."
+            )
+        
         return recommendations
 
 class EnterpriseHealthcareClassificationSystem:
-    """Enhanced main class with optimized processing and better error reporting."""
-    def __init__(self, client, output_dir: str = "classification_results"):
-        self.client = client
-        self.config = ClassificationConfig()
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def run(self, root_folder_path: str):
-        """Executes the optimized end-to-end process."""
-        start_time = time.time()
-        logger.info("--- STARTING OPTIMIZED ENTERPRISE CLASSIFICATION ---")
-
-        # Step 1: Discover all potential documents
-        discovery = EnterpriseFileDiscovery(root_folder_path, self.config)
-        all_documents = discovery.discover_all_documents()
-        if not all_documents:
-            logger.error("No documents were found. Exiting.")
-            return
-
-        # Step 2: Single-pass classification with integrated complexity analysis
-        classifier = HealthcareDocumentClassifier(self.client, self.config)
-        results = classifier.classify_all_documents(all_documents)
-
-        # Step 3: Save the results to output files
-        self._save_reports(all_documents, results)
-        
-        end_time = time.time()
-        logger.info("--- CLASSIFICATION COMPLETE ---")
-        logger.info(f"Total time: {(end_time - start_time):.2f} seconds")
-        self._print_summary(results)
-
-    def _save_reports(self, all_docs: List[DocumentMetadata], results: Dict[str, List[DocumentMetadata]]):
-        """Enhanced reporting with complexity tracking and performance metrics."""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Enhanced detailed report with complexity information
-        report_path = self.output_dir / f"full_classification_report_{timestamp}.csv"
-        with open(report_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'source_path', 'pdf_name', 'state', 'classification_result', 
-                'effective_date', 'detected_on_page', 'stage_failed', 'error_message', 
-                'complexity_level', 'pdf_issues', 'processing_time', 'confidence_score'
-            ])
-            for doc in all_docs:
-                writer.writerow([
-                    doc.source_path, 
-                    doc.pdf_name, 
-                    doc.state, 
-                    doc.classification_result, 
-                    doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '', 
-                    doc.detected_on_page or '', 
-                    doc.stage_failed, 
-                    doc.error_message,
-                    doc.pdf_complexity_level,
-                    '; '.join(doc.pdf_issues) if doc.pdf_issues else '',
-                    f"{doc.processing_time:.2f}s",
-                    f"{doc.confidence_score:.2f}"
-                ])
-        logger.info(f"Enhanced CSV report saved to: {report_path}")
-
-        # Complexity analysis report
-        complexity_analysis = results.get('complexity_analysis', {})
-        complexity_report_path = self.output_dir / f"complexity_analysis_{timestamp}.json"
-        with open(complexity_report_path, 'w', encoding='utf-8') as f:
-            json.dump(complexity_analysis, f, indent=2, default=str)
-        logger.info(f"Complexity analysis saved to: {complexity_report_path}")
-
-        # Separate report for problematic PDFs
-        problematic_pdfs = [doc for doc in all_docs 
-                           if doc.pdf_complexity_level in ['problematic', 'complex'] 
-                           or doc.classification_result in ['pdf_corrupted', 'form_field_issues']]
-        
-        if problematic_pdfs:
-            problematic_report_path = self.output_dir / f"problematic_pdfs_report_{timestamp}.csv"
-            with open(problematic_report_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['source_path', 'pdf_name', 'state', 'complexity_level', 
-                               'issues', 'classification_result', 'file_size'])
-                for doc in problematic_pdfs:
-                    writer.writerow([
-                        doc.source_path, 
-                        doc.pdf_name, 
-                        doc.state, 
-                        doc.pdf_complexity_level,
-                        '; '.join(doc.pdf_issues) if doc.pdf_issues else '', 
-                        doc.classification_result, 
-                        doc.file_size
-                    ])
-            logger.info(f"Problematic PDFs report saved to: {problematic_report_path}")
-
-        # Simple text file for relevant documents (for extraction pipeline)
-        relevant_paths = self.output_dir / f"relevant_document_paths_{timestamp}.txt"
-        with open(relevant_paths, 'w', encoding='utf-8') as f:
-            for doc in results['relevant']:
-                f.write(f"{doc.source_path}\n")
-        logger.info(f"Relevant paths list saved to: {relevant_paths}")
-
-        # Summary statistics file
-        summary_path = self.output_dir / f"processing_summary_{timestamp}.json"
-        summary_data = {
-            'total_documents': len(all_docs),
-            'processing_results': {category: len(docs) for category, docs in results.items() 
-                                 if category != 'complexity_analysis'},
-            'complexity_analysis': complexity_analysis,
-            'average_processing_time': sum(doc.processing_time for doc in all_docs) / len(all_docs) if all_docs else 0,
-            'success_rate': (len(results['relevant']) / len(all_docs)) * 100 if all_docs else 0
-        }
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            json.dump(summary_data, f, indent=2, default=str)
-        logger.info(f"Processing summary saved to: {summary_path}")
-
-    def _print_summary(self, results: Dict[str, List[DocumentMetadata]]):
-        """Enhanced summary with complexity and performance statistics."""
-        print("\n" + "="*60)
-        print("FINAL CLASSIFICATION SUMMARY")
-        print("="*60)
-        print(f"  Relevant Documents (2020+):     {len(results['relevant'])}")
-        print(f"  Not Healthcare Contracts:       {len(results['not_healthcare'])}")
-        print(f"  Old Dates (< 2020):             {len(results['old_date'])}")
-        print(f"  No Date Found:                  {len(results['no_date'])}")
-        print(f"  Form Field Issues:              {len(results['form_field_issues'])}")
-        print(f"  PDF Corrupted/Unreadable:       {len(results['pdf_corrupted'])}")
-        print(f"  Failed Processing:              {len(results['failed'])}")
-        print("-" * 60)
-        
-        # Complexity distribution
-        complexity_analysis = results.get('complexity_analysis', {})
-        if complexity_analysis:
-            print("\nCOMPLEXITY DISTRIBUTION:")
-            distribution = complexity_analysis.get('complexity_distribution', {})
-            for level, stats in distribution.items():
-                count = stats.get('count', 0)
-                percentage = stats.get('percentage', 0)
-                print(f"  {level.capitalize():<12}: {count:>4} ({percentage:>5.1f}%)")
-            
-            # Common issues
-            common_issues = complexity_analysis.get('common_issues', {})
-            if common_issues:
-                print(f"\nCOMMON ISSUES:")
-                for issue, count in list(common_issues.items())[:5]:  # Top 5 issues
-                    print(f"  {issue.replace('_', ' ').title():<20}: {count}")
-            
-            # Recommendations
-            recommendations = complexity_analysis.get('recommendations', [])
-            if recommendations:
-                print(f"\nRECOMMENDATIONS:")
-                for i, rec in enumerate(recommendations, 1):
-                    print(f"  {i}. {rec}")
-        
-        print("="*60)
-        
-        # Performance metrics
-        total_docs = sum(len(docs) for category, docs in results.items() 
-                        if category != 'complexity_analysis')
-        if total_docs > 0:
-            success_rate = (len(results['relevant']) / total_docs) * 100
-            print(f"\nSUCCESS RATE: {success_rate:.1f}% ({len(results['relevant'])}/{total_docs})")
-            
-            problematic_count = (len(results['pdf_corrupted']) + 
-                               len(results['form_field_issues']) + 
-                               len(results['failed']))
-            if problematic_count > 0:
-                print(f"ATTENTION NEEDED: {problematic_count} documents require manual review")
-
-# ==========================================
-# CLIENT SETUP & MAIN EXECUTION
-# ==========================================
-
-def create_client():
-    """Create Google AI client."""
-    return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
-
-def run_enterprise_healthcare_classification(
-    root_folder_path: str, 
-    output_dir: str = "healthcare_classification_results",
-    max_workers: int = 3
-) -> Dict[str, Any]:
-    """
-    Main function to run enterprise healthcare document classification.
-    
-    Args:
-        root_folder_path: Path to root folder containing AGREEMENTS-NON STANDARD
-        output_dir: Directory to save classification results
-        max_workers: Number of parallel workers for classification (future enhancement)
-        
-    Returns:
-        Dictionary with classification results and statistics
-    """
-    client = create_client()
-    classification_system = EnterpriseHealthcareClassificationSystem(
-        client=client, 
-        output_dir=output_dir
-    )
-    
-    # Execute the classification process
-    return classification_system.run_classification(
-        root_folder_path=root_folder_path
-    )
-
-class EnterpriseHealthcareClassificationSystem:
-    """Enhanced main class with optimized processing and better error reporting."""
+    """Enhanced main class with incremental processing and optimized workflows."""
     def __init__(self, client, output_dir: str = "classification_results"):
         self.client = client
         self.config = ClassificationConfig()
@@ -868,10 +856,15 @@ class EnterpriseHealthcareClassificationSystem:
 
     def run_classification(self, root_folder_path: str) -> Dict[str, Any]:
         """
-        Executes the optimized end-to-end process and returns comprehensive results.
+        Executes the enhanced end-to-end process with incremental processing.
         """
         start_time = time.time()
-        logger.info("STARTING OPTIMIZED ENTERPRISE CLASSIFICATION")
+        logger.info("STARTING ENHANCED ENTERPRISE CLASSIFICATION WITH INCREMENTAL PROCESSING")
+        logger.info(f"Configuration:")
+        logger.info(f"  Min file modification date: {self.config.min_file_modification_date}")
+        logger.info(f"  Min effective year: {self.config.min_effective_year}")
+        logger.info(f"  Incremental processing: {'ENABLED' if self.config.enable_incremental_processing else 'DISABLED'}")
+        logger.info(f"  File date pre-filtering: {'ENABLED' if self.config.enable_file_date_prefilter else 'DISABLED'}")
 
         # Step 1: Discover all potential documents
         discovery = EnterpriseFileDiscovery(root_folder_path, self.config)
@@ -884,25 +877,27 @@ class EnterpriseHealthcareClassificationSystem:
                 'output_directory': str(self.output_dir)
             }
 
-        # Step 2: Single-pass classification with integrated complexity analysis
+        # Step 2: Enhanced classification with incremental processing
         classifier = HealthcareDocumentClassifier(self.client, self.config)
         results = classifier.classify_all_documents(all_documents)
 
-        # Step 3: Save the results to output files
-        output_files = self._save_reports(all_documents, results)
+        # Step 3: Save the enhanced results to output files
+        output_files = self._save_enhanced_reports(all_documents, results)
         
         end_time = time.time()
         total_time = end_time - start_time
         
-        logger.info("CLASSIFICATION COMPLETE")
+        logger.info("ENHANCED CLASSIFICATION COMPLETE")
         logger.info(f"Total time: {total_time:.2f} seconds")
-        self._print_summary(results)
+        self._print_enhanced_summary(results)
         
         # Return comprehensive results for the caller
+        incremental_stats = results.get('complexity_analysis', {}).get('incremental_stats', {})
         return {
             'success': True,
             'output_directory': str(self.output_dir),
-            'total_documents_processed': len(all_documents),
+            'total_documents_discovered': len(all_documents),
+            'total_documents_processed': incremental_stats.get('newly_processed', 0),
             'relevant_documents_found': len(results['relevant']),
             'processing_time_seconds': total_time,
             'output_files': output_files,
@@ -913,29 +908,38 @@ class EnterpriseHealthcareClassificationSystem:
                 'no_date': len(results['no_date']),
                 'form_field_issues': len(results['form_field_issues']),
                 'pdf_corrupted': len(results['pdf_corrupted']),
-                'failed': len(results['failed'])
+                'failed': len(results['failed']),
+                'old_file_date': len(results['old_file_date']),  # NEW
+                'skipped_unchanged': len(results['skipped_unchanged'])  # NEW
             },
+            'incremental_processing_stats': incremental_stats,
             'complexity_analysis': results.get('complexity_analysis', {}),
-            'success_rate_percentage': (len(results['relevant']) / len(all_documents)) * 100 if all_documents else 0
+            'success_rate_percentage': (len(results['relevant']) / len(all_documents)) * 100 if all_documents else 0,
+            'processing_efficiency': {
+                'documents_skipped': incremental_stats.get('skipped_old_files', 0) + incremental_stats.get('skipped_unchanged', 0),
+                'api_calls_saved': incremental_stats.get('skipped_old_files', 0) + incremental_stats.get('skipped_unchanged', 0),
+                'time_saved_percentage': ((incremental_stats.get('skipped_old_files', 0) + incremental_stats.get('skipped_unchanged', 0)) / len(all_documents)) * 100 if all_documents else 0
+            }
         }
 
     def run(self, root_folder_path: str):
         """Legacy method for backwards compatibility."""
         return self.run_classification(root_folder_path)
 
-    def _save_reports(self, all_docs: List[DocumentMetadata], results: Dict[str, List[DocumentMetadata]]) -> Dict[str, str]:
-        """Enhanced reporting with complexity tracking and performance metrics."""
+    def _save_enhanced_reports(self, all_docs: List[DocumentMetadata], results: Dict[str, List[DocumentMetadata]]) -> Dict[str, str]:
+        """Enhanced reporting with incremental processing tracking."""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_files = {}
         
-        # Enhanced detailed report with complexity information
+        # Enhanced detailed report with incremental processing information
         report_path = self.output_dir / f"full_classification_report_{timestamp}.csv"
         with open(report_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
                 'source_path', 'pdf_name', 'state', 'classification_result', 
                 'effective_date', 'detected_on_page', 'stage_failed', 'error_message', 
-                'complexity_level', 'pdf_issues', 'processing_time', 'confidence_score'
+                'complexity_level', 'pdf_issues', 'processing_time', 'confidence_score',
+                'file_modification_date', 'file_date_meets_criteria', 'is_newly_modified'  # NEW columns
             ])
             for doc in all_docs:
                 writer.writerow([
@@ -950,18 +954,47 @@ class EnterpriseHealthcareClassificationSystem:
                     doc.pdf_complexity_level,
                     '; '.join(doc.pdf_issues) if doc.pdf_issues else '',
                     f"{doc.processing_time:.2f}s",
-                    f"{doc.confidence_score:.2f}"
+                    f"{doc.confidence_score:.2f}",
+                    doc.file_modification_date.strftime('%Y-%m-%d') if doc.file_modification_date else '',  # NEW
+                    doc.file_date_meets_criteria,  # NEW
+                    doc.is_newly_modified  # NEW
                 ])
         output_files['detailed_report'] = str(report_path)
         logger.info(f"Enhanced CSV report saved to: {report_path}")
 
-        # Complexity analysis report
+        # Enhanced complexity analysis report with incremental stats
         complexity_analysis = results.get('complexity_analysis', {})
-        complexity_report_path = self.output_dir / f"complexity_analysis_{timestamp}.json"
+        complexity_report_path = self.output_dir / f"processing_analysis_{timestamp}.json"
         with open(complexity_report_path, 'w', encoding='utf-8') as f:
             json.dump(complexity_analysis, f, indent=2, default=str)
-        output_files['complexity_analysis'] = str(complexity_report_path)
-        logger.info(f"Complexity analysis saved to: {complexity_report_path}")
+        output_files['processing_analysis'] = str(complexity_report_path)
+        logger.info(f"Processing analysis saved to: {complexity_report_path}")
+
+        # Incremental processing summary
+        incremental_summary_path = self.output_dir / f"incremental_summary_{timestamp}.json"
+        incremental_data = {
+            'run_date': datetime.now().isoformat(),
+            'configuration': {
+                'min_file_modification_date': self.config.min_file_modification_date.isoformat(),
+                'min_effective_year': self.config.min_effective_year,
+                'incremental_enabled': self.config.enable_incremental_processing,
+                'file_date_prefilter_enabled': self.config.enable_file_date_prefilter
+            },
+            'incremental_stats': complexity_analysis.get('incremental_stats', {}),
+            'efficiency_gains': {
+                'total_discovered': complexity_analysis.get('incremental_stats', {}).get('total_discovered', 0),
+                'actually_processed': complexity_analysis.get('incremental_stats', {}).get('newly_processed', 0),
+                'processing_reduction_percentage': (
+                    (complexity_analysis.get('incremental_stats', {}).get('skipped_old_files', 0) + 
+                     complexity_analysis.get('incremental_stats', {}).get('skipped_unchanged', 0)) / 
+                    max(complexity_analysis.get('incremental_stats', {}).get('total_discovered', 1), 1)
+                ) * 100
+            }
+        }
+        with open(incremental_summary_path, 'w', encoding='utf-8') as f:
+            json.dump(incremental_data, f, indent=2, default=str)
+        output_files['incremental_summary'] = str(incremental_summary_path)
+        logger.info(f"Incremental processing summary saved to: {incremental_summary_path}")
 
         # Separate report for problematic PDFs
         problematic_pdfs = [doc for doc in all_docs 
@@ -995,41 +1028,63 @@ class EnterpriseHealthcareClassificationSystem:
         output_files['relevant_documents'] = str(relevant_paths)
         logger.info(f"Relevant healthcare documents list saved to: {relevant_paths}")
 
-        # Summary statistics file
-        summary_path = self.output_dir / f"processing_summary_{timestamp}.json"
-        summary_data = {
-            'total_documents': len(all_docs),
-            'processing_results': {category: len(docs) for category, docs in results.items() 
-                                 if category != 'complexity_analysis'},
-            'complexity_analysis': complexity_analysis,
-            'average_processing_time': sum(doc.processing_time for doc in all_docs) / len(all_docs) if all_docs else 0,
-            'success_rate': (len(results['relevant']) / len(all_docs)) * 100 if all_docs else 0
-        }
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            json.dump(summary_data, f, indent=2, default=str)
-        output_files['processing_summary'] = str(summary_path)
-        logger.info(f"Processing summary saved to: {summary_path}")
-        
+        # NEW: Files to process next time (for monitoring)
+        if results.get('old_file_date') or results.get('skipped_unchanged'):
+            skipped_files_report = self.output_dir / f"skipped_files_report_{timestamp}.csv"
+            with open(skipped_files_report, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['source_path', 'pdf_name', 'state', 'skip_reason', 'file_modification_date'])
+                
+                for doc in results.get('old_file_date', []):
+                    writer.writerow([doc.source_path, doc.pdf_name, doc.state, 'old_file_date', doc.file_modification_date])
+                
+                for doc in results.get('skipped_unchanged', []):
+                    writer.writerow([doc.source_path, doc.pdf_name, doc.state, 'unchanged_since_last_run', doc.file_modification_date])
+            
+            output_files['skipped_files'] = str(skipped_files_report)
+            logger.info(f"Skipped files report saved to: {skipped_files_report}")
+
         return output_files
 
-    def _print_summary(self, results: Dict[str, List[DocumentMetadata]]):
-        """Enhanced summary with complexity and performance statistics."""
-        print("\n" + "="*60)
-        print("FINAL CLASSIFICATION SUMMARY")
-        print("="*60)
+    def _print_enhanced_summary(self, results: Dict[str, List[DocumentMetadata]]):
+        """Enhanced summary with incremental processing statistics."""
+        print("\n" + "="*70)
+        print("ENHANCED CLASSIFICATION SUMMARY WITH INCREMENTAL PROCESSING")
+        print("="*70)
         print(f"  Relevant Documents (2020+):     {len(results['relevant'])}")
         print(f"  Not Healthcare Contracts:       {len(results['not_healthcare'])}")
-        print(f"  Old Dates (< 2020):             {len(results['old_date'])}")
+        print(f"  Old Effective Dates (< 2020):   {len(results['old_date'])}")
         print(f"  No Date Found:                  {len(results['no_date'])}")
         print(f"  Form Field Issues:              {len(results['form_field_issues'])}")
         print(f"  PDF Corrupted/Unreadable:       {len(results['pdf_corrupted'])}")
         print(f"  Failed Processing:              {len(results['failed'])}")
-        print("-" * 60)
+        print("-" * 70)
+        print("EFFICIENCY GAINS:")
+        print(f"  Old File Dates (< 2019):        {len(results['old_file_date'])}")
+        print(f"  Skipped (Unchanged):            {len(results['skipped_unchanged'])}")
+        print("-" * 70)
+        
+        # Incremental processing statistics
+        complexity_analysis = results.get('complexity_analysis', {})
+        incremental_stats = complexity_analysis.get('incremental_stats', {})
+        
+        if incremental_stats:
+            print("\nINCREMENTAL PROCESSING EFFICIENCY:")
+            print(f"  Total Documents Discovered:     {incremental_stats.get('total_discovered', 0)}")
+            print(f"  Skipped (Old File Date):        {incremental_stats.get('skipped_old_files', 0)}")
+            print(f"  Skipped (Unchanged):            {incremental_stats.get('skipped_unchanged', 0)}")
+            print(f"  Actually Processed:             {incremental_stats.get('newly_processed', 0)}")
+            
+            total_discovered = incremental_stats.get('total_discovered', 1)
+            total_skipped = incremental_stats.get('skipped_old_files', 0) + incremental_stats.get('skipped_unchanged', 0)
+            efficiency_percentage = (total_skipped / total_discovered) * 100 if total_discovered > 0 else 0
+            
+            print(f"  Processing Efficiency:          {efficiency_percentage:.1f}% reduction")
+            print(f"  API Calls Saved:                {total_skipped}")
         
         # Complexity distribution
-        complexity_analysis = results.get('complexity_analysis', {})
         if complexity_analysis:
-            print("\nCOMPLEXITY DISTRIBUTION:")
+            print(f"\nCOMPLEXITY DISTRIBUTION:")
             distribution = complexity_analysis.get('complexity_distribution', {})
             for level, stats in distribution.items():
                 count = stats.get('count', 0)
@@ -1050,11 +1105,11 @@ class EnterpriseHealthcareClassificationSystem:
                 for i, rec in enumerate(recommendations, 1):
                     print(f"  {i}. {rec}")
         
-        print("="*60)
+        print("="*70)
         
         # Performance metrics
         total_docs = sum(len(docs) for category, docs in results.items() 
-                        if category != 'complexity_analysis')
+                        if category not in ['complexity_analysis', 'skipped_unchanged', 'old_file_date'])
         if total_docs > 0:
             success_rate = (len(results['relevant']) / total_docs) * 100
             print(f"\nSUCCESS RATE: {success_rate:.1f}% ({len(results['relevant'])}/{total_docs})")
@@ -1066,27 +1121,84 @@ class EnterpriseHealthcareClassificationSystem:
                 print(f"ATTENTION NEEDED: {problematic_count} documents require manual review")
 
 # ==========================================
+# CLIENT SETUP & MAIN EXECUTION
+# ==========================================
+
+def create_client():
+    """Create Google AI client."""
+    return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+
+def run_enhanced_healthcare_classification(
+    root_folder_path: str, 
+    output_dir: str = "enhanced_healthcare_classification_results",
+    min_file_date: str = "2019-01-01",
+    enable_incremental: bool = True
+) -> Dict[str, Any]:
+    """
+    Main function to run enhanced healthcare document classification with incremental processing.
+    
+    Args:
+        root_folder_path: Path to root folder containing AGREEMENTS-NON STANDARD
+        output_dir: Directory to save classification results
+        min_file_date: Minimum file modification date (YYYY-MM-DD format)
+        enable_incremental: Enable incremental processing to skip unchanged files
+        
+    Returns:
+        Dictionary with classification results and statistics
+    """
+    client = create_client()
+    classification_system = EnterpriseHealthcareClassificationSystem(
+        client=client, 
+        output_dir=output_dir
+    )
+    
+    # Configure the system based on parameters
+    if min_file_date:
+        try:
+            classification_system.config.min_file_modification_date = parser.parse(min_file_date).date()
+        except Exception as e:
+            logger.warning(f"Invalid date format '{min_file_date}', using default 2019-01-01: {e}")
+            classification_system.config.min_file_modification_date = date(2019, 1, 1)
+    
+    classification_system.config.enable_incremental_processing = enable_incremental
+    
+    # Execute the enhanced classification process
+    return classification_system.run_classification(
+        root_folder_path=root_folder_path
+    )
+
+# ==========================================
 # MAIN EXECUTION
 # ==========================================
 
 if __name__ == "__main__":
     # Configure for your enterprise environment
     ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"  # Your network path
-    OUTPUT_DIR = "healthcare_classification_results"
-    MAX_WORKERS = 3  # Adjust based on your system capacity
+    OUTPUT_DIR = "enhanced_healthcare_classification_results"
+    MIN_FILE_DATE = "2019-01-01"  # Only process files modified from this date
+    ENABLE_INCREMENTAL = True     # Enable incremental processing
 
     try:
-        # Run the healthcare document classification
-        results = run_enterprise_healthcare_classification(
+        # Run the enhanced healthcare document classification
+        results = run_enhanced_healthcare_classification(
             root_folder_path=ROOT_FOLDER_PATH,
             output_dir=OUTPUT_DIR,
-            max_workers=MAX_WORKERS
+            min_file_date=MIN_FILE_DATE,
+            enable_incremental=ENABLE_INCREMENTAL
         )
         
-        print("\nHEALTHCARE CLASSIFICATION COMPLETED SUCCESSFULLY!")
+        print("\nENHANCED HEALTHCARE CLASSIFICATION COMPLETED SUCCESSFULLY!")
         print(f"Check the output directory: {results.get('output_directory')}")
         print(f"Use 'relevant_healthcare_documents_*.txt' with your extraction code")
-        print(f"Found {results.get('relevant_documents_found', 0)} relevant healthcare documents with 2020+ effective dates")
+        print(f"Found {results.get('relevant_documents_found', 0)} relevant healthcare documents")
+        
+        # Display efficiency gains
+        efficiency_stats = results.get('processing_efficiency', {})
+        if efficiency_stats:
+            print(f"\nEFFICIENCY GAINS:")
+            print(f"  Documents skipped: {efficiency_stats.get('documents_skipped', 0)}")
+            print(f"  API calls saved: {efficiency_stats.get('api_calls_saved', 0)}")
+            print(f"  Time saved: {efficiency_stats.get('time_saved_percentage', 0):.1f}%")
         
     except Exception as e:
         logger.error(f"Critical error in main execution: {e}")
