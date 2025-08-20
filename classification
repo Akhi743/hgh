@@ -5,34 +5,60 @@ import logging
 import os
 import time
 import threading
-import queue
 import signal
 import sys
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from google.genai import types
 import google.genai as genai
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from dataclasses import dataclass, field
 from dateutil import parser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Event
-from collections import defaultdict
+from collections import defaultdict, deque
+import gc
+import psutil
+from queue import Queue, Empty
+import hashlib
+import math
 
-# Enhanced logging setup with thread safety
+# Enhanced logging setup
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(threadName)-10s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('healthcare_classification.log', encoding='utf-8'),
+        RotatingFileHandler('thorough_classification.log', maxBytes=50*1024*1024, backupCount=5, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+# ==========================================
+# THOROUGH MODE DATA CLASSES
+# ==========================================
+
+@dataclass
+class ThoroughModeStats:
+    """Statistics for thorough mode processing."""
+    total_documents: int = 0
+    target_duration_hours: float = 18.0  # Target 15-20 hours (use middle)
+    start_time: Optional[datetime] = None
+    estimated_end_time: Optional[datetime] = None
+    documents_processed: int = 0
+    documents_per_hour_target: float = 0.0
+    documents_per_hour_actual: float = 0.0
+    processing_pace: str = "normal"  # "slow", "normal", "fast"
+    time_adjustment_factor: float = 1.0
+    early_exits_triggered: int = 0
+    total_pages_analyzed: int = 0
+    average_pages_per_doc: float = 0.0
+
 @dataclass
 class DocumentMetadata:
-    """Represents a single PDF, holding all its metadata and final classification details."""
+    """Enhanced document metadata for thorough mode."""
     source_path: str
     pdf_name: str
     state: str
@@ -49,25 +75,21 @@ class DocumentMetadata:
     pdf_complexity_level: str = ""
     pdf_issues: List[str] = field(default_factory=list)
     
-    # Enhanced file date tracking
+    # Thorough mode specific
+    pages_analyzed: int = 0
+    early_exit_triggered: bool = False
+    thread_id: str = ""
+    processing_started_at: Optional[datetime] = None
     file_modification_date: date = None
-    file_date_meets_criteria: bool = False
     is_newly_modified: bool = False
     
-    # Thread processing tracking
-    thread_id: str = ""
-    retry_count: int = 0
-    processing_started_at: Optional[datetime] = None
-
     def __post_init__(self):
-        if self.pdf_issues is None:
-            self.pdf_issues = []
-        # Set file modification date for easy access
-        self.file_modification_date = self.last_modified.date()
+        if self.last_modified:
+            self.file_modification_date = self.last_modified.date()
 
 @dataclass
 class ClassificationResult:
-    """A simple structure to pass results between classification methods."""
+    """Enhanced classification results for thorough mode."""
     is_relevant: bool
     detected_on_page: Optional[int] = None
     effective_date: Optional[datetime] = None
@@ -76,89 +98,66 @@ class ClassificationResult:
     processing_time: float = 0.0
     pages_checked: int = 0
     early_exit_triggered: bool = False
+    total_pages_available: int = 0
+    pages_skipped: int = 0
 
-@dataclass
-class PDFComplexityInfo:
-    """Structure to hold PDF complexity analysis results."""
-    has_form_fields: bool = False
-    has_digital_signatures: bool = False
-    has_encryption: bool = False
-    has_embedded_files: bool = False
-    page_count: int = 0
-    complexity_level: str = 'simple'
-    potential_issues: List[str] = field(default_factory=list)
-    analysis_successful: bool = True
+# ==========================================
+# THOROUGH MODE CONFIGURATION
+# ==========================================
 
-@dataclass
-class ThreadMetrics:
-    """Track performance metrics for each thread."""
-    thread_id: str
-    documents_processed: int = 0
-    documents_successful: int = 0
-    documents_failed: int = 0
-    total_processing_time: float = 0.0
-    average_time_per_doc: float = 0.0
-    current_document: str = ""
-    docs_per_minute: float = 0.0
-    start_time: Optional[datetime] = None
-
-class ProductionConfig:
-    """Production-ready configuration with enterprise features."""
+class ThoroughModeConfig:
+    """Thorough mode specific configuration - exactly as requested."""
     def __init__(self):
-        # Folder names the script will look for.
+        # THOROUGH MODE REQUIREMENTS
+        self.pages_per_document = 10  # Exactly 10 pages as requested
+        self.parallel_threads = 5     # Exactly 5 threads as requested
+        self.enable_early_exit = True # Early exit on first match
+        self.target_duration_hours = 18.0  # Target 15-20 hours (use middle: 18)
+        
+        # Core business logic
         self.agreements_folder = "AGREEMENTS-NON STANDARD"
         self.hospital_subfolder = "HOSPITAL"
-        
-        # Key business logic settings
         self.min_effective_year = 2020
         self.min_file_modification_date = date(2019, 1, 1)
-        self.enable_file_date_prefilter = True
+        
+        # Thorough mode page strategy
+        self.page_selection_strategy = "thorough"  # "thorough", "smart", "sequential"
+        self.first_pages_count = 6   # More thorough: first 6 pages
+        self.last_pages_count = 4    # Last 4 pages
+        self.analyze_middle_pages = True  # Also analyze some middle pages
+        
+        # Pacing control for 15-20 hour target
+        self.enable_adaptive_pacing = True
+        self.min_delay_between_docs = 0.5  # Minimum delay in seconds
+        self.max_delay_between_docs = 10.0  # Maximum delay in seconds
+        self.pacing_adjustment_interval = 100  # Adjust pacing every N documents
+        
+        # State management
         self.enable_incremental_processing = True
+        self.checkpoint_interval = 50
+        self.state_file_path = "thorough_mode_state.json"
         
-        # Production threading configuration
-        self.max_threads = 5
-        self.enable_threading = True
-        self.thread_timeout_minutes = 10
+        # Performance settings optimized for thoroughness
+        self.batch_size = 25  # Smaller batches for better control
+        self.memory_limit_mb = 1024
+        self.api_timeout_seconds = 45  # Longer timeout for thorough processing
         
-        # Enhanced page processing with early exit
-        self.max_pages_per_document = 10
-        self.first_pages_count = 5
-        self.last_pages_count = 5
-        self.enable_early_exit = True
-        self.enable_smart_page_selection = True
+        # Monitoring
+        self.progress_update_interval = 30  # More frequent updates
+        self.enable_detailed_logging = True
+        self.save_detailed_analytics = True
         
-        # Fault tolerance and recovery
-        self.checkpoint_interval = 100  # Save progress every N documents
-        self.enable_resume = True
-        self.retry_failed_documents = True
-        self.max_retries_per_document = 1
-        self.graceful_shutdown_timeout = 30  # seconds
-        
-        # Performance optimizations
-        self.enable_connection_pooling = True
-        self.batch_state_saves = True
-        self.priority_processing = "newest_first"  # or "largest_first", "random"
-        
-        # Monitoring and logging
-        self.enable_real_time_monitoring = True
-        self.progress_update_interval = 10  # seconds
-        self.detailed_thread_logging = True
-        
-        # State persistence
-        self.state_file_path = "production_classification_state.json"
-        self.checkpoint_file_path = "classification_checkpoint.json"
-        
-        # AI processing settings
+        # AI settings
         self.image_dpi = 150
-        self.max_repair_attempts = 3
-        self.skip_corrupted_pages = True
-        self.enable_complexity_analysis = True
-        
-        # Prompts
-        self.healthcare_contract_prompt = "Analyze the image. Is this a formal letter from Aetna about a 'charge master increase' where they state 'we have received' a notification? Answer only YES or NO."
+        self.healthcare_contract_prompt = "Analyze the image carefully. Is this a formal letter from Aetna about a 'charge master increase' where they state 'we have received' a notification? Answer only YES or NO."
         self.effective_date_prompt = 'This is an Aetna charge master increase letter. Find the EFFECTIVE DATE mentioned in the letter (phrases like "effective January 1, 2024" or "to become effective 1/1/2025"). Respond with just the date found, or "NOT_FOUND" if no effective date exists.'
         
-        # US states for folder identification
+        # File filtering
+        self.min_file_size_bytes = 1024
+        self.max_file_size_mb = 200  # Allow larger files in thorough mode
+        self.skip_file_patterns = ['.tmp', '.lock', '~$']
+        
+        # US states
         self.us_states = {
             'ALABAMA', 'ALASKA', 'ARIZONA', 'ARKANSAS', 'CALIFORNIA', 'COLORADO', 
             'CONNECTICUT', 'DELAWARE', 'FLORIDA', 'GEORGIA', 'HAWAII', 'IDAHO', 
@@ -172,804 +171,923 @@ class ProductionConfig:
             'WEST VIRGINIA', 'WISCONSIN', 'WYOMING', 'PUERTO RICO', 'DISTRICT OF COLUMBIA'
         }
 
-class ProductionStateManager:
-    """Thread-safe state manager with checkpoint and recovery capabilities."""
+# ==========================================
+# ADAPTIVE PACING CONTROLLER
+# ==========================================
+
+class AdaptivePacingController:
+    """Controls processing pace to target 15-20 hour completion time."""
     
-    def __init__(self, config: ProductionConfig):
+    def __init__(self, config: ThoroughModeConfig, total_documents: int):
+        self.config = config
+        self.total_documents = total_documents
+        self.target_hours = config.target_duration_hours
+        self.start_time = datetime.now()
+        
+        # Calculate target rate
+        self.target_docs_per_hour = total_documents / self.target_hours
+        self.target_docs_per_minute = self.target_docs_per_hour / 60
+        
+        # Pacing control
+        self.current_delay = config.min_delay_between_docs
+        self.documents_processed = 0
+        self.last_adjustment_time = datetime.now()
+        self.last_adjustment_count = 0
+        
+        # Statistics
+        self.pacing_history = deque(maxlen=50)
+        self.rate_history = deque(maxlen=20)
+        
+        logger.info(f"Thorough Mode Pacing: Target {self.target_docs_per_hour:.1f} docs/hour over {self.target_hours} hours")
+        logger.info(f"Total documents: {total_documents:,}")
+    
+    def calculate_adaptive_delay(self, documents_completed: int) -> float:
+        """Calculate delay needed to maintain target pace."""
+        if not self.config.enable_adaptive_pacing:
+            return self.config.min_delay_between_docs
+        
+        current_time = datetime.now()
+        elapsed_hours = (current_time - self.start_time).total_seconds() / 3600
+        
+        if elapsed_hours < 0.1:  # Too early to adjust
+            return self.current_delay
+        
+        # Calculate current rate
+        current_rate = documents_completed / elapsed_hours
+        
+        # Calculate how we're doing vs target
+        rate_ratio = current_rate / self.target_docs_per_hour
+        
+        # Adjust delay based on rate
+        if rate_ratio > 1.2:  # Too fast - slow down
+            self.current_delay = min(self.current_delay * 1.1, self.config.max_delay_between_docs)
+            pace_status = "slowing down"
+        elif rate_ratio < 0.8:  # Too slow - speed up
+            self.current_delay = max(self.current_delay * 0.9, self.config.min_delay_between_docs)
+            pace_status = "speeding up"
+        else:  # Just right
+            pace_status = "on target"
+        
+        # Log pacing adjustments
+        if documents_completed % self.config.pacing_adjustment_interval == 0:
+            remaining_hours = (self.total_documents - documents_completed) / max(current_rate, 0.1)
+            eta = current_time + timedelta(hours=remaining_hours)
+            
+            logger.info(f"Pacing Update: {current_rate:.1f} docs/hr (target: {self.target_docs_per_hour:.1f}) - {pace_status}")
+            logger.info(f"ETA: {eta.strftime('%Y-%m-%d %H:%M')} ({remaining_hours:.1f} hours remaining)")
+        
+        return self.current_delay
+    
+    def apply_pacing_delay(self, documents_completed: int):
+        """Apply adaptive delay to control processing pace."""
+        delay = self.calculate_adaptive_delay(documents_completed)
+        if delay > 0:
+            time.sleep(delay)
+
+# ==========================================
+# THOROUGH MODE STATE MANAGER
+# ==========================================
+
+class ThoroughModeStateManager:
+    """Enhanced state manager for thorough mode with detailed tracking."""
+    
+    def __init__(self, config: ThoroughModeConfig):
         self.config = config
         self.state_file_path = Path(config.state_file_path)
-        self.checkpoint_file_path = Path(config.checkpoint_file_path)
         self.processed_files = {}
+        self.thorough_stats = ThoroughModeStats()
         self.last_run_date = None
         self._lock = Lock()
-        self.checkpoint_counter = 0
         
-        # Recovery state tracking
-        self.in_progress_files = set()
-        self.failed_files = set()
+        # Enhanced tracking for thorough mode
+        self.session_start_time = datetime.now()
+        self.total_pages_analyzed = 0
+        self.early_exits_count = 0
+        self.detailed_results = []
         
         self.load_state()
-        self.load_checkpoint()
     
     def load_state(self):
-        """Load the previous run state from disk."""
+        """Load previous thorough mode state."""
         try:
             if self.state_file_path.exists():
                 with open(self.state_file_path, 'r', encoding='utf-8') as f:
                     state_data = json.load(f)
-                    
+                
                 self.last_run_date = parser.parse(state_data.get('last_run_date')).date() if state_data.get('last_run_date') else None
                 self.processed_files = state_data.get('processed_files', {})
                 
-                logger.info(f"Loaded state: Last run = {self.last_run_date}, {len(self.processed_files)} previously processed files")
+                # Load thorough mode specific data
+                thorough_data = state_data.get('thorough_mode_stats', {})
+                self.total_pages_analyzed = thorough_data.get('total_pages_analyzed', 0)
+                self.early_exits_count = thorough_data.get('early_exits_count', 0)
+                
+                logger.info(f"Loaded thorough mode state: {len(self.processed_files)} processed files")
+                logger.info(f"Previous session analyzed {self.total_pages_analyzed:,} pages with {self.early_exits_count} early exits")
             else:
-                logger.info("No previous state found. Starting fresh run.")
+                logger.info("No previous thorough mode state found. Starting fresh.")
         except Exception as e:
-            logger.warning(f"Could not load previous state: {e}. Starting fresh.")
+            logger.warning(f"Could not load thorough mode state: {e}. Starting fresh.")
             self.processed_files = {}
-            self.last_run_date = None
-    
-    def load_checkpoint(self):
-        """Load checkpoint for crash recovery."""
-        try:
-            if self.checkpoint_file_path.exists():
-                with open(self.checkpoint_file_path, 'r', encoding='utf-8') as f:
-                    checkpoint_data = json.load(f)
-                
-                self.in_progress_files = set(checkpoint_data.get('in_progress_files', []))
-                self.failed_files = set(checkpoint_data.get('failed_files', []))
-                
-                if self.in_progress_files:
-                    logger.info(f"Recovered checkpoint: {len(self.in_progress_files)} files were in-progress")
-                    # Mark in-progress files as needing reprocessing
-                    for file_path in self.in_progress_files:
-                        if file_path in self.processed_files:
-                            del self.processed_files[file_path]
-            else:
-                logger.info("No checkpoint found.")
-        except Exception as e:
-            logger.warning(f"Could not load checkpoint: {e}")
-    
-    def save_checkpoint(self):
-        """Save current processing checkpoint."""
-        try:
-            checkpoint_data = {
-                'timestamp': datetime.now().isoformat(),
-                'in_progress_files': list(self.in_progress_files),
-                'failed_files': list(self.failed_files),
-                'processed_count': len(self.processed_files)
-            }
-            
-            # Atomic write
-            temp_path = self.checkpoint_file_path.with_suffix('.tmp')
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(checkpoint_data, f, indent=2, default=str)
-            temp_path.replace(self.checkpoint_file_path)
-            
-        except Exception as e:
-            logger.error(f"Could not save checkpoint: {e}")
-    
-    def save_state(self, current_run_date: date):
-        """Save the current run state to disk with thread safety."""
-        with self._lock:
-            try:
-                state_data = {
-                    'last_run_date': current_run_date.isoformat(),
-                    'processed_files': self.processed_files,
-                    'total_files_processed': len(self.processed_files),
-                    'final_save_timestamp': datetime.now().isoformat()
-                }
-                
-                # Atomic write
-                temp_path = self.state_file_path.with_suffix('.tmp')
-                with open(temp_path, 'w', encoding='utf-8') as f:
-                    json.dump(state_data, f, indent=2, default=str)
-                temp_path.replace(self.state_file_path)
-                
-                logger.info(f"Saved final state: {len(self.processed_files)} processed files as of {current_run_date}")
-                
-                # Clean up checkpoint file
-                if self.checkpoint_file_path.exists():
-                    self.checkpoint_file_path.unlink()
-                    
-            except Exception as e:
-                logger.error(f"Could not save state: {e}")
     
     def should_process_file(self, file_path: str, file_modified_date: date) -> bool:
-        """Thread-safe determination if a file needs processing."""
+        """Determine if file needs thorough processing."""
         with self._lock:
             file_info = self.processed_files.get(file_path)
             
             if not file_info:
                 return True
             
-            # Check if file was modified since last processing
+            # In thorough mode, we might want to reprocess some files
             last_processed_date = parser.parse(file_info['last_modified']).date()
-            return file_modified_date > last_processed_date
+            
+            # Only skip if file is unchanged AND was processed in thorough mode
+            was_thorough = file_info.get('thorough_mode', False)
+            
+            return not was_thorough or file_modified_date > last_processed_date
     
-    def mark_file_in_progress(self, file_path: str):
-        """Mark file as currently being processed."""
-        with self._lock:
-            self.in_progress_files.add(file_path)
-    
-    def update_file_status(self, file_path: str, file_modified_date: date, classification_result: str, thread_id: str):
-        """Thread-safe update of file processing status."""
+    def update_file_status(self, file_path: str, file_modified_date: date, 
+                          classification_result: str, thread_id: str, 
+                          pages_analyzed: int = 0, early_exit: bool = False):
+        """Update file status with thorough mode details."""
         with self._lock:
             self.processed_files[file_path] = {
                 'last_modified': file_modified_date.isoformat(),
                 'classification_result': classification_result,
                 'processed_on': datetime.now().isoformat(),
-                'thread_id': thread_id
+                'thread_id': thread_id,
+                'thorough_mode': True,
+                'pages_analyzed': pages_analyzed,
+                'early_exit_triggered': early_exit
             }
             
-            # Remove from in-progress
-            self.in_progress_files.discard(file_path)
+            # Update session statistics
+            self.total_pages_analyzed += pages_analyzed
+            if early_exit:
+                self.early_exits_count += 1
+    
+    def save_final_state(self, total_documents: int):
+        """Save final thorough mode state with comprehensive statistics."""
+        try:
+            session_duration = datetime.now() - self.session_start_time
             
-            # Handle checkpointing
-            self.checkpoint_counter += 1
-            if self.checkpoint_counter % self.config.checkpoint_interval == 0:
-                self.save_checkpoint()
-    
-    def mark_file_failed(self, file_path: str, error_message: str):
-        """Mark file as failed processing."""
-        with self._lock:
-            self.failed_files.add(file_path)
-            self.in_progress_files.discard(file_path)
+            state_data = {
+                'last_run_date': date.today().isoformat(),
+                'processed_files': self.processed_files,
+                'thorough_mode_stats': {
+                    'total_documents_processed': len(self.processed_files),
+                    'total_pages_analyzed': self.total_pages_analyzed,
+                    'early_exits_count': self.early_exits_count,
+                    'session_duration_hours': session_duration.total_seconds() / 3600,
+                    'average_pages_per_document': self.total_pages_analyzed / max(len(self.processed_files), 1),
+                    'early_exit_rate': (self.early_exits_count / max(len(self.processed_files), 1)) * 100,
+                    'processing_mode': 'thorough',
+                    'target_duration_hours': self.config.target_duration_hours,
+                    'actual_duration_hours': session_duration.total_seconds() / 3600
+                },
+                'final_save_timestamp': datetime.now().isoformat()
+            }
+            
+            # Atomic write
+            temp_path = self.state_file_path.with_suffix('.tmp')
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(state_data, f, indent=2, default=str)
+            temp_path.replace(self.state_file_path)
+            
+            logger.info(f"Final thorough mode state saved: {len(self.processed_files)} files processed")
+            logger.info(f"Total pages analyzed: {self.total_pages_analyzed:,}")
+            logger.info(f"Early exits triggered: {self.early_exits_count}")
+            
+        except Exception as e:
+            logger.error(f"Could not save thorough mode state: {e}")
 
-class ThreadSafeProgressMonitor:
-    """Real-time progress monitoring with thread safety."""
+# ==========================================
+# THOROUGH MODE PROGRESS MONITOR
+# ==========================================
+
+class ThoroughModeProgressMonitor:
+    """Enhanced progress monitor for thorough mode with detailed tracking."""
     
-    def __init__(self, total_documents: int, config: ProductionConfig):
+    def __init__(self, total_documents: int, config: ThoroughModeConfig):
         self.total_documents = total_documents
         self.config = config
         self._lock = Lock()
         self.start_time = datetime.now()
         
-        # Thread metrics
-        self.thread_metrics = {}
+        # Thorough mode specific tracking
+        self.target_end_time = self.start_time + timedelta(hours=config.target_duration_hours)
+        self.documents_processed = 0
+        self.total_pages_analyzed = 0
+        self.early_exits_triggered = 0
+        self.classification_results = defaultdict(int)
         
-        # Overall statistics
-        self.completed_documents = 0
-        self.successful_documents = 0
-        self.failed_documents = 0
-        self.documents_by_result = defaultdict(int)
+        # Thread tracking
+        self.thread_metrics = {}
+        self.active_threads = set()
         
         # Performance tracking
+        self.processing_rate_history = deque(maxlen=20)
+        self.pages_per_hour_history = deque(maxlen=20)
         self.last_update_time = datetime.now()
         self.last_completed_count = 0
         
-        # Graceful shutdown
+        # Shutdown coordination
         self.shutdown_event = Event()
         
-        # Start monitoring thread
-        if config.enable_real_time_monitoring:
-            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-            self.monitor_thread.start()
+        # Start monitoring
+        self.monitor_thread = threading.Thread(target=self._thorough_monitor_loop, daemon=True, name="ThoroughMonitor")
+        self.monitor_thread.start()
+        
+        logger.info(f"Thorough Mode Monitor started: Target {config.target_duration_hours} hours")
+        logger.info(f"Expected completion: {self.target_end_time.strftime('%Y-%m-%d %H:%M')}")
     
     def register_thread(self, thread_id: str):
-        """Register a new worker thread."""
+        """Register worker thread for thorough mode."""
         with self._lock:
-            self.thread_metrics[thread_id] = ThreadMetrics(
-                thread_id=thread_id,
-                start_time=datetime.now()
-            )
+            self.thread_metrics[thread_id] = {
+                'documents_processed': 0,
+                'pages_analyzed': 0,
+                'early_exits': 0,
+                'total_time': 0.0,
+                'current_document': 'Initializing...',
+                'start_time': datetime.now(),
+                'current_page': 0,
+                'max_pages': 0
+            }
+            self.active_threads.add(thread_id)
     
-    def update_thread_progress(self, thread_id: str, document_name: str, is_successful: bool, result_type: str, processing_time: float):
-        """Update progress for a specific thread."""
+    def update_thread_progress(self, thread_id: str, document_name: str, 
+                             classification_result: str, processing_time: float,
+                             pages_analyzed: int = 0, early_exit: bool = False):
+        """Update thread progress with thorough mode details."""
         with self._lock:
             if thread_id not in self.thread_metrics:
                 self.register_thread(thread_id)
             
             metrics = self.thread_metrics[thread_id]
-            metrics.documents_processed += 1
-            metrics.total_processing_time += processing_time
-            metrics.current_document = document_name
+            metrics['documents_processed'] += 1
+            metrics['pages_analyzed'] += pages_analyzed
+            metrics['total_time'] += processing_time
             
-            if is_successful:
-                metrics.documents_successful += 1
-                self.successful_documents += 1
-            else:
-                metrics.documents_failed += 1
-                self.failed_documents += 1
+            if early_exit:
+                metrics['early_exits'] += 1
+                self.early_exits_triggered += 1
             
-            self.completed_documents += 1
-            self.documents_by_result[result_type] += 1
+            self.documents_processed += 1
+            self.total_pages_analyzed += pages_analyzed
+            self.classification_results[classification_result] += 1
             
-            # Calculate rates
-            if metrics.documents_processed > 0:
-                metrics.average_time_per_doc = metrics.total_processing_time / metrics.documents_processed
-                elapsed_minutes = (datetime.now() - metrics.start_time).total_seconds() / 60
-                if elapsed_minutes > 0:
-                    metrics.docs_per_minute = metrics.documents_processed / elapsed_minutes
+            # Update current status
+            short_name = document_name[-40:] if len(document_name) > 40 else document_name
+            exit_indicator = " [Early Exit]" if early_exit else ""
+            metrics['current_document'] = f"{short_name} [{classification_result}]{exit_indicator}"
     
-    def _monitor_loop(self):
-        """Background monitoring loop."""
+    def update_document_stage(self, thread_id: str, document_name: str, 
+                            current_page: int, max_pages: int, stage: str):
+        """Update document processing stage."""
+        with self._lock:
+            if thread_id not in self.thread_metrics:
+                self.register_thread(thread_id)
+            
+            metrics = self.thread_metrics[thread_id]
+            metrics['current_page'] = current_page
+            metrics['max_pages'] = max_pages
+            
+            short_name = document_name[-30:] if len(document_name) > 30 else document_name
+            metrics['current_document'] = f"{short_name} [{stage} {current_page}/{max_pages}]"
+    
+    def _thorough_monitor_loop(self):
+        """Enhanced monitoring loop for thorough mode."""
         while not self.shutdown_event.is_set():
             try:
-                self._print_progress_update()
+                self._update_thorough_metrics()
+                self._print_thorough_progress()
                 time.sleep(self.config.progress_update_interval)
             except Exception as e:
-                logger.error(f"Error in progress monitor: {e}")
+                logger.error(f"Thorough monitor error: {e}")
     
-    def _print_progress_update(self):
-        """Print detailed progress update."""
+    def _update_thorough_metrics(self):
+        """Update thorough mode specific metrics."""
+        current_time = datetime.now()
+        
+        with self._lock:
+            elapsed_time = current_time - self.start_time
+            elapsed_hours = elapsed_time.total_seconds() / 3600
+            
+            # Calculate rates
+            if elapsed_hours > 0:
+                docs_per_hour = self.documents_processed / elapsed_hours
+                pages_per_hour = self.total_pages_analyzed / elapsed_hours
+                
+                self.processing_rate_history.append(docs_per_hour)
+                self.pages_per_hour_history.append(pages_per_hour)
+    
+    def _print_thorough_progress(self):
+        """Print detailed thorough mode progress."""
         with self._lock:
             current_time = datetime.now()
             elapsed_time = current_time - self.start_time
+            elapsed_hours = elapsed_time.total_seconds() / 3600
             
-            # Calculate overall rate
-            current_completed = self.completed_documents
-            time_since_last = (current_time - self.last_update_time).total_seconds()
+            # Calculate progress
+            progress_pct = (self.documents_processed / max(self.total_documents, 1)) * 100
             
-            if time_since_last > 0:
-                recent_rate = (current_completed - self.last_completed_count) / (time_since_last / 60)
+            # Calculate rates
+            if elapsed_hours > 0:
+                current_docs_per_hour = self.documents_processed / elapsed_hours
+                current_pages_per_hour = self.total_pages_analyzed / elapsed_hours
+                
+                # Estimate completion
+                remaining_docs = self.total_documents - self.documents_processed
+                if current_docs_per_hour > 0:
+                    remaining_hours = remaining_docs / current_docs_per_hour
+                    estimated_completion = current_time + timedelta(hours=remaining_hours)
+                else:
+                    estimated_completion = self.target_end_time
             else:
-                recent_rate = 0
+                current_docs_per_hour = 0
+                current_pages_per_hour = 0
+                estimated_completion = self.target_end_time
             
-            # Calculate ETA
-            if current_completed > 0 and recent_rate > 0:
-                remaining_docs = self.total_documents - current_completed
-                eta_minutes = remaining_docs / recent_rate
-                eta_hours = eta_minutes / 60
-            else:
-                eta_hours = 0
+            # Target vs actual comparison
+            target_docs_per_hour = self.total_documents / self.config.target_duration_hours
+            pace_comparison = "ON TARGET"
+            if current_docs_per_hour > target_docs_per_hour * 1.2:
+                pace_comparison = "AHEAD (may finish early)"
+            elif current_docs_per_hour < target_docs_per_hour * 0.8:
+                pace_comparison = "BEHIND (may need more time)"
             
-            # Success rate
-            success_rate = (self.successful_documents / max(current_completed, 1)) * 100
+            # Average pages per document
+            avg_pages = self.total_pages_analyzed / max(self.documents_processed, 1)
+            early_exit_rate = (self.early_exits_triggered / max(self.documents_processed, 1)) * 100
             
-            print(f"\n{'='*80}")
-            print(f"PRODUCTION CLASSIFICATION PROGRESS - {current_time.strftime('%H:%M:%S')}")
-            print(f"{'='*80}")
-            print(f"Overall: {current_completed:,}/{self.total_documents:,} ({(current_completed/self.total_documents)*100:.1f}%) | Success Rate: {success_rate:.1f}%")
-            print(f"Elapsed: {elapsed_time} | ETA: {eta_hours:.1f} hours | Rate: {recent_rate:.1f} docs/min")
-            print(f"-" * 80)
+            # Clear and print status
+            os.system('cls' if os.name == 'nt' else 'clear')
             
-            # Thread details
-            for thread_id, metrics in self.thread_metrics.items():
-                status = f"[{thread_id}] {metrics.documents_processed:,} docs | "
-                status += f"Rate: {metrics.docs_per_minute:.1f}/min | "
-                status += f"Avg: {metrics.average_time_per_doc:.1f}s | "
-                status += f"Current: {metrics.current_document[-50:] if metrics.current_document else 'Idle'}"
-                print(status)
+            print(f"\n{'='*120}")
+            print(f"THOROUGH MODE HEALTHCARE CLASSIFICATION - {current_time.strftime('%H:%M:%S')}")
+            print(f"{'='*120}")
+            print(f"Progress: {self.documents_processed:,}/{self.total_documents:,} ({progress_pct:.1f}%) | Pages: {self.total_pages_analyzed:,} | Avg: {avg_pages:.1f} pages/doc")
+            print(f"Elapsed: {str(elapsed_time).split('.')[0]} | Target: {self.config.target_duration_hours}h | ETA: {estimated_completion.strftime('%H:%M')}")
+            print(f"Rate: {current_docs_per_hour:.1f} docs/hr (target: {target_docs_per_hour:.1f}) | Pages: {current_pages_per_hour:.0f}/hr | {pace_comparison}")
+            print(f"Early Exits: {self.early_exits_triggered} ({early_exit_rate:.1f}%) | Threads: 5 parallel")
+            print(f"-" * 120)
             
-            print(f"-" * 80)
+            # Thread details (show all 5 threads)
+            print("THREAD STATUS (5 Parallel Threads):")
+            for thread_id, metrics in list(self.thread_metrics.items()):
+                docs_processed = metrics.get('documents_processed', 0)
+                pages_analyzed = metrics.get('pages_analyzed', 0)
+                early_exits = metrics.get('early_exits', 0)
+                current_doc = metrics.get('current_document', 'Idle')
+                
+                print(f"  [{thread_id}] {docs_processed:,} docs | {pages_analyzed:,} pages | {early_exits} early exits")
+                print(f"    └── {current_doc}")
             
-            # Result breakdown
-            if self.documents_by_result:
-                print("Results: ", end="")
-                result_parts = []
-                for result_type, count in sorted(self.documents_by_result.items()):
-                    result_parts.append(f"{result_type}: {count}")
-                print(" | ".join(result_parts))
+            # Classification results
+            if self.classification_results:
+                print(f"-" * 120)
+                result_summary = " | ".join([f"{k}: {v}" for k, v in sorted(self.classification_results.items())])
+                print(f"RESULTS: {result_summary}")
             
-            print(f"{'='*80}")
-            
-            # Update tracking variables
-            self.last_update_time = current_time
-            self.last_completed_count = current_completed
+            print(f"{'='*120}")
     
     def shutdown(self):
-        """Gracefully shutdown the monitor."""
+        """Graceful shutdown of thorough mode monitor."""
         self.shutdown_event.set()
         if hasattr(self, 'monitor_thread'):
             self.monitor_thread.join(timeout=5)
 
-class EnhancedPDFHandler:
-    """Production-ready PDF handler with connection pooling and optimization."""
+# ==========================================
+# THOROUGH MODE PDF HANDLER
+# ==========================================
+
+class ThoroughModePDFHandler:
+    """PDF handler optimized for thorough 10-page analysis."""
     
-    def __init__(self, config: ProductionConfig):
+    def __init__(self, config: ThoroughModeConfig):
         self.config = config
         self._local = threading.local()
     
-    def _get_thread_id(self) -> str:
-        """Get current thread ID for logging."""
-        return threading.current_thread().name
-    
-    def quick_complexity_check(self, pdf_doc: fitz.Document) -> PDFComplexityInfo:
-        """Analyze PDF complexity with performance optimizations."""
-        complexity_info = PDFComplexityInfo()
+    def attempt_pdf_open_thorough(self, pdf_path: str) -> Optional[fitz.Document]:
+        """Thorough PDF opening with multiple strategies."""
+        # Standard strategies
+        strategies = ['standard', 'stream', 'repair']
         
-        try:
-            complexity_info.page_count = len(pdf_doc)
-            
-            # Quick form field check (first 3 pages only for performance)
-            pages_to_check = min(3, len(pdf_doc))
-            for page_num in range(pages_to_check):
-                try:
-                    page = pdf_doc.load_page(page_num)
-                    if page.get_widgets():
-                        complexity_info.has_form_fields = True
-                        complexity_info.potential_issues.append('form_fields')
-                        break
-                except Exception:
-                    continue
-            
-            # Quick encryption check
-            if pdf_doc.needs_pass:
-                complexity_info.has_encryption = True
-                complexity_info.potential_issues.append('password_protected')
-            
-            # Quick embedded files check
-            if pdf_doc.embfile_count() > 0:
-                complexity_info.has_embedded_files = True
-                complexity_info.potential_issues.append('embedded_files')
-            
-            # Simplified complexity level
-            issue_count = len(complexity_info.potential_issues)
-            if issue_count == 0:
-                complexity_info.complexity_level = 'simple'
-            elif issue_count <= 2:
-                complexity_info.complexity_level = 'moderate'
-            else:
-                complexity_info.complexity_level = 'complex'
+        for strategy in strategies:
+            try:
+                if strategy == 'standard':
+                    doc = fitz.open(pdf_path)
+                elif strategy == 'stream':
+                    with open(pdf_path, 'rb') as f:
+                        pdf_data = f.read()
+                    doc = fitz.open(stream=pdf_data, filetype="pdf")
+                else:  # repair
+                    doc = fitz.open(pdf_path, filetype="pdf")
                 
-        except Exception as e:
-            complexity_info.potential_issues.append(f'analysis_error: {str(e)}')
-            complexity_info.complexity_level = 'problematic'
-            complexity_info.analysis_successful = False
+                if len(doc) > 0:
+                    return doc
+                else:
+                    doc.close()
+                    
+            except Exception:
+                continue
         
-        return complexity_info
-
-    def attempt_pdf_open_with_strategies(self, pdf_path: str) -> Optional[fitz.Document]:
-        """Open PDF with multiple strategies and optimizations."""
-        thread_id = self._get_thread_id()
-        logger.debug(f"[{thread_id}] Opening PDF: {os.path.basename(pdf_path)}")
-        
-        # Strategy 1: Standard open (fastest)
-        try:
-            doc = fitz.open(pdf_path)
-            return doc
-        except Exception:
-            pass
-        
-        # Strategy 2: Memory-based opening
-        try:
-            with open(pdf_path, 'rb') as f:
-                pdf_data = f.read()
-            doc = fitz.open(stream=pdf_data, filetype="pdf")
-            return doc
-        except Exception:
-            pass
-        
-        # Strategy 3: Repair mode
-        try:
-            doc = fitz.open(pdf_path, filetype="pdf")
-            return doc
-        except Exception:
-            pass
-        
-        logger.warning(f"[{thread_id}] All PDF open strategies failed for: {os.path.basename(pdf_path)}")
         return None
-
+    
+    def get_thorough_page_selection(self, pdf_doc: fitz.Document) -> List[int]:
+        """Select exactly 10 pages using thorough strategy."""
+        total_pages = len(pdf_doc)
+        
+        if total_pages <= self.config.pages_per_document:
+            # If document has 10 or fewer pages, analyze all
+            return list(range(total_pages))
+        
+        # For documents with more than 10 pages, use strategic selection
+        pages_to_check = []
+        
+        if self.config.page_selection_strategy == "thorough":
+            # Thorough strategy: First 6, middle 2, last 2
+            # First 6 pages (healthcare contracts often have key info early)
+            first_pages = list(range(min(6, total_pages)))
+            pages_to_check.extend(first_pages)
+            
+            remaining_slots = self.config.pages_per_document - len(first_pages)
+            
+            if total_pages > 6 and remaining_slots > 0:
+                # Add some middle pages
+                middle_start = total_pages // 3
+                middle_pages = list(range(middle_start, min(middle_start + 2, total_pages)))
+                # Remove any overlap with first pages
+                middle_pages = [p for p in middle_pages if p not in pages_to_check]
+                pages_to_check.extend(middle_pages[:min(2, remaining_slots)])
+                
+                remaining_slots = self.config.pages_per_document - len(pages_to_check)
+                
+                # Fill remaining slots with last pages
+                if remaining_slots > 0:
+                    last_pages = list(range(max(total_pages - remaining_slots, len(pages_to_check)), total_pages))
+                    # Remove any overlap
+                    last_pages = [p for p in last_pages if p not in pages_to_check]
+                    pages_to_check.extend(last_pages)
+        
+        # Ensure we have exactly 10 pages (or fewer if document is small)
+        pages_to_check = sorted(list(set(pages_to_check)))[:self.config.pages_per_document]
+        
+        return pages_to_check
+    
     def safe_page_access(self, doc: fitz.Document, page_idx: int) -> Optional[fitz.Page]:
-        """Safely access a page with error handling."""
+        """Safe page access for thorough mode."""
         try:
             page = doc.load_page(page_idx)
-            _ = page.rect  # Test if page is accessible
+            _ = page.rect  # Test accessibility
             return page
-        except Exception:
+        except:
             return None
-
-class ProductionHealthcareClassifier:
-    """Production-ready classifier with threading, early exit, and fault tolerance."""
     
-    def __init__(self, client, config: ProductionConfig):
+    def get_thorough_client(self):
+        """Get thread-local client for thorough processing."""
+        if not hasattr(self._local, 'client'):
+            self._local.client = create_client()
+        return self._local.client
+
+# ==========================================
+# FILE DISCOVERY (OPTIMIZED FOR THOROUGH MODE)
+# ==========================================
+
+class ThoroughModeFileDiscovery:
+    """File discovery optimized for thorough mode processing."""
+    
+    def __init__(self, root_path: str, config: ThoroughModeConfig):
+        self.root_path = Path(root_path)
+        self.config = config
+    
+    def discover_all_documents(self) -> List[DocumentMetadata]:
+        """Discover all documents for thorough mode processing."""
+        logger.info(f"Starting thorough mode discovery from: {self.root_path}")
+        
+        agreements_path = self.root_path / self.config.agreements_folder
+        if not agreements_path.exists():
+            logger.error(f"'{self.config.agreements_folder}' not found")
+            return []
+        
+        all_documents = []
+        state_folders = [f for f in agreements_path.iterdir() 
+                        if f.is_dir() and self._is_state_folder(f)]
+        
+        logger.info(f"Thorough mode processing {len(state_folders)} state folders...")
+        
+        for state_folder in state_folders:
+            state_docs = self._process_state_thorough(state_folder)
+            all_documents.extend(state_docs)
+            
+            if len(all_documents) % 500 == 0:
+                logger.info(f"Discovered {len(all_documents):,} documents for thorough analysis...")
+        
+        # Apply thorough mode filters
+        filtered_docs = self._apply_thorough_filters(all_documents)
+        
+        logger.info(f"Thorough mode discovery complete: {len(filtered_docs):,} documents ready for 10-page analysis")
+        return filtered_docs
+    
+    def _process_state_thorough(self, state_folder: Path) -> List[DocumentMetadata]:
+        """Process state folder for thorough mode."""
+        hospital_path = state_folder / self.config.hospital_subfolder
+        if not hospital_path.exists():
+            return []
+        
+        documents = []
+        
+        try:
+            pdf_paths = list(hospital_path.rglob("*.pdf"))
+            
+            for pdf_path in pdf_paths:
+                try:
+                    # Skip patterns
+                    if any(pattern in str(pdf_path) for pattern in self.config.skip_file_patterns):
+                        continue
+                    
+                    # Handle long paths
+                    path_str = str(pdf_path)
+                    if path_str.startswith('\\\\') and not path_str.startswith('\\\\?\\'):
+                        path_str = '\\\\?\\UNC\\' + path_str[2:]
+                    
+                    if os.path.exists(path_str):
+                        stat_info = os.stat(path_str)
+                        
+                        # Thorough mode size filters
+                        if (stat_info.st_size < self.config.min_file_size_bytes or 
+                            stat_info.st_size > self.config.max_file_size_mb * 1024 * 1024):
+                            continue
+                        
+                        doc = DocumentMetadata(
+                            source_path=path_str,
+                            pdf_name=pdf_path.name,
+                            state=state_folder.name,
+                            file_size=stat_info.st_size,
+                            last_modified=datetime.fromtimestamp(stat_info.st_mtime)
+                        )
+                        documents.append(doc)
+                        
+                except Exception as e:
+                    logger.debug(f"Error processing {pdf_path}: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error processing state {state_folder.name}: {e}")
+        
+        return documents
+    
+    def _apply_thorough_filters(self, documents: List[DocumentMetadata]) -> List[DocumentMetadata]:
+        """Apply filters optimized for thorough mode."""
+        filtered = []
+        
+        for doc in documents:
+            # File date filter
+            if doc.file_modification_date < self.config.min_file_modification_date:
+                continue
+            
+            # In thorough mode, we're more inclusive
+            filtered.append(doc)
+        
+        return filtered
+    
+    def _is_state_folder(self, folder_path: Path) -> bool:
+        """Check if folder represents a US state."""
+        folder_name_upper = folder_path.name.upper()
+        return any(state in folder_name_upper for state in self.config.us_states)
+
+# ==========================================
+# THOROUGH MODE CLASSIFIER
+# ==========================================
+
+class ThoroughModeHealthcareClassifier:
+    """Healthcare classifier implementing exact thorough mode requirements."""
+    
+    def __init__(self, client, config: ThoroughModeConfig):
         self.client = client
         self.config = config
-        self.pdf_handler = EnhancedPDFHandler(config)
+        self.pdf_handler = ThoroughModePDFHandler(config)
+        self.state_manager = ThoroughModeStateManager(config)
         
-        # Thread-safe state management
-        self.state_manager = ProductionStateManager(config)
-        self.progress_monitor = None
+        # Thorough mode tracking
+        self.total_documents_discovered = 0
+        self.api_calls_made = 0
+        self.session_stats = ThoroughModeStats()
         
-        # Thread-safe statistics
-        self._stats_lock = Lock()
-        self.complexity_stats = defaultdict(int)
-        self.issue_frequency = defaultdict(int)
-        self.incremental_stats = {
-            'total_discovered': 0,
-            'skipped_old_files': 0,
-            'skipped_unchanged': 0,
-            'newly_processed': 0
-        }
+        # Pacing controller (will be initialized when we know total document count)
+        self.pacing_controller = None
         
-        # Graceful shutdown handling
+        # Shutdown handling
         self.shutdown_requested = Event()
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
-        """Handle graceful shutdown on Ctrl+C or terminate signal."""
-        logger.info("Shutdown signal received. Initiating graceful shutdown...")
+        """Graceful shutdown for thorough mode."""
+        logger.info("Thorough mode shutdown signal received...")
         self.shutdown_requested.set()
-        
-        if self.progress_monitor:
-            self.progress_monitor.shutdown()
-        
-        # Save current state
-        self.state_manager.save_state(date.today())
-        
-        logger.info("Graceful shutdown completed.")
+        self.state_manager.save_final_state(self.total_documents_discovered)
         sys.exit(0)
     
-    def classify_all_documents(self, documents: List[DocumentMetadata]) -> Dict[str, List[DocumentMetadata]]:
-        """Production-ready classification with threading and fault tolerance."""
-        logger.info(f"Starting production classification of {len(documents)} documents with {self.config.max_threads} threads...")
+    def classify_all_documents_thorough(self, documents: List[DocumentMetadata]) -> Dict[str, Any]:
+        """Execute thorough mode classification with exact requirements."""
+        self.total_documents_discovered = len(documents)
         
-        # Apply pre-filtering
-        documents_to_process = self._apply_pre_filtering(documents)
+        logger.info(f"Starting Thorough Mode Classification:")
+        logger.info(f"  • Documents: {len(documents):,}")
+        logger.info(f"  • Pages per document: {self.config.pages_per_document}")
+        logger.info(f"  • Parallel threads: {self.config.parallel_threads}")
+        logger.info(f"  • Early exit: {self.config.enable_early_exit}")
+        logger.info(f"  • Target duration: {self.config.target_duration_hours} hours")
         
-        # Initialize progress monitoring
-        self.progress_monitor = ThreadSafeProgressMonitor(len(documents_to_process), self.config)
+        # Apply thorough mode filtering
+        documents_to_process = self._apply_thorough_filtering(documents)
         
-        # Initialize results structure
-        results = {
-            'relevant': [], 'not_healthcare': [], 'old_date': [], 'no_date': [], 
-            'failed': [], 'pdf_corrupted': [], 'form_field_issues': [],
-            'old_file_date': [], 'skipped_unchanged': []
-        }
+        # Initialize pacing controller
+        self.pacing_controller = AdaptivePacingController(self.config, len(documents_to_process))
         
-        # Thread-safe result collection
+        # Initialize progress monitor
+        progress_monitor = ThoroughModeProgressMonitor(len(documents_to_process), self.config)
+        
+        # Results tracking
+        results = defaultdict(list)
         results_lock = Lock()
         
-        def process_document_wrapper(doc: DocumentMetadata) -> DocumentMetadata:
-            """Wrapper function for thread processing."""
+        # Process in smaller batches for thorough mode
+        batch_size = self.config.batch_size
+        total_batches = (len(documents_to_process) + batch_size - 1) // batch_size
+        
+        logger.info(f"Thorough mode processing {len(documents_to_process)} documents in {total_batches} batches")
+        
+        documents_completed = 0
+        
+        for batch_idx in range(total_batches):
+            if self.shutdown_requested.is_set():
+                logger.info("Shutdown requested during thorough mode processing...")
+                break
+            
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(documents_to_process))
+            batch_documents = documents_to_process[start_idx:end_idx]
+            
+            logger.info(f"Thorough batch {batch_idx + 1}/{total_batches} ({len(batch_documents)} documents)")
+            
+            # Process batch with exactly 5 threads
+            batch_results = self._process_thorough_batch(
+                batch_documents, progress_monitor, results_lock, results
+            )
+            
+            documents_completed += len(batch_documents)
+            
+            # Apply adaptive pacing to meet 15-20 hour target
+            if self.pacing_controller:
+                self.pacing_controller.apply_pacing_delay(documents_completed)
+            
+            # Memory cleanup
+            gc.collect()
+            
+            logger.info(f"Thorough batch {batch_idx + 1} completed. Total: {documents_completed:,}/{len(documents_to_process):,}")
+        
+        # Finalize results
+        progress_monitor.shutdown()
+        self.state_manager.save_final_state(len(documents_to_process))
+        
+        # Generate thorough mode results
+        final_results = self._generate_thorough_results(results, documents, documents_completed)
+        
+        logger.info(f"Thorough Mode Classification completed: {documents_completed:,} documents processed")
+        return final_results
+    
+    def _apply_thorough_filtering(self, documents: List[DocumentMetadata]) -> List[DocumentMetadata]:
+        """Apply thorough mode specific filtering."""
+        documents_to_process = []
+        skipped_counts = defaultdict(int)
+        
+        for doc in documents:
+            # Check if thorough processing needed
+            should_process = self.state_manager.should_process_file(
+                doc.source_path, doc.file_modification_date
+            )
+            
+            if not should_process:
+                skipped_counts['already_processed_thorough'] += 1
+                doc.classification_result = "skipped_thorough_complete"
+                continue
+            
+            doc.is_newly_modified = True
+            documents_to_process.append(doc)
+        
+        # Sort by modification date (newest first for healthcare relevance)
+        documents_to_process.sort(key=lambda x: x.last_modified, reverse=True)
+        
+        logger.info(f"Thorough mode filtering results:")
+        logger.info(f"  • To process: {len(documents_to_process):,}")
+        logger.info(f"  • Estimated pages to analyze: {len(documents_to_process) * self.config.pages_per_document:,}")
+        for reason, count in skipped_counts.items():
+            logger.info(f"  • Skipped ({reason}): {count:,}")
+        
+        return documents_to_process
+    
+    def _process_thorough_batch(self, batch_documents: List[DocumentMetadata], 
+                               progress_monitor: ThoroughModeProgressMonitor,
+                               results_lock: Lock, results: Dict) -> List[DocumentMetadata]:
+        """Process batch using exactly 5 parallel threads as required."""
+        
+        def process_single_document_thorough(doc: DocumentMetadata) -> DocumentMetadata:
+            """Process single document with thorough 10-page analysis."""
             thread_id = threading.current_thread().name
-            self.progress_monitor.register_thread(thread_id)
+            progress_monitor.register_thread(thread_id)
             
             try:
-                # Check for shutdown
                 if self.shutdown_requested.is_set():
                     return doc
                 
-                # Mark as in progress
-                self.state_manager.mark_file_in_progress(doc.source_path)
-                doc.processing_started_at = datetime.now()
                 doc.thread_id = thread_id
+                doc.processing_started_at = datetime.now()
                 
-                # Process the document
-                classification_result = self._classify_single_document_production(doc)
+                # Execute thorough classification
+                classification_result = self._classify_document_thorough_mode(doc, progress_monitor)
                 
-                # Update document with results
+                # Update document with thorough results
                 doc.processing_time = classification_result.processing_time
                 doc.confidence_score = classification_result.confidence
                 doc.detected_on_page = classification_result.detected_on_page
                 doc.effective_date = classification_result.effective_date
                 doc.stage_failed = classification_result.stage_failed
+                doc.pages_analyzed = classification_result.pages_checked
+                doc.early_exit_triggered = classification_result.early_exit_triggered
                 doc.classification_status = "completed"
                 
                 # Determine result category
-                if classification_result.is_relevant:
+                is_successful = classification_result.is_relevant
+                if is_successful:
                     doc.classification_result = "relevant"
-                    is_successful = True
                 else:
-                    if "old_file_date" in doc.stage_failed.lower():
-                        doc.classification_result = 'old_file_date'
-                    elif "form field" in doc.stage_failed.lower():
-                        doc.classification_result = 'form_field_issues'
-                    elif "Stage 2: No effective date" in doc.stage_failed:
-                        doc.classification_result = 'no_date'
-                    elif "Stage 2: Effective date before" in doc.stage_failed:
-                        doc.classification_result = 'old_date'
-                    elif "PDF corruption" in doc.stage_failed or "Unable to open" in doc.stage_failed:
-                        doc.classification_result = 'pdf_corrupted'
-                    else:
-                        doc.classification_result = 'not_healthcare'
-                    is_successful = False
+                    doc.classification_result = self._categorize_thorough_failure(doc.stage_failed)
                 
-                # Update thread-safe statistics
-                with self._stats_lock:
-                    if doc.pdf_complexity_level:
-                        self.complexity_stats[doc.pdf_complexity_level] += 1
-                    for issue in doc.pdf_issues:
-                        self.issue_frequency[issue] += 1
-                
-                # Update state management
+                # Update state with thorough mode details
                 self.state_manager.update_file_status(
-                    doc.source_path, 
-                    doc.file_modification_date, 
-                    doc.classification_result,
-                    thread_id
+                    doc.source_path, doc.file_modification_date, 
+                    doc.classification_result, thread_id,
+                    doc.pages_analyzed, doc.early_exit_triggered
                 )
                 
-                # Update progress monitoring
-                self.progress_monitor.update_thread_progress(
-                    thread_id, 
-                    doc.pdf_name, 
-                    is_successful, 
-                    doc.classification_result, 
-                    doc.processing_time
+                # Update progress monitor
+                progress_monitor.update_thread_progress(
+                    thread_id, doc.pdf_name, doc.classification_result, 
+                    doc.processing_time, doc.pages_analyzed, doc.early_exit_triggered
                 )
                 
-                # Thread-safe result collection
+                # Update results
                 with results_lock:
                     results[doc.classification_result].append(doc)
                 
                 return doc
                 
             except Exception as e:
-                logger.error(f"[{thread_id}] Failed to process {doc.pdf_name}: {e}")
+                logger.error(f"[{thread_id}] Thorough mode failed for {doc.pdf_name}: {e}")
                 doc.classification_result = "failed"
                 doc.error_message = str(e)
-                doc.pdf_complexity_level = "problematic"
-                
-                self.state_manager.mark_file_failed(doc.source_path, str(e))
                 
                 with results_lock:
                     results['failed'].append(doc)
                 
                 return doc
         
-        # Execute with ThreadPoolExecutor
-        logger.info(f"Processing {len(documents_to_process)} documents with {self.config.max_threads} threads...")
-        
-        completed_count = 0
-        with ThreadPoolExecutor(max_workers=self.config.max_threads, thread_name_prefix="ClassifierWorker") as executor:
-            # Submit all tasks
-            future_to_doc = {executor.submit(process_document_wrapper, doc): doc for doc in documents_to_process}
+        # Execute with exactly 5 threads as required
+        with ThreadPoolExecutor(max_workers=self.config.parallel_threads, 
+                               thread_name_prefix="ThoroughWorker") as executor:
             
-            # Process completed tasks
-            for future in as_completed(future_to_doc):
+            futures = {executor.submit(process_single_document_thorough, doc): doc 
+                      for doc in batch_documents}
+            
+            completed_docs = []
+            for future in as_completed(futures):
                 if self.shutdown_requested.is_set():
-                    logger.info("Shutdown requested, cancelling remaining tasks...")
-                    for remaining_future in future_to_doc:
-                        remaining_future.cancel()
                     break
                 
                 try:
-                    doc = future.result(timeout=self.config.thread_timeout_minutes * 60)
-                    completed_count += 1
-                    
-                    if completed_count % 100 == 0:
-                        logger.info(f"Completed {completed_count}/{len(documents_to_process)} documents")
-                        
+                    doc = future.result(timeout=self.config.api_timeout_seconds)
+                    completed_docs.append(doc)
                 except Exception as e:
-                    logger.error(f"Task execution failed: {e}")
+                    logger.error(f"Thorough mode task failed: {e}")
         
-        # Add skipped documents to results
-        skipped_docs = [doc for doc in documents if not doc.is_newly_modified and doc not in documents_to_process]
-        results['skipped_unchanged'].extend(skipped_docs)
-        
-        # Generate comprehensive analysis
-        total_docs = len(documents)
-        results['complexity_analysis'] = {
-            'total_analyzed': total_docs,
-            'incremental_stats': self.incremental_stats,
-            'thread_performance': {tid: {
-                'documents_processed': tm.documents_processed,
-                'success_rate': (tm.documents_successful / max(tm.documents_processed, 1)) * 100,
-                'avg_time_per_doc': tm.average_time_per_doc,
-                'docs_per_minute': tm.docs_per_minute
-            } for tid, tm in self.progress_monitor.thread_metrics.items()},
-            'complexity_distribution': {
-                level: {'count': count, 'percentage': (count/total_docs)*100 if total_docs > 0 else 0}
-                for level, count in self.complexity_stats.items()
-            },
-            'common_issues': dict(sorted(self.issue_frequency.items(), key=lambda x: x[1], reverse=True)),
-            'recommendations': self._generate_recommendations()
-        }
-        
-        # Shutdown progress monitor
-        if self.progress_monitor:
-            self.progress_monitor.shutdown()
-        
-        # Save final state
-        self.state_manager.save_state(date.today())
-        
-        logger.info(f"Production classification completed. Processed {completed_count} documents.")
-        return results
+        return completed_docs
     
-    def _apply_pre_filtering(self, documents: List[DocumentMetadata]) -> List[DocumentMetadata]:
-        """Apply intelligent pre-filtering with priority sorting."""
-        documents_to_process = []
-        self.incremental_stats['total_discovered'] = len(documents)
-        
-        for doc in documents:
-            # Check file modification date criteria
-            doc.file_date_meets_criteria = doc.file_modification_date >= self.config.min_file_modification_date
-            
-            # Check incremental processing
-            if self.config.enable_incremental_processing:
-                doc.is_newly_modified = self.state_manager.should_process_file(
-                    doc.source_path, 
-                    doc.file_modification_date
-                )
-            else:
-                doc.is_newly_modified = True
-            
-            # Apply filtering logic
-            if not doc.file_date_meets_criteria:
-                self.incremental_stats['skipped_old_files'] += 1
-                doc.classification_result = "old_file_date"
-                doc.stage_failed = f"File modified before {self.config.min_file_modification_date} ({doc.file_modification_date})"
-                continue
-            
-            if not doc.is_newly_modified:
-                self.incremental_stats['skipped_unchanged'] += 1
-                doc.classification_result = "skipped_unchanged"
-                doc.stage_failed = f"File unchanged since last run"
-                continue
-            
-            documents_to_process.append(doc)
-            self.incremental_stats['newly_processed'] += 1
-        
-        # Apply priority sorting
-        if self.config.priority_processing == "newest_first":
-            documents_to_process.sort(key=lambda x: x.last_modified, reverse=True)
-        elif self.config.priority_processing == "largest_first":
-            documents_to_process.sort(key=lambda x: x.file_size, reverse=True)
-        elif self.config.priority_processing == "random":
-            import random
-            random.shuffle(documents_to_process)
-        
-        logger.info(f"Pre-filtering results:")
-        logger.info(f"  Total discovered: {self.incremental_stats['total_discovered']}")
-        logger.info(f"  Skipped (old file date): {self.incremental_stats['skipped_old_files']}")
-        logger.info(f"  Skipped (unchanged): {self.incremental_stats['skipped_unchanged']}")
-        logger.info(f"  To process: {self.incremental_stats['newly_processed']}")
-        
-        return documents_to_process
-    
-    def _classify_single_document_production(self, doc: DocumentMetadata) -> ClassificationResult:
-        """Production-ready single document classification with early exit and smart page selection."""
+    def _classify_document_thorough_mode(self, doc: DocumentMetadata, 
+                                       progress_monitor: ThoroughModeProgressMonitor) -> ClassificationResult:
+        """Execute thorough mode classification - exactly 10 pages, early exit enabled."""
         start_time = time.time()
         pdf_doc = None
-        thread_id = threading.current_thread().name
+        thread_id = doc.thread_id
         
         try:
-            # Open PDF with enhanced strategies
-            pdf_doc = self.pdf_handler.attempt_pdf_open_with_strategies(doc.source_path)
+            # Open PDF with thorough strategies
+            progress_monitor.update_document_stage(thread_id, doc.pdf_name, 0, 10, "Opening PDF")
+            pdf_doc = self.pdf_handler.attempt_pdf_open_thorough(doc.source_path)
             
             if pdf_doc is None:
                 doc.pdf_complexity_level = "problematic"
                 doc.pdf_issues = ["unable_to_open"]
                 return ClassificationResult(
-                    False,
-                    stage_failed="PDF corruption: Unable to open PDF after all repair attempts",
-                    processing_time=time.time() - start_time
+                    False, stage_failed="Unable to open PDF for thorough analysis",
+                    processing_time=time.time() - start_time, total_pages_available=0
                 )
             
-            # Quick complexity analysis
-            if self.config.enable_complexity_analysis:
-                complexity_info = self.pdf_handler.quick_complexity_check(pdf_doc)
-                doc.pdf_complexity_level = complexity_info.complexity_level
-                doc.pdf_issues = complexity_info.potential_issues.copy()
-            else:
-                doc.pdf_complexity_level = "simple"
-                doc.pdf_issues = []
-            
-            # Check if PDF has accessible pages
-            if len(pdf_doc) == 0:
-                doc.pdf_complexity_level = "problematic"
-                doc.pdf_issues.append("no_pages")
+            total_pages_available = len(pdf_doc)
+            if total_pages_available == 0:
                 return ClassificationResult(
-                    False,
-                    stage_failed="PDF corruption: No accessible pages found",
-                    processing_time=time.time() - start_time
+                    False, stage_failed="PDF has no pages for thorough analysis",
+                    processing_time=time.time() - start_time, total_pages_available=0
                 )
             
-            # Smart page selection with early exit
-            pages_to_check = self._get_smart_page_selection(pdf_doc)
+            # Get exactly 10 pages (or fewer if document is smaller) using thorough strategy
+            pages_to_analyze = self.pdf_handler.get_thorough_page_selection(pdf_doc)
             
-            if not pages_to_check:
-                doc.pdf_issues.append("no_accessible_pages")
+            if not pages_to_analyze:
                 return ClassificationResult(
-                    False,
-                    stage_failed="PDF corruption: No accessible pages for analysis",
-                    processing_time=time.time() - start_time
+                    False, stage_failed="No accessible pages for thorough analysis",
+                    processing_time=time.time() - start_time, total_pages_available=total_pages_available
                 )
             
-            logger.debug(f"[{thread_id}] Processing {doc.pdf_name}: checking {len(pages_to_check)} pages")
+            logger.debug(f"[{thread_id}] Thorough analysis: {len(pages_to_analyze)} pages from {total_pages_available} total")
             
-            # Process pages with early exit logic
             pages_checked = 0
-            accessible_pages_count = 0
             
-            for page_idx in pages_to_check:
-                # Check for shutdown signal
+            # Thorough analysis: check each of the selected pages
+            for i, page_idx in enumerate(pages_to_analyze):
                 if self.shutdown_requested.is_set():
-                    return ClassificationResult(
-                        False,
-                        stage_failed="Processing interrupted by shutdown",
-                        processing_time=time.time() - start_time,
-                        pages_checked=pages_checked
-                    )
+                    break
+                
+                progress_monitor.update_document_stage(
+                    thread_id, doc.pdf_name, i + 1, len(pages_to_analyze), 
+                    f"Analyzing page {page_idx + 1}"
+                )
                 
                 page = self.pdf_handler.safe_page_access(pdf_doc, page_idx)
                 if page is None:
-                    logger.debug(f"[{thread_id}] Skipping corrupted page {page_idx + 1} in {doc.pdf_name}")
                     continue
                 
-                accessible_pages_count += 1
                 pages_checked += 1
                 
                 # Stage 1: Healthcare contract detection
-                if not self._is_healthcare_contract_safe(page, thread_id):
+                if not self._is_healthcare_contract_thorough(page, thread_id):
                     continue
                 
-                logger.debug(f"[{thread_id}] Healthcare contract found on page {page_idx + 1} in {doc.pdf_name}")
+                # Stage 2: Date extraction with early exit
+                progress_monitor.update_document_stage(
+                    thread_id, doc.pdf_name, i + 1, len(pages_to_analyze), 
+                    f"Extracting date from page {page_idx + 1}"
+                )
                 
-                # Stage 2: Effective date extraction
-                date_result = self._get_effective_date_safe(page, thread_id)
+                date_result = self._get_effective_date_thorough(page, thread_id)
                 processing_time = time.time() - start_time
                 
                 if date_result and date_result.year >= self.config.min_effective_year:
-                    # SUCCESS - Early exit!
-                    confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
-                    logger.debug(f"[{thread_id}] SUCCESS: Valid date {date_result.year} found in {doc.pdf_name}")
+                    # SUCCESS - Early exit triggered
+                    logger.info(f"[{thread_id}] Thorough mode SUCCESS: {doc.pdf_name} - Early exit on page {page_idx + 1}")
                     return ClassificationResult(
-                        True, 
-                        page_idx + 1, 
-                        date_result, 
-                        confidence=confidence, 
-                        processing_time=processing_time,
-                        pages_checked=pages_checked,
-                        early_exit_triggered=True
+                        True, page_idx + 1, date_result, confidence=0.95,
+                        processing_time=processing_time, pages_checked=pages_checked,
+                        early_exit_triggered=True, total_pages_available=total_pages_available,
+                        pages_skipped=len(pages_to_analyze) - pages_checked
                     )
                 elif date_result:
-                    # Found date but too old - Early exit!
-                    confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
-                    stage_failed_msg = f"Stage 2: Effective date before {self.config.min_effective_year} ({date_result.year})"
-                    if doc.pdf_complexity_level in ['complex', 'moderate']:
-                        stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
-                    
-                    logger.debug(f"[{thread_id}] Old date {date_result.year} found in {doc.pdf_name}")
+                    # Found date but too old - Early exit
+                    logger.info(f"[{thread_id}] Thorough mode: {doc.pdf_name} - Date too old ({date_result.year})")
                     return ClassificationResult(
-                        False, 
-                        page_idx + 1, 
-                        date_result, 
-                        stage_failed=stage_failed_msg, 
-                        confidence=confidence, 
-                        processing_time=processing_time,
-                        pages_checked=pages_checked,
-                        early_exit_triggered=True
+                        False, page_idx + 1, date_result,
+                        stage_failed=f"Effective date before {self.config.min_effective_year} ({date_result.year})",
+                        confidence=0.9, processing_time=processing_time,
+                        pages_checked=pages_checked, early_exit_triggered=True,
+                        total_pages_available=total_pages_available,
+                        pages_skipped=len(pages_to_analyze) - pages_checked
                     )
                 else:
-                    # Healthcare contract but no date found - Early exit!
-                    confidence = 0.8 if doc.pdf_complexity_level == 'simple' else 0.7
-                    stage_failed_msg = "Stage 2: No effective date found on relevant page"
-                    if doc.pdf_complexity_level in ['complex', 'moderate']:
-                        stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
-                    
-                    logger.debug(f"[{thread_id}] Healthcare contract found but no date in {doc.pdf_name}")
+                    # Healthcare contract found but no date - Early exit
+                    logger.info(f"[{thread_id}] Thorough mode: {doc.pdf_name} - No effective date found")
                     return ClassificationResult(
-                        False, 
-                        page_idx + 1, 
-                        None, 
-                        stage_failed=stage_failed_msg, 
-                        confidence=confidence, 
-                        processing_time=processing_time,
-                        pages_checked=pages_checked,
-                        early_exit_triggered=True
+                        False, page_idx + 1, None,
+                        stage_failed="Healthcare contract found but no effective date",
+                        confidence=0.8, processing_time=processing_time,
+                        pages_checked=pages_checked, early_exit_triggered=True,
+                        total_pages_available=total_pages_available,
+                        pages_skipped=len(pages_to_analyze) - pages_checked
                     )
             
-            # No healthcare contract found in any page
-            if accessible_pages_count > 0:
-                confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
-                stage_failed_msg = "Stage 1: Not a healthcare contract"
-                if doc.pdf_complexity_level in ['complex', 'moderate']:
-                    stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
-                
-                logger.debug(f"[{thread_id}] No healthcare contract found in {doc.pdf_name}")
-                return ClassificationResult(
-                    False, 
-                    stage_failed=stage_failed_msg, 
-                    confidence=confidence, 
-                    processing_time=time.time() - start_time,
-                    pages_checked=pages_checked
-                )
-            else:
-                doc.pdf_issues.append("no_processable_pages")
-                return ClassificationResult(
-                    False, 
-                    stage_failed="PDF corruption: No pages could be processed", 
-                    processing_time=time.time() - start_time,
-                    pages_checked=pages_checked
-                )
-        
+            # Completed full thorough analysis - no healthcare contract found
+            logger.info(f"[{thread_id}] Thorough mode complete: {doc.pdf_name} - Not healthcare contract ({pages_checked} pages analyzed)")
+            return ClassificationResult(
+                False, stage_failed="Not a healthcare contract after thorough analysis",
+                confidence=0.95, processing_time=time.time() - start_time,
+                pages_checked=pages_checked, early_exit_triggered=False,
+                total_pages_available=total_pages_available, pages_skipped=0
+            )
+            
         except Exception as e:
-            logger.error(f"[{thread_id}] Critical error processing {doc.pdf_name}: {e}")
-            raise RuntimeError(f"Failed to process PDF {doc.pdf_name}") from e
+            logger.error(f"[{thread_id}] Critical error in thorough mode: {e}")
+            raise RuntimeError(f"Thorough mode processing failed: {doc.pdf_name}") from e
         finally:
             if pdf_doc:
                 try:
@@ -977,540 +1095,451 @@ class ProductionHealthcareClassifier:
                 except:
                     pass
     
-    def _get_smart_page_selection(self, pdf_doc: fitz.Document) -> List[int]:
-        """Smart page selection optimized for healthcare contracts."""
-        total_pages = len(pdf_doc)
-        
-        # For small documents, check all pages
-        if total_pages <= self.config.max_pages_per_document:
-            candidate_pages = list(range(total_pages))
-        else:
-            # Smart selection: healthcare contracts typically appear early
-            first_pages = list(range(min(self.config.first_pages_count, total_pages)))
-            
-            # Check last few pages for continuation
-            last_start = max(total_pages - self.config.last_pages_count, self.config.first_pages_count)
-            last_pages = list(range(last_start, total_pages))
-            
-            candidate_pages = sorted(list(set(first_pages + last_pages)))
-        
-        # Filter out inaccessible pages
-        accessible_pages = []
-        for page_idx in candidate_pages:
-            if self.pdf_handler.safe_page_access(pdf_doc, page_idx) is not None:
-                accessible_pages.append(page_idx)
-        
-        return accessible_pages
-    
-    def _call_gemini_safe(self, page: fitz.Page, prompt: str, thread_id: str) -> Optional[str]:
-        """Thread-safe Gemini API call with enhanced error handling."""
+    def _is_healthcare_contract_thorough(self, page: fitz.Page, thread_id: str) -> bool:
+        """Healthcare contract detection optimized for thorough mode."""
         try:
+            client = self.pdf_handler.get_thorough_client()
+            
+            # Create image for analysis
             mat = fitz.Matrix(self.config.image_dpi / 72, self.config.image_dpi / 72)
             pix = page.get_pixmap(matrix=mat)
             
             if pix.width == 0 or pix.height == 0:
-                logger.debug(f"[{thread_id}] Generated pixmap has zero dimensions")
+                return False
+            
+            image_bytes = pix.tobytes("png")
+            if not image_bytes:
+                return False
+            
+            # API call with thorough mode timeout
+            response = client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/png'),
+                    self.config.healthcare_contract_prompt
+                ]
+            )
+            
+            self.api_calls_made += 1
+            result = response.text.strip().upper()
+            return 'YES' in result
+            
+        except Exception as e:
+            logger.debug(f"[{thread_id}] Healthcare contract detection failed: {e}")
+            return False
+    
+    def _get_effective_date_thorough(self, page: fitz.Page, thread_id: str) -> Optional[datetime]:
+        """Effective date extraction optimized for thorough mode."""
+        try:
+            client = self.pdf_handler.get_thorough_client()
+            
+            # Create image for analysis
+            mat = fitz.Matrix(self.config.image_dpi / 72, self.config.image_dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            
+            if pix.width == 0 or pix.height == 0:
                 return None
             
             image_bytes = pix.tobytes("png")
-            if len(image_bytes) == 0:
-                logger.debug(f"[{thread_id}] Generated image bytes are empty")
+            if not image_bytes:
                 return None
             
-            # Use thread-local client or create new one
-            if not hasattr(self.pdf_handler._local, 'client'):
-                self.pdf_handler._local.client = create_client()
-            
-            response = self.pdf_handler._local.client.models.generate_content(
+            # API call with thorough mode timeout
+            response = client.models.generate_content(
                 model='gemini-1.5-flash',
-                contents=[types.Part.from_bytes(data=image_bytes, mime_type='image/png'), prompt]
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/png'),
+                    self.config.effective_date_prompt
+                ]
             )
-            return response.text.strip()
             
-        except Exception as e:
-            logger.debug(f"[{thread_id}] Gemini API call failed: {e}")
-            return None
-    
-    def _is_healthcare_contract_safe(self, page: fitz.Page, thread_id: str) -> bool:
-        """Safe healthcare contract detection with thread logging."""
-        try:
-            answer = self._call_gemini_safe(page, self.config.healthcare_contract_prompt, thread_id)
-            return answer and 'YES' in answer.upper()
-        except Exception as e:
-            logger.debug(f"[{thread_id}] Healthcare contract check failed: {e}")
-            return False
-    
-    def _get_effective_date_safe(self, page: fitz.Page, thread_id: str) -> Optional[datetime]:
-        """Safe effective date extraction with thread logging."""
-        try:
-            date_text = self._call_gemini_safe(page, self.config.effective_date_prompt, thread_id)
+            self.api_calls_made += 1
+            date_text = response.text.strip()
+            
             if not date_text or "NOT_FOUND" in date_text:
                 return None
+            
             return parser.parse(date_text)
+            
         except (parser.ParserError, TypeError, Exception) as e:
-            logger.debug(f"[{thread_id}] Could not parse date from AI response '{date_text}': {e}")
+            logger.debug(f"[{thread_id}] Date extraction failed: {e}")
             return None
     
-    def _generate_recommendations(self) -> List[str]:
-        """Generate actionable recommendations based on processing results."""
-        recommendations = []
+    def _categorize_thorough_failure(self, stage_failed: str) -> str:
+        """Categorize failure reasons for thorough mode."""
+        stage_lower = stage_failed.lower()
         
-        if self.issue_frequency.get('form_fields', 0) > 0:
-            recommendations.append(
-                f"Form fields detected in {self.issue_frequency['form_fields']} documents. "
-                "Consider implementing form field flattening for these documents."
-            )
-        
-        if self.issue_frequency.get('digital_signatures', 0) > 0:
-            recommendations.append(
-                f"Digital signatures detected in {self.issue_frequency['digital_signatures']} documents. "
-                "These may cause xref errors during processing."
-            )
-        
-        if self.complexity_stats['problematic'] > self.complexity_stats['simple']:
-            recommendations.append(
-                "High proportion of problematic PDFs detected. "
-                "Consider implementing additional PDF repair strategies."
-            )
-        
-        # Threading performance recommendations
-        if hasattr(self, 'progress_monitor') and self.progress_monitor:
-            avg_thread_performance = sum(tm.docs_per_minute for tm in self.progress_monitor.thread_metrics.values())
-            avg_thread_performance /= max(len(self.progress_monitor.thread_metrics), 1)
-            
-            if avg_thread_performance < 5:  # Less than 5 docs per minute per thread
-                recommendations.append(
-                    f"Average thread performance is {avg_thread_performance:.1f} docs/minute. "
-                    "Consider optimizing PDF processing or increasing thread timeout."
-                )
-        
-        # Early exit effectiveness
-        total_processed = sum(self.complexity_stats.values())
-        if total_processed > 0:
-            recommendations.append(
-                f"Processed {total_processed} documents with production threading. "
-                f"Early exit logic and smart page selection optimized processing efficiency."
-            )
-        
-        return recommendations
-
-class EnterpriseFileDiscovery:
-    """Enhanced file discovery with production optimizations."""
-    def __init__(self, root_path: str, config: ProductionConfig):
-        self.root_path = Path(root_path)
-        self.config = config
-
-    def discover_all_documents(self) -> List[DocumentMetadata]:
-        """Optimized document discovery for production use."""
-        logger.info(f"Starting enhanced document discovery from: {self.root_path}")
-        agreements_path = self.root_path / self.config.agreements_folder
-        
-        if not agreements_path.exists():
-            logger.error(f"'{self.config.agreements_folder}' folder not found at: {agreements_path}")
-            return []
-
-        all_documents = []
-        state_folders = [f for f in agreements_path.iterdir() if f.is_dir() and self._is_state_folder(f)]
-        logger.info(f"Found {len(state_folders)} state folders to process.")
-
-        for state_folder in state_folders:
-            all_documents.extend(self._process_single_state(state_folder))
-
-        logger.info(f"Discovery complete. Total documents found: {len(all_documents)}")
-        return all_documents
-
-    def _process_single_state(self, state_folder: Path) -> List[DocumentMetadata]:
-        """Process state folder with enhanced error handling."""
-        logger.info(f"Processing State: {state_folder.name}")
-        hospital_base_path = state_folder / self.config.hospital_subfolder
-        
-        if not hospital_base_path.exists():
-            logger.warning(f"No '{self.config.hospital_subfolder}' folder found in {state_folder.name}.")
-            return []
-
-        state_documents = []
-        hospital_subfolders = [d for d in hospital_base_path.iterdir() if d.is_dir()]
-        logger.info(f"Found {len(hospital_subfolders)} hospital subfolders in {state_folder.name}.")
-
-        for hospital_folder in hospital_subfolders:
-            try:
-                pdf_paths = hospital_folder.rglob("*.pdf")
-                
-                for pdf_path in pdf_paths:
-                    try:
-                        path_str = str(pdf_path)
-                        if path_str.startswith('\\\\') and not path_str.startswith('\\\\?\\'):
-                            path_str = '\\\\?\\UNC\\' + path_str[2:]
-                        
-                        if os.path.exists(path_str):
-                            stats = os.stat(path_str)
-                            doc = DocumentMetadata(
-                                source_path=path_str,
-                                pdf_name=pdf_path.name,
-                                state=state_folder.name,
-                                file_size=stats.st_size,
-                                last_modified=datetime.fromtimestamp(stats.st_mtime)
-                            )
-                            state_documents.append(doc)
-                    except Exception as e:
-                        logger.warning(f"Could not process file {pdf_path.name}: {e}")
-                        continue
-                        
-            except Exception as e:
-                logger.error(f"Could not process hospital folder {hospital_folder.name}: {e}")
-        
-        logger.info(f"Found {len(state_documents)} documents in {state_folder.name}.")
-        return state_documents
-
-    def _is_state_folder(self, folder_path: Path) -> bool:
-        """Enhanced state folder identification."""
-        return any(state in folder_path.name.upper() for state in self.config.us_states)
-
-class ProductionHealthcareClassificationSystem:
-    """Production-ready main orchestration class."""
+        if "unable to open" in stage_lower or "no pages" in stage_lower:
+            return "pdf_corrupted"
+        elif "effective date before" in stage_lower:
+            return "old_date"
+        elif "no effective date" in stage_lower:
+            return "no_date"
+        elif "not a healthcare contract" in stage_lower:
+            return "not_healthcare"
+        else:
+            return "other_failure"
     
-    def __init__(self, client, output_dir: str = "production_healthcare_results"):
-        self.client = client
-        self.config = ProductionConfig()
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def run_production_classification(self, root_folder_path: str) -> Dict[str, Any]:
-        """Execute production classification with full enterprise features."""
-        start_time = time.time()
+    def _generate_thorough_results(self, results: Dict, all_documents: List[DocumentMetadata], 
+                                 documents_processed: int) -> Dict[str, Any]:
+        """Generate comprehensive thorough mode results."""
         
-        logger.info("=" * 80)
-        logger.info("STARTING PRODUCTION HEALTHCARE CLASSIFICATION")
-        logger.info("=" * 80)
-        logger.info(f"Configuration:")
-        logger.info(f"  Threads: {self.config.max_threads}")
-        logger.info(f"  Max pages per document: {self.config.max_pages_per_document}")
-        logger.info(f"  Early exit enabled: {self.config.enable_early_exit}")
-        logger.info(f"  Smart page selection: {self.config.enable_smart_page_selection}")
-        logger.info(f"  File date filter: {self.config.min_file_modification_date}")
-        logger.info(f"  Incremental processing: {self.config.enable_incremental_processing}")
-        logger.info(f"  Fault tolerance: {self.config.enable_resume}")
-        logger.info("=" * 80)
-
-        # Step 1: Document discovery
-        discovery = EnterpriseFileDiscovery(root_folder_path, self.config)
-        all_documents = discovery.discover_all_documents()
+        # Calculate thorough mode statistics
+        total_pages_analyzed = sum(doc.pages_analyzed for doc in all_documents if hasattr(doc, 'pages_analyzed'))
+        early_exits = sum(1 for doc in all_documents if getattr(doc, 'early_exit_triggered', False))
+        total_processing_time = sum(doc.processing_time for doc in all_documents if doc.processing_time > 0)
         
-        if not all_documents:
-            logger.error("No documents were found. Exiting.")
-            return {
-                'success': False,
-                'error': 'No documents found',
-                'output_directory': str(self.output_dir)
-            }
-
-        # Step 2: Production classification
-        classifier = ProductionHealthcareClassifier(self.client, self.config)
-        results = classifier.classify_all_documents(all_documents)
-
-        # Step 3: Save comprehensive results
-        output_files = self._save_production_reports(all_documents, results)
+        # Performance metrics
+        avg_processing_time = total_processing_time / max(documents_processed, 1)
+        avg_pages_per_doc = total_pages_analyzed / max(documents_processed, 1)
+        early_exit_rate = (early_exits / max(documents_processed, 1)) * 100
         
-        end_time = time.time()
-        total_time = end_time - start_time
+        # Session duration
+        if hasattr(self, 'session_start_time'):
+            session_duration = datetime.now() - self.session_start_time
+        else:
+            session_duration = timedelta(seconds=total_processing_time)
         
-        logger.info("=" * 80)
-        logger.info("PRODUCTION CLASSIFICATION COMPLETED")
-        logger.info(f"Total processing time: {total_time/3600:.2f} hours")
-        logger.info("=" * 80)
+        actual_duration_hours = session_duration.total_seconds() / 3600
+        target_vs_actual = actual_duration_hours / self.config.target_duration_hours
         
-        self._print_production_summary(results, total_time)
-        
-        # Return comprehensive results
-        incremental_stats = results.get('complexity_analysis', {}).get('incremental_stats', {})
-        thread_performance = results.get('complexity_analysis', {}).get('thread_performance', {})
-        
-        return {
-            'success': True,
-            'output_directory': str(self.output_dir),
-            'total_documents_discovered': len(all_documents),
-            'total_documents_processed': incremental_stats.get('newly_processed', 0),
-            'relevant_documents_found': len(results['relevant']),
-            'processing_time_hours': total_time / 3600,
-            'processing_time_seconds': total_time,
-            'output_files': output_files,
-            'classification_breakdown': {
-                'relevant': len(results['relevant']),
-                'not_healthcare': len(results['not_healthcare']),
-                'old_date': len(results['old_date']),
-                'no_date': len(results['no_date']),
-                'form_field_issues': len(results['form_field_issues']),
-                'pdf_corrupted': len(results['pdf_corrupted']),
-                'failed': len(results['failed']),
-                'old_file_date': len(results['old_file_date']),
-                'skipped_unchanged': len(results['skipped_unchanged'])
+        # Generate comprehensive results
+        thorough_results = {
+            'classification_results': dict(results),
+            'thorough_mode_summary': {
+                'mode': 'THOROUGH_MODE',
+                'pages_per_document': self.config.pages_per_document,
+                'parallel_threads': self.config.parallel_threads,
+                'early_exit_enabled': self.config.enable_early_exit,
+                'target_duration_hours': self.config.target_duration_hours,
+                'actual_duration_hours': actual_duration_hours,
+                'target_vs_actual_ratio': target_vs_actual,
+                'duration_status': 'ON_TARGET' if 0.8 <= target_vs_actual <= 1.2 else 'OFF_TARGET'
+            },
+            'processing_statistics': {
+                'total_documents_discovered': len(all_documents),
+                'documents_processed': documents_processed,
+                'total_pages_analyzed': total_pages_analyzed,
+                'average_pages_per_document': avg_pages_per_doc,
+                'early_exits_triggered': early_exits,
+                'early_exit_rate_percentage': early_exit_rate,
+                'average_processing_time_per_document': avg_processing_time,
+                'total_api_calls_made': self.api_calls_made,
+                'successful_classifications': len(results.get('relevant', [])),
+                'success_rate_percentage': (len(results.get('relevant', [])) / max(documents_processed, 1)) * 100
             },
             'performance_metrics': {
-                'documents_per_hour': (incremental_stats.get('newly_processed', 0) / max(total_time / 3600, 0.01)),
-                'average_time_per_document': total_time / max(incremental_stats.get('newly_processed', 1), 1),
-                'thread_performance': thread_performance,
-                'efficiency_gain_percentage': (
-                    (incremental_stats.get('skipped_old_files', 0) + incremental_stats.get('skipped_unchanged', 0)) / 
-                    max(len(all_documents), 1)
-                ) * 100
+                'documents_per_hour': documents_processed / max(actual_duration_hours, 0.01),
+                'pages_per_hour': total_pages_analyzed / max(actual_duration_hours, 0.01),
+                'api_calls_per_hour': self.api_calls_made / max(actual_duration_hours, 0.01),
+                'average_pages_analyzed_per_relevant_doc': total_pages_analyzed / max(len(results.get('relevant', [])), 1),
+                'time_efficiency': 'EFFICIENT' if avg_processing_time < 30 else 'MODERATE' if avg_processing_time < 60 else 'SLOW'
             },
-            'incremental_processing_stats': incremental_stats,
-            'complexity_analysis': results.get('complexity_analysis', {})
+            'classification_breakdown': {
+                category: len(docs) for category, docs in results.items()
+            }
         }
+        
+        return thorough_results
 
-    def _save_production_reports(self, all_docs: List[DocumentMetadata], results: Dict[str, List[DocumentMetadata]]) -> Dict[str, str]:
-        """Save comprehensive production reports."""
+# ==========================================
+# THOROUGH MODE ORCHESTRATION SYSTEM
+# ==========================================
+
+class ThoroughModeHealthcareClassificationSystem:
+    """Main orchestration system for thorough mode - implements exact requirements."""
+    
+    def __init__(self, client, output_dir: str = "thorough_mode_results"):
+        self.client = client
+        self.config = ThoroughModeConfig()
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.session_start_time = datetime.now()
+    
+    def run_thorough_mode_classification(self, root_folder_path: str) -> Dict[str, Any]:
+        """Execute thorough mode classification with exact requirements."""
+        
+        logger.info("=" * 120)
+        logger.info("THOROUGH MODE HEALTHCARE CLASSIFICATION SYSTEM")
+        logger.info("=" * 120)
+        logger.info(f"✓ Pages per document: {self.config.pages_per_document}")
+        logger.info(f"✓ Parallel threads: {self.config.parallel_threads}")
+        logger.info(f"✓ Early exit on first match: {self.config.enable_early_exit}")
+        logger.info(f"✓ Target duration: {self.config.target_duration_hours} hours (15-20 hour range)")
+        logger.info("=" * 120)
+        
+        try:
+            # Step 1: Document discovery
+            discovery = ThoroughModeFileDiscovery(root_folder_path, self.config)
+            all_documents = discovery.discover_all_documents()
+            
+            if not all_documents:
+                logger.error("No documents found for thorough mode processing")
+                return {'success': False, 'error': 'No documents found'}
+            
+            # Step 2: Thorough mode classification
+            classifier = ThoroughModeHealthcareClassifier(self.client, self.config)
+            classifier.session_start_time = self.session_start_time
+            results = classifier.classify_all_documents_thorough(all_documents)
+            
+            # Step 3: Save thorough mode reports
+            output_files = self._save_thorough_reports(all_documents, results)
+            
+            end_time = datetime.now()
+            total_duration = end_time - self.session_start_time
+            total_hours = total_duration.total_seconds() / 3600
+            
+            logger.info("=" * 120)
+            logger.info("THOROUGH MODE CLASSIFICATION COMPLETED")
+            logger.info(f"Actual duration: {total_hours:.2f} hours (Target: {self.config.target_duration_hours}h)")
+            logger.info("=" * 120)
+            
+            # Print thorough mode summary
+            self._print_thorough_summary(results, total_hours)
+            
+            return {
+                'success': True,
+                'mode': 'THOROUGH_MODE',
+                'output_directory': str(self.output_dir),
+                'output_files': output_files,
+                'results': results,
+                'actual_duration_hours': total_hours,
+                'target_duration_hours': self.config.target_duration_hours,
+                'met_time_target': 15.0 <= total_hours <= 20.0
+            }
+            
+        except Exception as e:
+            logger.error(f"Critical error in thorough mode: {e}", exc_info=True)
+            return {'success': False, 'error': str(e)}
+    
+    def _save_thorough_reports(self, all_docs: List[DocumentMetadata], 
+                              results: Dict[str, Any]) -> Dict[str, str]:
+        """Save comprehensive thorough mode reports."""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_files = {}
         
-        # Comprehensive production report
-        report_path = self.output_dir / f"production_classification_report_{timestamp}.csv"
+        # Main thorough mode report
+        report_path = self.output_dir / f"thorough_mode_report_{timestamp}.csv"
         with open(report_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'source_path', 'pdf_name', 'state', 'classification_result', 
-                'effective_date', 'detected_on_page', 'stage_failed', 'error_message', 
-                'complexity_level', 'pdf_issues', 'processing_time', 'confidence_score',
-                'file_modification_date', 'file_date_meets_criteria', 'is_newly_modified',
-                'thread_id', 'retry_count', 'pages_checked', 'early_exit_triggered'
+                'source_path', 'pdf_name', 'state', 'classification_result',
+                'effective_date', 'detected_on_page', 'stage_failed', 'confidence_score',
+                'processing_time', 'pages_analyzed', 'early_exit_triggered',
+                'thread_id', 'file_size_mb'
             ])
+            
             for doc in all_docs:
                 writer.writerow([
-                    doc.source_path, doc.pdf_name, doc.state, doc.classification_result, 
-                    doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '', 
-                    doc.detected_on_page or '', doc.stage_failed, doc.error_message,
-                    doc.pdf_complexity_level, '; '.join(doc.pdf_issues) if doc.pdf_issues else '',
-                    f"{doc.processing_time:.2f}s", f"{doc.confidence_score:.2f}",
-                    doc.file_modification_date.strftime('%Y-%m-%d') if doc.file_modification_date else '',
-                    doc.file_date_meets_criteria, doc.is_newly_modified,
-                    doc.thread_id, doc.retry_count, '', ''  # Pages checked and early exit would need to be tracked
+                    doc.source_path, doc.pdf_name, doc.state, doc.classification_result,
+                    doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '',
+                    doc.detected_on_page or '', doc.stage_failed, f"{doc.confidence_score:.3f}",
+                    f"{doc.processing_time:.2f}", getattr(doc, 'pages_analyzed', 0),
+                    getattr(doc, 'early_exit_triggered', False), doc.thread_id,
+                    f"{doc.file_size / (1024*1024):.1f}"
                 ])
-        output_files['production_report'] = str(report_path)
         
-        # Thread performance report
-        complexity_analysis = results.get('complexity_analysis', {})
-        thread_performance = complexity_analysis.get('thread_performance', {})
+        output_files['thorough_report'] = str(report_path)
         
-        if thread_performance:
-            thread_report_path = self.output_dir / f"thread_performance_{timestamp}.json"
-            with open(thread_report_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'overall_performance': complexity_analysis.get('incremental_stats', {}),
-                    'thread_metrics': thread_performance,
-                    'recommendations': complexity_analysis.get('recommendations', [])
-                }, f, indent=2, default=str)
-            output_files['thread_performance'] = str(thread_report_path)
+        # Thorough mode analytics
+        analytics_path = self.output_dir / f"thorough_mode_analytics_{timestamp}.json"
+        with open(analytics_path, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, default=str)
+        output_files['analytics'] = str(analytics_path)
         
         # Relevant documents for extraction pipeline
-        relevant_paths = self.output_dir / f"relevant_healthcare_documents_{timestamp}.txt"
-        with open(relevant_paths, 'w', encoding='utf-8') as f:
-            for doc in results['relevant']:
-                f.write(f"{doc.source_path}\n")
-        output_files['relevant_documents'] = str(relevant_paths)
+        relevant_docs = results['classification_results'].get('relevant', [])
+        if relevant_docs:
+            relevant_path = self.output_dir / f"thorough_mode_relevant_documents_{timestamp}.txt"
+            with open(relevant_path, 'w', encoding='utf-8') as f:
+                for doc in relevant_docs:
+                    f.write(f"{doc.source_path}\n")
+            output_files['relevant_list'] = str(relevant_path)
+            
+            # Detailed relevant documents report
+            relevant_details_path = self.output_dir / f"thorough_mode_relevant_details_{timestamp}.csv"
+            with open(relevant_details_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'source_path', 'pdf_name', 'state', 'effective_date', 'detected_on_page',
+                    'confidence_score', 'processing_time', 'pages_analyzed', 'early_exit_triggered'
+                ])
+                
+                for doc in relevant_docs:
+                    writer.writerow([
+                        doc.source_path, doc.pdf_name, doc.state,
+                        doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '',
+                        doc.detected_on_page or '', f"{doc.confidence_score:.3f}",
+                        f"{doc.processing_time:.2f}", getattr(doc, 'pages_analyzed', 0),
+                        getattr(doc, 'early_exit_triggered', False)
+                    ])
+            output_files['relevant_details'] = str(relevant_details_path)
         
-        logger.info(f"Production reports saved to: {self.output_dir}")
+        logger.info(f"Thorough mode reports saved to: {self.output_dir}")
         return output_files
-
-    def _print_production_summary(self, results: Dict[str, List[DocumentMetadata]], total_time: float):
-        """Print comprehensive production summary."""
-        print(f"\n{'='*80}")
-        print("PRODUCTION CLASSIFICATION SUMMARY")
-        print(f"{'='*80}")
-        print(f"Processing Time: {total_time/3600:.2f} hours ({total_time/60:.1f} minutes)")
-        print(f"{'='*80}")
+    
+    def _print_thorough_summary(self, results: Dict[str, Any], actual_hours: float):
+        """Print comprehensive thorough mode summary."""
+        summary = results.get('thorough_mode_summary', {})
+        stats = results.get('processing_statistics', {})
+        performance = results.get('performance_metrics', {})
+        breakdown = results.get('classification_breakdown', {})
         
-        # Results breakdown
-        print(f"  Relevant Documents (2020+):     {len(results['relevant'])}")
-        print(f"  Not Healthcare Contracts:       {len(results['not_healthcare'])}")
-        print(f"  Old Effective Dates (< 2020):   {len(results['old_date'])}")
-        print(f"  No Date Found:                  {len(results['no_date'])}")
-        print(f"  Form Field Issues:              {len(results['form_field_issues'])}")
-        print(f"  PDF Corrupted/Unreadable:       {len(results['pdf_corrupted'])}")
-        print(f"  Failed Processing:              {len(results['failed'])}")
-        print(f"-" * 80)
-        print("EFFICIENCY GAINS:")
-        print(f"  Old File Dates (< 2019):        {len(results['old_file_date'])}")
-        print(f"  Skipped (Unchanged):            {len(results['skipped_unchanged'])}")
+        print(f"\n{'='*120}")
+        print("THOROUGH MODE CLASSIFICATION SUMMARY")
+        print(f"{'='*120}")
+        
+        # Thorough mode verification
+        print("THOROUGH MODE REQUIREMENTS:")
+        print(f"  ✓ Pages per document: {summary.get('pages_per_document', 0)}")
+        print(f"  ✓ Parallel threads: {summary.get('parallel_threads', 0)}")
+        print(f"  ✓ Early exit enabled: {summary.get('early_exit_enabled', False)}")
+        print(f"  ✓ Target duration: {summary.get('target_duration_hours', 0)} hours")
+        
+        # Time performance
+        target_hours = summary.get('target_duration_hours', 18)
+        time_status = "✓ ON TARGET" if 15 <= actual_hours <= 20 else "⚠ OFF TARGET"
+        print(f"\nTIME PERFORMANCE:")
+        print(f"  Target: {target_hours} hours (15-20 hour range)")
+        print(f"  Actual: {actual_hours:.2f} hours")
+        print(f"  Status: {time_status}")
+        
+        # Processing statistics
+        print(f"\nPROCESSING STATISTICS:")
+        print(f"  Documents Processed: {stats.get('documents_processed', 0):,}")
+        print(f"  Total Pages Analyzed: {stats.get('total_pages_analyzed', 0):,}")
+        print(f"  Average Pages/Document: {stats.get('average_pages_per_document', 0):.1f}")
+        print(f"  Early Exits Triggered: {stats.get('early_exits_triggered', 0):,} ({stats.get('early_exit_rate_percentage', 0):.1f}%)")
+        print(f"  Relevant Documents Found: {stats.get('successful_classifications', 0):,}")
+        print(f"  Success Rate: {stats.get('success_rate_percentage', 0):.1f}%")
         
         # Performance metrics
-        complexity_analysis = results.get('complexity_analysis', {})
-        incremental_stats = complexity_analysis.get('incremental_stats', {})
-        thread_performance = complexity_analysis.get('thread_performance', {})
+        print(f"\nPERFORMANCE METRICS:")
+        print(f"  Documents/Hour: {performance.get('documents_per_hour', 0):.1f}")
+        print(f"  Pages/Hour: {performance.get('pages_per_hour', 0):.0f}")
+        print(f"  API Calls/Hour: {performance.get('api_calls_per_hour', 0):.0f}")
+        print(f"  Avg Processing Time: {stats.get('average_processing_time_per_document', 0):.1f} seconds")
         
-        if incremental_stats:
-            total_discovered = incremental_stats.get('total_discovered', 1)
-            newly_processed = incremental_stats.get('newly_processed', 0)
-            total_skipped = incremental_stats.get('skipped_old_files', 0) + incremental_stats.get('skipped_unchanged', 0)
-            
-            print(f"\nPERFORMANCE METRICS:")
-            print(f"  Documents/Hour:                 {(newly_processed / max(total_time / 3600, 0.01)):.1f}")
-            print(f"  Average Time/Document:          {(total_time / max(newly_processed, 1)):.1f} seconds")
-            print(f"  Processing Efficiency:          {(total_skipped / total_discovered) * 100:.1f}% reduction")
-            print(f"  API Calls Saved:                {total_skipped:,}")
+        # Classification breakdown
+        print(f"\nCLASSIFICATION BREAKDOWN:")
+        for category, count in sorted(breakdown.items()):
+            print(f"  {category.replace('_', ' ').title()}: {count:,}")
         
-        if thread_performance:
-            print(f"\nTHREAD PERFORMANCE:")
-            for thread_id, metrics in thread_performance.items():
-                print(f"  {thread_id}: {metrics['documents_processed']} docs, "
-                      f"{metrics['docs_per_minute']:.1f}/min, {metrics['success_rate']:.1f}% success")
+        # Efficiency assessment
+        efficiency = performance.get('time_efficiency', 'UNKNOWN')
+        early_exit_effectiveness = "HIGH" if stats.get('early_exit_rate_percentage', 0) > 20 else "MODERATE" if stats.get('early_exit_rate_percentage', 0) > 10 else "LOW"
         
-        print(f"{'='*80}")
+        print(f"\nEFFICIENCY ASSESSMENT:")
+        print(f"  Processing Efficiency: {efficiency}")
+        print(f"  Early Exit Effectiveness: {early_exit_effectiveness}")
+        print(f"  Thoroughness: {stats.get('average_pages_per_document', 0):.1f}/{summary.get('pages_per_document', 10)} pages analyzed per document")
+        
+        print(f"{'='*120}")
 
 # ==========================================
-# CLIENT SETUP & MAIN EXECUTION
+# CLIENT AND MAIN EXECUTION
 # ==========================================
 
 def create_client():
-    """Create Google AI client with thread safety."""
+    """Create Google AI client for thorough mode."""
     return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
 
-def run_production_healthcare_classification(
+def run_thorough_mode_healthcare_classification(
     root_folder_path: str,
-    output_dir: str = "production_healthcare_results",
-    threads: int = 5,
-    min_file_date: str = "2019-01-01",
-    enable_incremental: bool = True
+    output_dir: str = "thorough_mode_results"
 ) -> Dict[str, Any]:
     """
-    Run production-ready healthcare classification with full enterprise features.
+    Execute Thorough Mode Healthcare Classification with exact requirements:
+    - 10 pages per document
+    - 5 parallel threads
+    - Early exit on first match
+    - Target: 15-20 hours
     
     Args:
-        root_folder_path: Path to root folder containing AGREEMENTS-NON STANDARD
-        output_dir: Directory to save classification results
-        threads: Number of parallel processing threads (1-10)
-        min_file_date: Minimum file modification date (YYYY-MM-DD format)
-        enable_incremental: Enable incremental processing to skip unchanged files
-        
+        root_folder_path: Path to root folder containing documents
+        output_dir: Output directory for results
+    
     Returns:
-        Dictionary with comprehensive classification results and performance metrics
+        Dictionary with comprehensive results and thorough mode metrics
     """
+    
     client = create_client()
-    classification_system = ProductionHealthcareClassificationSystem(
-        client=client, 
-        output_dir=output_dir
-    )
+    system = ThoroughModeHealthcareClassificationSystem(client=client, output_dir=output_dir)
     
-    # Configure the system based on parameters
-    classification_system.config.max_threads = max(1, min(threads, 10))  # Safety bounds
-    classification_system.config.enable_incremental_processing = enable_incremental
-    
-    if min_file_date:
-        try:
-            classification_system.config.min_file_modification_date = parser.parse(min_file_date).date()
-        except Exception as e:
-            logger.warning(f"Invalid date format '{min_file_date}', using default 2019-01-01: {e}")
-            classification_system.config.min_file_modification_date = date(2019, 1, 1)
-    
-    # Execute the production classification
-    return classification_system.run_production_classification(root_folder_path)
+    return system.run_thorough_mode_classification(root_folder_path)
 
 # ==========================================
-# MAIN EXECUTION
+# MAIN EXECUTION BLOCK
 # ==========================================
 
 if __name__ == "__main__":
-    # Production configuration for enterprise environment
-    ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"  # Your network path
-    OUTPUT_DIR = "production_healthcare_results"
-    
-    # Production settings - optimized for 5,400 documents
-    THREADS = 5                # 5 parallel workers for optimal performance
-    MIN_FILE_DATE = "2019-01-01"  # Only process files modified from this date
-    ENABLE_INCREMENTAL = True     # Enable incremental processing for future runs
-    
-    # Performance expectations with these settings:
-    # - First run: ~4-6 hours for 5,400 documents
-    # - Subsequent runs: ~15-30 minutes for newly modified files only
-    # - Early exit: ~60% time savings when contracts found quickly
-    # - Threading: 5x performance improvement over single-threaded
+    # Thorough Mode Configuration
+    ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"
+    OUTPUT_DIR = "thorough_mode_results"
     
     try:
-        print("="*80)
-        print("STARTING PRODUCTION HEALTHCARE CLASSIFICATION")
-        print("="*80)
-        print(f"Configuration:")
-        print(f"  Source Path: {ROOT_FOLDER_PATH}")
-        print(f"  Output Directory: {OUTPUT_DIR}")
-        print(f"  Processing Threads: {THREADS}")
-        print(f"  Minimum File Date: {MIN_FILE_DATE}")
-        print(f"  Incremental Processing: {'ENABLED' if ENABLE_INCREMENTAL else 'DISABLED'}")
-        print(f"  Expected Performance: 4-6 hours for full run, <1 hour for incremental")
-        print("="*80)
+        print("=" * 120)
+        print("THOROUGH MODE HEALTHCARE CLASSIFICATION SYSTEM")
+        print("=" * 120)
+        print("REQUIREMENTS:")
+        print("  • 10 pages per document analysis")
+        print("  • 5 parallel processing threads")
+        print("  • Early exit on first match")
+        print("  • Target completion: 15-20 hours")
+        print("=" * 120)
         
-        # Run the production healthcare document classification
-        results = run_production_healthcare_classification(
+        # Execute thorough mode
+        results = run_thorough_mode_healthcare_classification(
             root_folder_path=ROOT_FOLDER_PATH,
-            output_dir=OUTPUT_DIR,
-            threads=THREADS,
-            min_file_date=MIN_FILE_DATE,
-            enable_incremental=ENABLE_INCREMENTAL
+            output_dir=OUTPUT_DIR
         )
         
-        print("\n" + "="*80)
-        print("PRODUCTION CLASSIFICATION COMPLETED SUCCESSFULLY!")
-        print("="*80)
-        print(f"Output Directory: {results.get('output_directory')}")
-        print(f"Processing Time: {results.get('processing_time_hours', 0):.2f} hours")
-        print(f"Documents Processed: {results.get('total_documents_processed', 0):,}")
-        print(f"Relevant Documents Found: {results.get('relevant_documents_found', 0):,}")
-        print(f"Success Rate: {results.get('classification_breakdown', {}).get('relevant', 0) / max(results.get('total_documents_processed', 1), 1) * 100:.1f}%")
-        
-        # Performance metrics
-        performance = results.get('performance_metrics', {})
-        if performance:
-            print(f"\nPERFORMANCE METRICS:")
-            print(f"  Processing Rate: {performance.get('documents_per_hour', 0):.1f} documents/hour")
-            print(f"  Average Time/Document: {performance.get('average_time_per_document', 0):.1f} seconds")
-            print(f"  Efficiency Gain: {performance.get('efficiency_gain_percentage', 0):.1f}% reduction from filtering")
-        
-        # Thread performance
-        thread_perf = performance.get('thread_performance', {})
-        if thread_perf:
-            print(f"\nTHREAD PERFORMANCE:")
-            for thread_id, metrics in thread_perf.items():
-                print(f"  {thread_id}: {metrics.get('documents_processed', 0)} docs, "
-                      f"{metrics.get('docs_per_minute', 0):.1f}/min, "
-                      f"{metrics.get('success_rate', 0):.1f}% success")
-        
-        print(f"\nNEXT STEPS:")
-        print(f"  1. Use 'relevant_healthcare_documents_*.txt' with your extraction pipeline")
-        print(f"  2. Review 'production_classification_report_*.csv' for detailed results")
-        print(f"  3. Check 'thread_performance_*.json' for optimization insights")
-        print(f"  4. Future runs will be much faster due to incremental processing")
-        
-        # Cost analysis
-        total_processed = results.get('total_documents_processed', 0)
-        skipped = results.get('incremental_processing_stats', {}).get('skipped_old_files', 0) + \
-                 results.get('incremental_processing_stats', {}).get('skipped_unchanged', 0)
-        
-        if total_processed > 0:
-            print(f"\nCOST ANALYSIS:")
-            print(f"  Documents Processed: {total_processed:,}")
-            print(f"  Documents Skipped: {skipped:,}")
-            print(f"  API Calls Saved: {skipped:,}")
-            print(f"  Estimated Cost Savings: ${skipped * 0.01:.2f}")
-        
-        print("="*80)
-        
+        if results['success']:
+            print(f"\n{'='*120}")
+            print("THOROUGH MODE COMPLETED SUCCESSFULLY!")
+            print(f"{'='*120}")
+            print(f"Output Directory: {results['output_directory']}")
+            print(f"Actual Duration: {results['actual_duration_hours']:.2f} hours")
+            print(f"Target Met: {'YES' if results['met_time_target'] else 'NO'}")
+            print(f"Mode: {results['mode']}")
+            
+            # Key statistics
+            stats = results['results'].get('processing_statistics', {})
+            print(f"\nKEY RESULTS:")
+            print(f"  • Documents Processed: {stats.get('documents_processed', 0):,}")
+            print(f"  • Pages Analyzed: {stats.get('total_pages_analyzed', 0):,}")
+            print(f"  • Relevant Documents: {stats.get('successful_classifications', 0):,}")
+            print(f"  • Early Exits: {stats.get('early_exits_triggered', 0):,} ({stats.get('early_exit_rate_percentage', 0):.1f}%)")
+            
+            print(f"\nUse the relevant documents list for your extraction pipeline")
+            print(f"{'='*120}")
+        else:
+            print(f"\nERROR: {results.get('error', 'Unknown error occurred')}")
+            
     except KeyboardInterrupt:
-        print("\n" + "="*80)
-        print("GRACEFUL SHUTDOWN INITIATED")
-        print("="*80)
-        print("Processing has been safely stopped.")
-        print("Progress has been saved and can be resumed by running the script again.")
-        print("="*80)
+        print(f"\n{'='*120}")
+        print("THOROUGH MODE GRACEFUL SHUTDOWN")
+        print("Processing state has been saved and can be resumed")
+        print("Session data preserved for incremental processing")
+        print(f"{'='*120}")
         
     except Exception as e:
-        logger.error(f"Critical error in production execution: {e}")
-        print(f"\nERROR: {e}")
-        print("\nTROUBLESHOoting:")
-        print("1. Check network connectivity to the source path")
-        print("2. Verify Google AI API credentials are configured")
-        print("3. Ensure sufficient disk space for output files")
-        print("4. Review the log file 'healthcare_classification.log' for details")
-        print("5. Try reducing thread count if experiencing resource issues")
+        print(f"\nCRITICAL ERROR IN THOROUGH MODE: {e}")
+        print("\nTroubleshooting steps:")
+        print("1. Verify network connectivity to document storage")
+        print("2. Check Google AI credentials and project access")
+        print("3. Review log file: thorough_classification.log")
+        print("4. Ensure sufficient system resources for 5 parallel threads")
+        print("5. Verify document folder structure exists")
         
     finally:
-        print(f"\nLog file: healthcare_classification.log")
-        print(f"State file: production_classification_state.json")
-        print(f"Resume capability: Enabled - rerun script to continue from last checkpoint")
+        print(f"\nTHOROUGH MODE SESSION COMPLETE")
+        print(f"Log file: thorough_classification.log")
+        print(f"State file: thorough_mode_state.json")
+        print(f"Resume capability: Enabled")
+        print(f"\nMode Specifications:")
+        print(f"  ✓ 10 pages analyzed per document")
+        print(f"  ✓ 5 parallel threads for processing")
+        print(f"  ✓ Early exit strategy implemented")
+        print(f"  ✓ 15-20 hour target duration with adaptive pacing")
+        print(f"  ✓ Comprehensive thorough mode analytics")
