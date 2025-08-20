@@ -209,13 +209,16 @@ class StateManager:
             }
 
 class ProgressMonitor:
-    """Thread-safe progress monitoring."""
+    """Thread-safe progress monitoring with current document tracking."""
     
     def __init__(self, total_documents: int, config: ClassificationConfig):
         self.total_documents = total_documents
         self.config = config
         self._lock = Lock()
         self.start_time = datetime.now()
+        
+        # Thread tracking - shows what each thread is currently processing
+        self.thread_status = {}
         
         # Overall statistics
         self.completed_documents = 0
@@ -227,6 +230,9 @@ class ProgressMonitor:
         self.last_update_time = datetime.now()
         self.last_completed_count = 0
         
+        # Recent activity tracking
+        self.recent_completions = []  # Store last 5 completed documents
+        
         # Graceful shutdown
         self.shutdown_event = Event()
         
@@ -234,8 +240,22 @@ class ProgressMonitor:
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True, name="ProgressMonitor")
         self.monitor_thread.start()
     
-    def update_progress(self, document_name: str, is_successful: bool, result_type: str, processing_time: float):
-        """Update progress for a completed document."""
+    def update_current_document(self, thread_id: str, document_name: str, status: str = "Processing"):
+        """Update what document a thread is currently working on."""
+        with self._lock:
+            # Truncate long document names for display
+            display_name = document_name
+            if len(display_name) > 50:
+                display_name = "..." + display_name[-47:]
+            
+            self.thread_status[thread_id] = {
+                'document': display_name,
+                'status': status,
+                'start_time': datetime.now()
+            }
+    
+    def update_progress(self, thread_id: str, document_name: str, is_successful: bool, result_type: str, processing_time: float):
+        """Update progress for a completed document with full PDF name."""
         with self._lock:
             if is_successful:
                 self.successful_documents += 1
@@ -244,6 +264,23 @@ class ProgressMonitor:
             
             self.completed_documents += 1
             self.documents_by_result[result_type] += 1
+            
+            # Add to recent completions with FULL PDF name
+            self.recent_completions.append({
+                'full_name': document_name,  # Store full PDF name
+                'name': document_name if len(document_name) <= 40 else "..." + document_name[-37:],  # Display name
+                'result': result_type,
+                'time': processing_time,
+                'thread': thread_id
+            })
+            
+            # Keep only last 10 completions for display
+            if len(self.recent_completions) > 10:
+                self.recent_completions.pop(0)
+            
+            # Update thread status to show completion
+            if thread_id in self.thread_status:
+                self.thread_status[thread_id]['status'] = f"✓ {result_type}"
     
     def _monitor_loop(self):
         """Background monitoring loop."""
@@ -255,7 +292,7 @@ class ProgressMonitor:
                 logger.error(f"Error in progress monitor: {e}")
     
     def _print_progress_update(self):
-        """Print progress update."""
+        """Print detailed progress update with PDF names and their results."""
         with self._lock:
             current_time = datetime.now()
             elapsed_time = current_time - self.start_time
@@ -283,22 +320,71 @@ class ProgressMonitor:
             # Clear console for clean update
             os.system('cls' if os.name == 'nt' else 'clear')
             
-            print(f"\n{'='*80}")
+            print(f"\n{'='*120}")
             print(f"HEALTHCARE CLASSIFICATION PROGRESS - {current_time.strftime('%H:%M:%S')}")
-            print(f"{'='*80}")
+            print(f"{'='*120}")
             print(f"Overall: {current_completed:,}/{self.total_documents:,} ({(current_completed/max(self.total_documents, 1))*100:.1f}%) | Success Rate: {success_rate:.1f}%")
             print(f"Elapsed: {str(elapsed_time).split('.')[0]} | ETA: {eta_hours:.1f} hours | Rate: {recent_rate:.1f} docs/min")
-            print(f"-" * 80)
+            print(f"-" * 120)
             
-            # Result breakdown
+            # Show what each thread is currently processing
+            print("CURRENT ACTIVITY:")
+            for thread_id, status in self.thread_status.items():
+                elapsed_on_doc = (current_time - status['start_time']).total_seconds()
+                print(f"  [{thread_id}] {status['document']} → {status['status']} ({elapsed_on_doc:.0f}s)")
+            
+            print(f"-" * 120)
+            
+            # Show recent completions with FULL PDF names and results
+            if self.recent_completions:
+                print("RECENT CLASSIFICATIONS (PDF → RESULT):")
+                for completion in self.recent_completions[-10:]:  # Show last 10
+                    full_name = completion['full_name']  # Full PDF name
+                    result = completion['result']
+                    time_taken = completion['time']
+                    thread = completion['thread']
+                    
+                    # Color code results for easier reading
+                    if result == 'relevant':
+                        status_display = f"✓ RELEVANT"
+                    elif result == 'not_healthcare':
+                        status_display = f"✗ NOT_HEALTHCARE"
+                    elif result == 'old_date':
+                        status_display = f"⚠ OLD_DATE"
+                    elif result == 'no_date':
+                        status_display = f"⚠ NO_DATE"
+                    elif result == 'pdf_corrupted':
+                        status_display = f"⚠ CORRUPTED"
+                    else:
+                        status_display = f"⚠ {result.upper()}"
+                    
+                    print(f"  {full_name} → {status_display} ({time_taken:.1f}s) [{thread}]")
+            
+            print(f"-" * 120)
+            
+            # Result breakdown with details
             if self.documents_by_result:
-                print("RESULTS: ", end="")
-                result_parts = []
+                print("CLASSIFICATION SUMMARY:")
                 for result_type, count in sorted(self.documents_by_result.items()):
-                    result_parts.append(f"{result_type}: {count}")
-                print(" | ".join(result_parts))
+                    percentage = (count / max(current_completed, 1)) * 100
+                    
+                    # Add descriptions for each result type
+                    descriptions = {
+                        'relevant': 'Healthcare contracts with valid dates (2020+)',
+                        'not_healthcare': 'Not Aetna healthcare contracts',
+                        'old_date': 'Healthcare contracts with old dates (< 2020)',
+                        'no_date': 'Healthcare contracts with no effective date',
+                        'pdf_corrupted': 'PDFs that could not be opened/processed',
+                        'form_field_issues': 'PDFs with form field complications',
+                        'failed': 'Processing errors',
+                        'old_file_date': 'Files modified before 2019',
+                        'skipped_unchanged': 'Files skipped (unchanged since last run)'
+                    }
+                    
+                    desc = descriptions.get(result_type, result_type)
+                    print(f"  {result_type.upper()}: {count} ({percentage:.1f}%) - {desc}")
             
-            print(f"{'='*80}")
+            print(f"{'='*120}")
             
             # Update tracking variables
             self.last_update_time = current_time
@@ -458,10 +544,51 @@ class HealthcareDocumentClassifier:
         self.complexity_stats = defaultdict(int)
         self.issue_frequency = defaultdict(int)
         
+        # Initialize live results file
+        self.live_results_file = None
+        self.live_results_lock = Lock()
+        self._init_live_results_file()
+        
         # Graceful shutdown handling
         self.shutdown_requested = Event()
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _init_live_results_file(self):
+        """Initialize live results file for real-time monitoring."""
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            live_results_path = Path(f"live_classification_results_{timestamp}.txt")
+            self.live_results_file = open(live_results_path, 'w', encoding='utf-8')
+            self.live_results_file.write("PDF_NAME → CLASSIFICATION_RESULT (REASON) [EFFECTIVE_DATE]\n")
+            self.live_results_file.write("=" * 100 + "\n")
+            self.live_results_file.flush()
+            logger.info(f"Live results will be written to: {live_results_path}")
+        except Exception as e:
+            logger.warning(f"Could not create live results file: {e}")
+            self.live_results_file = None
+    
+    def _write_live_result(self, pdf_name: str, result: str, reason: str, effective_date: Optional[datetime]):
+        """Write result to live file immediately."""
+        if not self.live_results_file:
+            return
+            
+        try:
+            with self.live_results_lock:
+                date_str = effective_date.strftime('%Y-%m-%d') if effective_date else 'N/A'
+                result_line = f"{pdf_name} → {result.upper()}"
+                
+                if reason:
+                    result_line += f" ({reason})"
+                
+                if effective_date:
+                    result_line += f" [Date: {date_str}]"
+                
+                result_line += "\n"
+                self.live_results_file.write(result_line)
+                self.live_results_file.flush()  # Immediate write to disk
+        except Exception as e:
+            logger.debug(f"Could not write to live results file: {e}")
     
     def _signal_handler(self, signum, frame):
         """Handle graceful shutdown on Ctrl+C or terminate signal."""
@@ -470,6 +597,13 @@ class HealthcareDocumentClassifier:
         
         if self.progress_monitor:
             self.progress_monitor.shutdown()
+        
+        # Close live results file
+        if self.live_results_file:
+            try:
+                self.live_results_file.close()
+            except:
+                pass
         
         # Save current state
         self.state_manager.save_state(date.today())
@@ -498,7 +632,7 @@ class HealthcareDocumentClassifier:
         results_lock = Lock()
         
         def process_document_wrapper(doc: DocumentMetadata) -> DocumentMetadata:
-            """Wrapper function for thread processing."""
+            """Wrapper function for thread processing with real-time progress tracking."""
             thread_id = threading.current_thread().name
             
             try:
@@ -508,6 +642,13 @@ class HealthcareDocumentClassifier:
                 
                 doc.processing_started_at = datetime.now()
                 doc.thread_id = thread_id
+                
+                # Show what document we're starting to process
+                self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Starting")
+                logger.info(f"[{thread_id}] Starting: {doc.pdf_name}")
+                
+                # Show PDF opening stage
+                self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Opening PDF")
                 
                 # EXACT classification from working code
                 classification_result = self._classify_single_document_exact(doc, thread_id)
@@ -524,6 +665,7 @@ class HealthcareDocumentClassifier:
                 if classification_result.is_relevant:
                     doc.classification_result = "relevant"
                     is_successful = True
+                    logger.info(f"[{thread_id}] SUCCESS: {doc.pdf_name} → RELEVANT (Date: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
                 else:
                     if "old_file_date" in doc.stage_failed.lower():
                         doc.classification_result = 'old_file_date'
@@ -538,6 +680,7 @@ class HealthcareDocumentClassifier:
                     else:
                         doc.classification_result = 'not_healthcare'
                     is_successful = False
+                    logger.info(f"[{thread_id}] REJECTED: {doc.pdf_name} → {doc.classification_result.upper()} ({doc.stage_failed})")
                 
                 # Update thread-safe statistics
                 with self._stats_lock:
@@ -554,8 +697,12 @@ class HealthcareDocumentClassifier:
                     thread_id
                 )
                 
-                # Update progress monitoring
+                # Also write results to a live results file for real-time monitoring
+                self._write_live_result(doc.pdf_name, doc.classification_result, doc.stage_failed, doc.effective_date)
+                
+                # Update progress monitoring with completion
                 self.progress_monitor.update_progress(
+                    thread_id, 
                     doc.pdf_name, 
                     is_successful, 
                     doc.classification_result, 
@@ -569,10 +716,13 @@ class HealthcareDocumentClassifier:
                 return doc
                 
             except Exception as e:
-                logger.error(f"[{thread_id}] Failed to process {doc.pdf_name}: {e}")
+                logger.error(f"[{thread_id}] FAILED to process {doc.pdf_name}: {e}")
                 doc.classification_result = "failed"
                 doc.error_message = str(e)
                 doc.pdf_complexity_level = "problematic"
+                
+                # Update progress to show failure
+                self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "FAILED")
                 
                 with results_lock:
                     results['failed'].append(doc)
@@ -667,11 +817,14 @@ class HealthcareDocumentClassifier:
         return documents_to_process
     
     def _classify_single_document_exact(self, doc: DocumentMetadata, thread_id: str) -> ClassificationResult:
-        """EXACT single document classification from working project knowledge code."""
+        """EXACT single document classification from working project knowledge code with progress updates."""
         start_time = time.time()
         pdf_doc = None
         
         try:
+            # Update progress: Opening PDF
+            self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Opening PDF")
+            
             # Step 1: Attempt to open PDF with repair strategies
             pdf_doc = self.pdf_handler.attempt_pdf_open_with_strategies(doc.source_path)
             
@@ -683,6 +836,9 @@ class HealthcareDocumentClassifier:
                     stage_failed="PDF corruption: Unable to open PDF after all repair attempts",
                     processing_time=time.time() - start_time
                 )
+            
+            # Update progress: Analyzing complexity
+            self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Analyzing")
             
             # Step 2: Analyze complexity on the already-opened document
             if self.config.enable_complexity_analysis:
@@ -703,6 +859,9 @@ class HealthcareDocumentClassifier:
                     processing_time=time.time() - start_time
                 )
             
+            # Update progress: Page selection
+            self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Selecting pages")
+            
             # Step 3: EXACT page selection from working code
             pages_to_check = self._get_pages_to_analyze_safely(pdf_doc)
             
@@ -715,7 +874,14 @@ class HealthcareDocumentClassifier:
                 )
 
             accessible_pages_count = 0
+            total_pages = len(pages_to_check)
+            
             for page_idx in pages_to_check:
+                # Update progress: Current page being processed
+                self.progress_monitor.update_current_document(
+                    thread_id, doc.pdf_name, f"Page {accessible_pages_count + 1}/{total_pages}"
+                )
+                
                 # Use the handler's safe_page_access method
                 page = self.pdf_handler.safe_page_access(pdf_doc, page_idx)
                 if page is None:
@@ -724,10 +890,20 @@ class HealthcareDocumentClassifier:
                 
                 accessible_pages_count += 1
                 
+                # Update progress: Stage 1 check
+                self.progress_monitor.update_current_document(
+                    thread_id, doc.pdf_name, f"Stage 1: Page {page_idx + 1}"
+                )
+                
                 # Stage 1: EXACT healthcare contract check from working code
                 if not self._is_healthcare_contract_safe(page):
                     continue
 
+                # Update progress: Stage 2 check
+                self.progress_monitor.update_current_document(
+                    thread_id, doc.pdf_name, f"Stage 2: Page {page_idx + 1}"
+                )
+                
                 # Stage 2: EXACT effective date check from working code
                 date_result = self._get_effective_date_safe(page)
                 processing_time = time.time() - start_time
