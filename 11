@@ -1,0 +1,183 @@
+"""
+Healthcare Document Processing Pipeline
+Main Entry Point
+
+This is the single entry point for the complete healthcare document processing pipeline.
+It orchestrates classification of thousands of PDFs followed by data extraction from
+relevant documents, producing a single consolidated CSV output.
+
+The pipeline handles enterprise-scale document processing with:
+- Parallel classification across network drives
+- Automatic extraction of relevant documents
+- Consolidated CSV output with all extracted data
+- Professional progress monitoring and logging
+"""
+
+import sys
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any
+
+from config.pipeline_settings import PipelineConfig
+from config.document_types import HEALTHCARE_CONTRACT_CONFIG
+from pipeline.coordinator import HealthcarePipelineCoordinator
+from utils.logging_config import setup_logging
+from utils.client_setup import create_google_ai_client
+
+
+def main():
+    """
+    Main entry point for the healthcare document processing pipeline.
+    
+    This function:
+    1. Sets up logging and configuration
+    2. Creates the Google AI client
+    3. Initializes the pipeline coordinator
+    4. Runs classification followed by extraction
+    5. Produces final consolidated results
+    """
+    # Initialize logging system
+    logger = setup_logging()
+    
+    # Display pipeline startup information
+    logger.info("Healthcare Document Processing Pipeline Starting")
+    logger.info("=" * 80)
+    
+    try:
+        # Load pipeline configuration
+        config = PipelineConfig()
+        logger.info(f"Configuration loaded successfully")
+        logger.info(f"Network path: {config.network_root_path}")
+        logger.info(f"Classification threads: {config.classification_threads}")
+        logger.info(f"Output directory: {config.output_directory}")
+        
+        # Create Google AI client for document processing
+        logger.info("Initializing Google AI client...")
+        client = create_google_ai_client()
+        
+        # Initialize the main pipeline coordinator
+        coordinator = HealthcarePipelineCoordinator(
+            client=client,
+            config=config,
+            extraction_config=HEALTHCARE_CONTRACT_CONFIG
+        )
+        
+        # Execute the complete pipeline
+        logger.info("Starting complete pipeline execution...")
+        pipeline_start_time = time.time()
+        
+        results = coordinator.run_complete_pipeline()
+        
+        pipeline_end_time = time.time()
+        total_pipeline_time = pipeline_end_time - pipeline_start_time
+        
+        # Display comprehensive results
+        display_pipeline_results(results, total_pipeline_time, logger)
+        
+        # Save final summary report
+        save_pipeline_summary(results, total_pipeline_time, config)
+        
+        logger.info("Healthcare Document Processing Pipeline Completed Successfully")
+        return 0
+        
+    except KeyboardInterrupt:
+        logger.info("Pipeline interrupted by user. Shutting down gracefully...")
+        return 1
+        
+    except Exception as e:
+        logger.error(f"Pipeline failed with error: {e}")
+        logger.exception("Full error details:")
+        return 1
+
+
+def display_pipeline_results(results: Dict[str, Any], total_time: float, logger):
+    """
+    Display comprehensive pipeline results in a professional format.
+    
+    Args:
+        results: Complete pipeline results dictionary
+        total_time: Total pipeline execution time in seconds
+        logger: Configured logger instance
+    """
+    logger.info("PIPELINE EXECUTION SUMMARY")
+    logger.info("-" * 80)
+    
+    # Classification results
+    classification_results = results.get('classification_results', {})
+    if classification_results:
+        logger.info("CLASSIFICATION PHASE:")
+        logger.info(f"  Total documents discovered: {classification_results.get('total_documents_discovered', 0):,}")
+        logger.info(f"  Documents classified as relevant: {classification_results.get('relevant_documents_found', 0):,}")
+        logger.info(f"  Classification time: {classification_results.get('processing_time_hours', 0):.2f} hours")
+        
+        breakdown = classification_results.get('classification_breakdown', {})
+        if breakdown:
+            logger.info("  Classification breakdown:")
+            for category, count in breakdown.items():
+                logger.info(f"    {category}: {count:,}")
+    
+    # Extraction results
+    extraction_results = results.get('extraction_results', {})
+    if extraction_results:
+        logger.info("EXTRACTION PHASE:")
+        logger.info(f"  Documents processed for extraction: {extraction_results.get('documents_processed', 0):,}")
+        logger.info(f"  Letters detected and processed: {extraction_results.get('total_letters_detected', 0):,}")
+        logger.info(f"  Total data rows extracted: {extraction_results.get('total_rows_extracted', 0):,}")
+        logger.info(f"  Extraction time: {extraction_results.get('processing_time_hours', 0):.2f} hours")
+        logger.info(f"  Final CSV output: {extraction_results.get('consolidated_csv_path', 'Not generated')}")
+    
+    # Overall pipeline metrics
+    logger.info("OVERALL PIPELINE METRICS:")
+    logger.info(f"  Total pipeline execution time: {total_time / 3600:.2f} hours")
+    logger.info(f"  Success rate: {results.get('overall_success_rate', 0):.1f}%")
+    logger.info(f"  Documents per hour: {results.get('documents_per_hour', 0):.1f}")
+
+
+def save_pipeline_summary(results: Dict[str, Any], total_time: float, config: PipelineConfig):
+    """
+    Save a comprehensive pipeline summary to a JSON file for record keeping.
+    
+    Args:
+        results: Complete pipeline results
+        total_time: Total execution time
+        config: Pipeline configuration
+    """
+    import json
+    
+    summary = {
+        'pipeline_execution': {
+            'start_time': results.get('pipeline_start_time'),
+            'end_time': datetime.now().isoformat(),
+            'total_time_hours': total_time / 3600,
+            'configuration': {
+                'network_path': str(config.network_root_path),
+                'classification_threads': config.classification_threads,
+                'output_directory': str(config.output_directory)
+            }
+        },
+        'classification_phase': results.get('classification_results', {}),
+        'extraction_phase': results.get('extraction_results', {}),
+        'overall_metrics': {
+            'success_rate': results.get('overall_success_rate', 0),
+            'documents_per_hour': results.get('documents_per_hour', 0),
+            'total_pipeline_time_hours': total_time / 3600
+        }
+    }
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    summary_path = config.output_directory / f"pipeline_summary_{timestamp}.json"
+    
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, default=str)
+    
+    print(f"Pipeline summary saved to: {summary_path}")
+
+
+if __name__ == "__main__":
+    """
+    Script entry point. This allows the pipeline to be run directly
+    or imported as a module for programmatic usage.
+    """
+    exit_code = main()
+    sys.exit(exit_code)
