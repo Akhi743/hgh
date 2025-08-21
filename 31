@@ -1,0 +1,520 @@
+"""
+Document Classification Logic
+
+This module contains the exact working classification logic for healthcare documents.
+The classification identifies relevant Aetna healthcare contracts from thousands of PDFs
+using AI-powered analysis with parallel processing for enterprise-scale operation.
+
+The classifier performs two-stage analysis:
+1. Healthcare contract detection using AI vision
+2. Effective date validation for business relevance
+
+All logic is preserved exactly from the working implementation.
+"""
+
+import time
+import logging
+import threading
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+
+import fitz
+from google.genai import types
+from dateutil import parser
+
+from .pdf_processing import EnhancedPDFHandler, PDFComplexityInfo
+from config.pipeline_settings import PipelineConfig, ClassificationPrompts
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DocumentMetadata:
+    """
+    Complete metadata for a single PDF document.
+    Contains all information needed for classification and tracking.
+    """
+    source_path: str
+    pdf_name: str
+    state: str
+    file_size: int
+    last_modified: datetime
+    
+    # Classification results
+    classification_status: str = "pending"
+    classification_result: str = "unknown"
+    detected_on_page: Optional[int] = None
+    effective_date: Optional[datetime] = None
+    stage_failed: str = ""
+    confidence_score: float = 0.0
+    processing_time: float = 0.0
+    error_message: str = ""
+    
+    # PDF analysis results
+    pdf_complexity_level: str = ""
+    pdf_issues: List[str] = None
+    
+    # Processing tracking
+    thread_id: str = ""
+    retry_count: int = 0
+    processing_started_at: Optional[datetime] = None
+    
+    def __post_init__(self):
+        if self.pdf_issues is None:
+            self.pdf_issues = []
+
+
+@dataclass
+class ClassificationResult:
+    """
+    Results from classifying a single document.
+    Contains all information about why a document was accepted or rejected.
+    """
+    is_relevant: bool
+    detected_on_page: Optional[int] = None
+    effective_date: Optional[datetime] = None
+    stage_failed: str = ""
+    confidence: float = 0.0
+    processing_time: float = 0.0
+
+
+class HealthcareDocumentClassifier:
+    """
+    Core document classifier with exact working logic preserved.
+    
+    This classifier uses the exact same two-stage process that was validated:
+    1. AI-powered healthcare contract detection
+    2. Effective date extraction and validation
+    
+    The classifier maintains all original PDF handling strategies and
+    processing logic while adding enterprise-scale parallel processing.
+    """
+    
+    def __init__(self, client, config: PipelineConfig):
+        """
+        Initialize the classifier with Google AI client and configuration.
+        
+        Args:
+            client: Google AI client for document analysis
+            config: Pipeline configuration with processing settings
+        """
+        self.client = client
+        self.config = config
+        self.pdf_handler = EnhancedPDFHandler()
+        
+        # Classification prompts - exact from working code
+        self.healthcare_prompt = ClassificationPrompts.HEALTHCARE_CONTRACT_DETECTION
+        self.date_extraction_prompt = ClassificationPrompts.EFFECTIVE_DATE_EXTRACTION
+        
+        # Thread-safe statistics tracking
+        self._stats_lock = Lock()
+        self.processing_stats = {
+            'total_processed': 0,
+            'relevant_found': 0,
+            'not_healthcare': 0,
+            'old_dates': 0,
+            'no_dates': 0,
+            'pdf_errors': 0
+        }
+    
+    def classify_document_batch(self, documents: List[DocumentMetadata]) -> Dict[str, List[DocumentMetadata]]:
+        """
+        Classify a batch of documents using parallel processing.
+        Uses the exact working classification logic with enterprise threading.
+        
+        Args:
+            documents: List of documents to classify
+            
+        Returns:
+            Dictionary with documents categorized by classification result
+        """
+        logger.info(f"Starting classification of {len(documents)} documents")
+        
+        # Initialize results structure
+        results = {
+            'relevant': [],
+            'not_healthcare': [],
+            'old_date': [],
+            'no_date': [],
+            'pdf_corrupted': [],
+            'failed': []
+        }
+        
+        # Thread-safe result collection
+        results_lock = Lock()
+        
+        def process_single_document(doc: DocumentMetadata) -> DocumentMetadata:
+            """
+            Process a single document with the exact working classification logic.
+            """
+            thread_id = threading.current_thread().name
+            doc.thread_id = thread_id
+            doc.processing_started_at = datetime.now()
+            
+            try:
+                logger.debug(f"[{thread_id}] Processing: {doc.pdf_name}")
+                
+                # Execute exact classification logic
+                classification_result = self._classify_single_document_exact(doc, thread_id)
+                
+                # Update document with results
+                doc.processing_time = classification_result.processing_time
+                doc.confidence_score = classification_result.confidence
+                doc.detected_on_page = classification_result.detected_on_page
+                doc.effective_date = classification_result.effective_date
+                doc.stage_failed = classification_result.stage_failed
+                doc.classification_status = "completed"
+                
+                # Determine result category
+                if classification_result.is_relevant:
+                    doc.classification_result = "relevant"
+                    category = 'relevant'
+                    logger.info(f"[{thread_id}] RELEVANT: {doc.pdf_name}")
+                else:
+                    # Categorize rejection reasons
+                    if "Stage 2: No effective date" in doc.stage_failed:
+                        doc.classification_result = 'no_date'
+                        category = 'no_date'
+                    elif "Stage 2: Effective date before" in doc.stage_failed:
+                        doc.classification_result = 'old_date'
+                        category = 'old_date'
+                    elif "PDF corruption" in doc.stage_failed or "Unable to open" in doc.stage_failed:
+                        doc.classification_result = 'pdf_corrupted'
+                        category = 'pdf_corrupted'
+                    else:
+                        doc.classification_result = 'not_healthcare'
+                        category = 'not_healthcare'
+                    
+                    logger.debug(f"[{thread_id}] REJECTED: {doc.pdf_name} - {doc.classification_result}")
+                
+                # Thread-safe result collection
+                with results_lock:
+                    results[category].append(doc)
+                
+                # Update statistics
+                with self._stats_lock:
+                    self.processing_stats['total_processed'] += 1
+                    if doc.classification_result == 'relevant':
+                        self.processing_stats['relevant_found'] += 1
+                    elif doc.classification_result == 'not_healthcare':
+                        self.processing_stats['not_healthcare'] += 1
+                    elif doc.classification_result in ['old_date', 'no_date']:
+                        self.processing_stats['old_dates'] += 1
+                    elif doc.classification_result == 'pdf_corrupted':
+                        self.processing_stats['pdf_errors'] += 1
+                
+                return doc
+                
+            except Exception as e:
+                logger.error(f"[{thread_id}] FAILED: {doc.pdf_name} - {e}")
+                doc.classification_result = "failed"
+                doc.error_message = str(e)
+                doc.classification_status = "failed"
+                
+                with results_lock:
+                    results['failed'].append(doc)
+                
+                return doc
+        
+        # Execute parallel processing with exact thread count from config
+        logger.info(f"Using {self.config.classification_threads} threads for classification")
+        
+        with ThreadPoolExecutor(max_workers=self.config.classification_threads, 
+                               thread_name_prefix="Classifier") as executor:
+            # Submit all documents for processing
+            future_to_doc = {executor.submit(process_single_document, doc): doc 
+                           for doc in documents}
+            
+            # Process completed documents
+            completed_count = 0
+            for future in as_completed(future_to_doc):
+                try:
+                    doc = future.result(timeout=self.config.classification_timeout_minutes * 60)
+                    completed_count += 1
+                    
+                    if completed_count % 100 == 0:
+                        logger.info(f"Classified {completed_count}/{len(documents)} documents")
+                        
+                except Exception as e:
+                    logger.error(f"Document processing failed: {e}")
+        
+        logger.info(f"Classification complete. Processed {completed_count} documents.")
+        self._log_classification_summary(results)
+        
+        return results
+    
+    def _classify_single_document_exact(self, doc: DocumentMetadata, thread_id: str) -> ClassificationResult:
+        """
+        Single document classification with exact working logic preserved.
+        This method contains the exact two-stage classification process.
+        
+        Args:
+            doc: Document metadata to classify
+            thread_id: Processing thread identifier
+            
+        Returns:
+            ClassificationResult with classification outcome
+        """
+        start_time = time.time()
+        pdf_doc = None
+        
+        try:
+            # Stage 1: Attempt to open PDF with multiple repair strategies
+            pdf_doc = self.pdf_handler.attempt_pdf_open_with_strategies(doc.source_path)
+            
+            if pdf_doc is None:
+                doc.pdf_complexity_level = "problematic"
+                doc.pdf_issues = ["unable_to_open"]
+                return ClassificationResult(
+                    False,
+                    stage_failed="PDF corruption: Unable to open PDF after all repair attempts",
+                    processing_time=time.time() - start_time
+                )
+            
+            # Stage 2: Analyze PDF complexity
+            if self.config.enable_complexity_analysis:
+                complexity_info = self.pdf_handler.quick_complexity_check(pdf_doc)
+                doc.pdf_complexity_level = complexity_info.complexity_level
+                doc.pdf_issues = complexity_info.potential_issues.copy()
+            else:
+                doc.pdf_complexity_level = "simple"
+                doc.pdf_issues = []
+            
+            # Check if PDF has accessible pages
+            if len(pdf_doc) == 0:
+                doc.pdf_complexity_level = "problematic"
+                doc.pdf_issues.append("no_pages")
+                return ClassificationResult(
+                    False,
+                    stage_failed="PDF corruption: No accessible pages found",
+                    processing_time=time.time() - start_time
+                )
+            
+            # Stage 3: Page selection with exact working logic
+            pages_to_check = self._get_pages_to_analyze_safely(pdf_doc)
+            
+            if not pages_to_check:
+                doc.pdf_issues.append("no_accessible_pages")
+                return ClassificationResult(
+                    False,
+                    stage_failed="PDF corruption: No accessible pages for analysis",
+                    processing_time=time.time() - start_time
+                )
+            
+            # Stage 4: Process each page with exact working logic
+            accessible_pages_count = 0
+            
+            for page_idx in pages_to_check:
+                # Safe page access with error handling
+                page = self.pdf_handler.safe_page_access(pdf_doc, page_idx)
+                if page is None:
+                    logger.debug(f"[{thread_id}] Skipping corrupted page {page_idx + 1} in {doc.pdf_name}")
+                    continue
+                
+                accessible_pages_count += 1
+                
+                # Stage 4a: Healthcare contract detection (exact working logic)
+                if not self._is_healthcare_contract_safe(page):
+                    continue
+                
+                # Stage 4b: Effective date extraction (exact working logic)
+                date_result = self._get_effective_date_safe(page)
+                processing_time = time.time() - start_time
+                
+                if date_result and date_result.year >= self.config.min_effective_year:
+                    confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                    return ClassificationResult(
+                        True, 
+                        page_idx + 1, 
+                        date_result, 
+                        confidence=confidence, 
+                        processing_time=processing_time
+                    )
+                elif date_result:
+                    confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                    stage_failed_msg = f"Stage 2: Effective date before {self.config.min_effective_year} ({date_result.year})"
+                    return ClassificationResult(
+                        False, 
+                        page_idx + 1, 
+                        date_result, 
+                        stage_failed=stage_failed_msg, 
+                        confidence=confidence, 
+                        processing_time=processing_time
+                    )
+                else:
+                    confidence = 0.8 if doc.pdf_complexity_level == 'simple' else 0.7
+                    stage_failed_msg = "Stage 2: No effective date found on relevant page"
+                    return ClassificationResult(
+                        False, 
+                        page_idx + 1, 
+                        None, 
+                        stage_failed=stage_failed_msg, 
+                        confidence=confidence, 
+                        processing_time=processing_time
+                    )
+            
+            # No healthcare contracts found after processing accessible pages
+            if accessible_pages_count > 0:
+                confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                return ClassificationResult(
+                    False, 
+                    stage_failed="Stage 1: Not a healthcare contract", 
+                    confidence=confidence, 
+                    processing_time=time.time() - start_time
+                )
+            else:
+                doc.pdf_issues.append("no_processable_pages")
+                return ClassificationResult(
+                    False, 
+                    stage_failed="PDF corruption: No pages could be processed", 
+                    processing_time=time.time() - start_time
+                )
+                
+        except Exception as e:
+            raise RuntimeError(f"Failed to process PDF {doc.pdf_name}") from e
+        finally:
+            if pdf_doc:
+                try:
+                    pdf_doc.close()
+                except:
+                    pass
+    
+    def _get_pages_to_analyze_safely(self, pdf_doc: fitz.Document) -> List[int]:
+        """
+        Page selection logic - exact from working code.
+        Selects first N and last N pages for analysis.
+        
+        Args:
+            pdf_doc: PyMuPDF document object
+            
+        Returns:
+            List of page indices to analyze
+        """
+        total_pages = len(pdf_doc)
+        
+        if total_pages <= (self.config.first_pages_count + self.config.last_pages_count):
+            candidate_pages = list(range(total_pages))
+        else:
+            first = list(range(self.config.first_pages_count))
+            last = list(range(total_pages - self.config.last_pages_count, total_pages))
+            candidate_pages = sorted(list(set(first + last)))
+        
+        # Filter out pages that can't be accessed
+        accessible_pages = []
+        for page_idx in candidate_pages:
+            if self.pdf_handler.safe_page_access(pdf_doc, page_idx) is not None:
+                accessible_pages.append(page_idx)
+        
+        logger.debug(f"Selected {len(accessible_pages)} accessible pages out of {len(candidate_pages)} candidates")
+        return accessible_pages
+    
+    def _call_gemini_safe(self, page: fitz.Page, prompt: str) -> Optional[str]:
+        """
+        Gemini API call with error handling - exact from working code.
+        
+        Args:
+            page: PDF page to analyze
+            prompt: AI prompt for analysis
+            
+        Returns:
+            AI response text or None if failed
+        """
+        try:
+            mat = fitz.Matrix(self.config.image_dpi / 72, self.config.image_dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Verify the pixmap is valid
+            if pix.width == 0 or pix.height == 0:
+                logger.debug("Generated pixmap has zero dimensions")
+                return None
+            
+            image_bytes = pix.tobytes("png")
+            
+            if len(image_bytes) == 0:
+                logger.debug("Generated image bytes are empty")
+                return None
+            
+            response = self.client.models.generate_content(
+                model=self.config.google_model,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type='image/png'), 
+                    prompt
+                ]
+            )
+            return response.text.strip()
+            
+        except Exception as e:
+            logger.debug(f"Gemini API call failed: {e}")
+            return None
+    
+    def _is_healthcare_contract_safe(self, page: fitz.Page) -> bool:
+        """
+        Healthcare contract detection - exact from working code.
+        
+        Args:
+            page: PDF page to analyze
+            
+        Returns:
+            True if page contains healthcare contract content
+        """
+        try:
+            answer = self._call_gemini_safe(page, self.healthcare_prompt)
+            return answer and 'YES' in answer.upper()
+        except Exception as e:
+            logger.debug(f"Healthcare contract check failed: {e}")
+            return False
+    
+    def _get_effective_date_safe(self, page: fitz.Page) -> Optional[datetime]:
+        """
+        Effective date extraction - exact from working code.
+        
+        Args:
+            page: PDF page to analyze
+            
+        Returns:
+            Parsed effective date or None if not found
+        """
+        try:
+            date_text = self._call_gemini_safe(page, self.date_extraction_prompt)
+            if not date_text or "NOT_FOUND" in date_text:
+                return None
+            return parser.parse(date_text)
+        except (parser.ParserError, TypeError, Exception) as e:
+            logger.debug(f"Could not parse date from AI response '{date_text}': {e}")
+            return None
+    
+    def _log_classification_summary(self, results: Dict[str, List[DocumentMetadata]]):
+        """
+        Log a summary of classification results for monitoring.
+        
+        Args:
+            results: Classification results dictionary
+        """
+        total_docs = sum(len(docs) for docs in results.values())
+        
+        logger.info("Classification Summary:")
+        logger.info(f"  Total documents: {total_docs}")
+        logger.info(f"  Relevant healthcare contracts: {len(results['relevant'])}")
+        logger.info(f"  Not healthcare contracts: {len(results['not_healthcare'])}")
+        logger.info(f"  Old effective dates: {len(results['old_date'])}")
+        logger.info(f"  No effective dates: {len(results['no_date'])}")
+        logger.info(f"  PDF processing errors: {len(results['pdf_corrupted'])}")
+        logger.info(f"  General failures: {len(results['failed'])}")
+        
+        if total_docs > 0:
+            success_rate = (len(results['relevant']) / total_docs) * 100
+            logger.info(f"  Success rate: {success_rate:.1f}%")
+    
+    def get_processing_statistics(self) -> Dict[str, int]:
+        """
+        Get current processing statistics for monitoring.
+        
+        Returns:
+            Dictionary with processing statistics
+        """
+        with self._stats_lock:
+            return self.processing_stats.copy()
