@@ -1,0 +1,369 @@
+"""
+Network File Discovery
+
+Enterprise file discovery system for scanning network drives and identifying PDF documents.
+Handles Windows network paths with long filename support and state-based folder organization.
+
+The discovery system:
+- Scans network drives efficiently
+- Identifies state-based folder structures
+- Handles long Windows network paths
+- Collects comprehensive file metadata
+- Supports incremental processing
+"""
+
+import os
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import List, Generator, Optional
+from dataclasses import dataclass
+
+from classification.document_classifier import DocumentMetadata
+from config.pipeline_settings import PipelineConfig
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DiscoveryStatistics:
+    """
+    Statistics from the file discovery process.
+    Provides insights into the scale and scope of document discovery.
+    """
+    total_state_folders: int = 0
+    total_hospital_folders: int = 0
+    total_pdfs_discovered: int = 0
+    total_file_size_bytes: int = 0
+    discovery_time_seconds: float = 0.0
+    folders_with_errors: int = 0
+    inaccessible_files: int = 0
+
+
+class EnterpriseFileDiscovery:
+    """
+    Enterprise-grade file discovery system for healthcare document processing.
+    
+    This system efficiently discovers PDF documents across network drives while
+    handling enterprise-specific challenges like long file paths, network latency,
+    and folder permission issues.
+    """
+    
+    def __init__(self, config: PipelineConfig):
+        """
+        Initialize the file discovery system with pipeline configuration.
+        
+        Args:
+            config: Pipeline configuration with network paths and settings
+        """
+        self.config = config
+        self.root_path = Path(config.network_root_path)
+        self.statistics = DiscoveryStatistics()
+    
+    def discover_all_documents(self) -> List[DocumentMetadata]:
+        """
+        Discover all PDF documents across the entire network structure.
+        
+        This is the main entry point for document discovery. It scans the entire
+        network structure and returns metadata for all discoverable PDF files.
+        
+        Returns:
+            List of DocumentMetadata objects for all discovered PDFs
+        """
+        logger.info(f"Starting enterprise document discovery")
+        logger.info(f"Network root path: {self.root_path}")
+        
+        start_time = datetime.now()
+        all_documents = []
+        
+        # Validate network path accessibility
+        agreements_path = self.root_path / self.config.agreements_folder
+        if not self._validate_network_path(agreements_path):
+            logger.error(f"Cannot access agreements folder: {agreements_path}")
+            return []
+        
+        # Discover state folders in the agreements directory
+        state_folders = self._discover_state_folders(agreements_path)
+        self.statistics.total_state_folders = len(state_folders)
+        
+        logger.info(f"Discovered {len(state_folders)} state folders for processing")
+        
+        # Process each state folder
+        for state_folder in state_folders:
+            try:
+                state_documents = self._process_state_folder(state_folder)
+                all_documents.extend(state_documents)
+                logger.info(f"State '{state_folder.name}': {len(state_documents)} documents")
+                
+            except Exception as e:
+                logger.error(f"Failed to process state folder '{state_folder.name}': {e}")
+                self.statistics.folders_with_errors += 1
+                continue
+        
+        # Calculate discovery statistics
+        end_time = datetime.now()
+        self.statistics.discovery_time_seconds = (end_time - start_time).total_seconds()
+        self.statistics.total_pdfs_discovered = len(all_documents)
+        self.statistics.total_file_size_bytes = sum(doc.file_size for doc in all_documents)
+        
+        self._log_discovery_summary()
+        
+        return all_documents
+    
+    def _validate_network_path(self, path: Path) -> bool:
+        """
+        Validate that a network path is accessible.
+        
+        Args:
+            path: Network path to validate
+            
+        Returns:
+            True if path is accessible, False otherwise
+        """
+        try:
+            return path.exists() and path.is_dir()
+        except (OSError, PermissionError) as e:
+            logger.error(f"Network path not accessible: {e}")
+            return False
+    
+    def _discover_state_folders(self, agreements_path: Path) -> List[Path]:
+        """
+        Discover all state folders within the agreements directory.
+        
+        Args:
+            agreements_path: Path to the agreements folder
+            
+        Returns:
+            List of state folder paths
+        """
+        state_folders = []
+        
+        try:
+            # List all directories in the agreements folder
+            for item in agreements_path.iterdir():
+                if item.is_dir() and self._is_state_folder(item):
+                    state_folders.append(item)
+                    
+        except (OSError, PermissionError) as e:
+            logger.error(f"Cannot list agreements directory: {e}")
+            
+        return sorted(state_folders, key=lambda x: x.name)
+    
+    def _is_state_folder(self, folder_path: Path) -> bool:
+        """
+        Determine if a folder represents a US state based on naming patterns.
+        
+        Args:
+            folder_path: Folder path to analyze
+            
+        Returns:
+            True if folder appears to be a state folder
+        """
+        folder_name_upper = folder_path.name.upper()
+        
+        # Check if folder name contains any US state name
+        return any(state in folder_name_upper for state in self.config.us_states)
+    
+    def _process_state_folder(self, state_folder: Path) -> List[DocumentMetadata]:
+        """
+        Process a single state folder to discover all PDF documents.
+        
+        Args:
+            state_folder: Path to the state folder
+            
+        Returns:
+            List of DocumentMetadata for PDFs in this state
+        """
+        logger.debug(f"Processing state folder: {state_folder.name}")
+        
+        # Navigate to the hospital subfolder
+        hospital_base_path = state_folder / self.config.hospital_subfolder
+        
+        if not hospital_base_path.exists():
+            logger.warning(f"No hospital folder found in state: {state_folder.name}")
+            return []
+        
+        state_documents = []
+        
+        # Discover hospital subfolders
+        hospital_folders = self._discover_hospital_folders(hospital_base_path)
+        self.statistics.total_hospital_folders += len(hospital_folders)
+        
+        # Process each hospital folder
+        for hospital_folder in hospital_folders:
+            try:
+                hospital_documents = self._process_hospital_folder(
+                    hospital_folder, 
+                    state_folder.name
+                )
+                state_documents.extend(hospital_documents)
+                
+            except Exception as e:
+                logger.warning(f"Error processing hospital folder '{hospital_folder.name}': {e}")
+                self.statistics.folders_with_errors += 1
+                continue
+        
+        logger.debug(f"State '{state_folder.name}': {len(state_documents)} documents discovered")
+        return state_documents
+    
+    def _discover_hospital_folders(self, hospital_base_path: Path) -> List[Path]:
+        """
+        Discover all hospital folders within a state's hospital directory.
+        
+        Args:
+            hospital_base_path: Path to the state's hospital directory
+            
+        Returns:
+            List of hospital folder paths
+        """
+        hospital_folders = []
+        
+        try:
+            for item in hospital_base_path.iterdir():
+                if item.is_dir():
+                    hospital_folders.append(item)
+                    
+        except (OSError, PermissionError) as e:
+            logger.warning(f"Cannot access hospital directory: {e}")
+            
+        return hospital_folders
+    
+    def _process_hospital_folder(self, hospital_folder: Path, state_name: str) -> List[DocumentMetadata]:
+        """
+        Process a single hospital folder to find all PDF documents.
+        
+        Args:
+            hospital_folder: Path to the hospital folder
+            state_name: Name of the parent state
+            
+        Returns:
+            List of DocumentMetadata for PDFs in this hospital folder
+        """
+        hospital_documents = []
+        
+        # Use recursive PDF discovery with long path support
+        for pdf_path in self._discover_pdfs_with_long_path_support(hospital_folder):
+            try:
+                # Create document metadata
+                doc_metadata = self._create_document_metadata(pdf_path, state_name)
+                if doc_metadata:
+                    hospital_documents.append(doc_metadata)
+                    
+            except Exception as e:
+                logger.debug(f"Cannot process PDF '{pdf_path.name}': {e}")
+                self.statistics.inaccessible_files += 1
+                continue
+        
+        return hospital_documents
+    
+    def _discover_pdfs_with_long_path_support(self, folder_path: Path) -> Generator[Path, None, None]:
+        """
+        Discover PDF files with Windows long path support.
+        
+        This method handles the Windows 260-character path limitation by using
+        the \\\\?\\ prefix for UNC paths when necessary.
+        
+        Args:
+            folder_path: Folder to search for PDFs
+            
+        Yields:
+            Path objects for discovered PDF files
+        """
+        try:
+            # Convert to long-path format for Windows network drives
+            folder_str = str(folder_path)
+            if folder_str.startswith('\\\\') and not folder_str.startswith('\\\\?\\'):
+                folder_str = '\\\\?\\UNC\\' + folder_str[2:]
+                folder_path = Path(folder_str)
+            
+            # Recursively find all PDF files
+            for pdf_path in folder_path.rglob("*.pdf"):
+                # Ensure the PDF file is accessible
+                pdf_str = str(pdf_path)
+                if pdf_str.startswith('\\\\') and not pdf_str.startswith('\\\\?\\'):
+                    pdf_str = '\\\\?\\UNC\\' + pdf_str[2:]
+                    pdf_path = Path(pdf_str)
+                
+                if self._is_file_accessible(pdf_path):
+                    yield pdf_path
+                    
+        except (OSError, PermissionError) as e:
+            logger.debug(f"Cannot access folder '{folder_path.name}': {e}")
+    
+    def _is_file_accessible(self, file_path: Path) -> bool:
+        """
+        Check if a file is accessible for reading.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            True if file is accessible
+        """
+        try:
+            return os.path.exists(str(file_path)) and os.path.isfile(str(file_path))
+        except (OSError, PermissionError):
+            return False
+    
+    def _create_document_metadata(self, pdf_path: Path, state_name: str) -> Optional[DocumentMetadata]:
+        """
+        Create comprehensive metadata for a discovered PDF document.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            state_name: Name of the parent state
+            
+        Returns:
+            DocumentMetadata object or None if file cannot be accessed
+        """
+        try:
+            # Get file statistics
+            path_str = str(pdf_path)
+            file_stats = os.stat(path_str)
+            
+            # Create metadata object
+            doc_metadata = DocumentMetadata(
+                source_path=path_str,
+                pdf_name=pdf_path.name,
+                state=state_name,
+                file_size=file_stats.st_size,
+                last_modified=datetime.fromtimestamp(file_stats.st_mtime)
+            )
+            
+            return doc_metadata
+            
+        except (OSError, PermissionError) as e:
+            logger.debug(f"Cannot access file statistics for '{pdf_path.name}': {e}")
+            return None
+    
+    def _log_discovery_summary(self):
+        """
+        Log a comprehensive summary of the discovery process.
+        """
+        logger.info("Document Discovery Summary:")
+        logger.info(f"  Discovery time: {self.statistics.discovery_time_seconds:.1f} seconds")
+        logger.info(f"  State folders processed: {self.statistics.total_state_folders}")
+        logger.info(f"  Hospital folders found: {self.statistics.total_hospital_folders}")
+        logger.info(f"  PDF documents discovered: {self.statistics.total_pdfs_discovered:,}")
+        logger.info(f"  Total file size: {self.statistics.total_file_size_bytes / (1024**3):.2f} GB")
+        
+        if self.statistics.folders_with_errors > 0:
+            logger.warning(f"  Folders with errors: {self.statistics.folders_with_errors}")
+        
+        if self.statistics.inaccessible_files > 0:
+            logger.warning(f"  Inaccessible files: {self.statistics.inaccessible_files}")
+        
+        # Calculate discovery rate
+        if self.statistics.discovery_time_seconds > 0:
+            docs_per_second = self.statistics.total_pdfs_discovered / self.statistics.discovery_time_seconds
+            logger.info(f"  Discovery rate: {docs_per_second:.1f} documents/second")
+    
+    def get_discovery_statistics(self) -> DiscoveryStatistics:
+        """
+        Get comprehensive discovery statistics for reporting.
+        
+        Returns:
+            DiscoveryStatistics object with detailed metrics
+        """
+        return self.statistics
