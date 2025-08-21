@@ -1,0 +1,198 @@
+"""
+Document Type Configurations
+
+This module contains exact configuration definitions from the working extraction code.
+The configurations define how different document types should be processed and extracted.
+
+Document type configurations include:
+- Field definitions for extraction
+- AI prompts for detection and extraction
+- CSV output column specifications
+- Processing instructions
+"""
+
+from typing import List
+from pydantic import BaseModel, Field
+from dataclasses import dataclass
+
+
+@dataclass
+class ExtractionField:
+    """
+    Configuration for a single extraction field.
+    Defines how individual data fields should be extracted from documents.
+    """
+    name: str
+    description: str
+    field_type: str = "Optional[str]"
+    examples: List[str] = None
+    
+    def __post_init__(self):
+        if self.examples is None:
+            self.examples = []
+
+
+class DocumentTypeConfig(BaseModel):
+    """
+    Complete configuration for a specific document type.
+    This makes the extractor generic and configurable for different document types.
+    """
+    document_type: str
+    description: str
+    document_fields: List[ExtractionField] = Field(default_factory=list)
+    row_fields: List[ExtractionField] = Field(default_factory=list)
+    detection_prompt: str
+    extraction_instructions: str
+    csv_columns: List[str]
+
+
+# Healthcare Contract Configuration - Exact from working extraction code
+HEALTHCARE_CONTRACT_CONFIG = DocumentTypeConfig(
+    document_type="HealthcareContract",
+    description="Aetna healthcare contract for charge master increases.",
+    
+    # Document-level fields that apply to the entire letter
+    document_fields=[
+        ExtractionField(
+            name="notification_received_date",
+            description="The date mentioned in the sentence 'We have received your email dated [DATE]' in the letter body - NOT the letter header date.",
+            examples=["December 6, 2024", "11/13/2024"]
+        ),
+        ExtractionField(
+            name="contract_duration",
+            description="The contract term or period.",
+            examples=["12-month period"]
+        ),
+        ExtractionField(
+            name="effective_date",
+            description="The effective date for all charge master increases mentioned in this letter.",
+            examples=["January 1, 2025", "1/1/2025"]
+        )
+    ],
+    
+    # Row-level fields that repeat for each facility/hospital
+    row_fields=[
+        ExtractionField(
+            name="hospital_name",
+            description="The name of the facility from a table row."
+        ),
+        ExtractionField(
+            name="charge_master_limit",
+            description="The complete contractual limit information including both Commercial and Medicare rates if present. Format as 'Commercial X%, Medicare Y%' or single percentage if only one rate.",
+            examples=["Commercial 4%, Medicare 3%", "CP 4.5%/ME 3.0%", "4%"]
+        ),
+        ExtractionField(
+            name="charge_master_increase",
+            description="The increase percentage from the same row."
+        )
+    ],
+    
+    # AI prompt for detecting healthcare contracts - exact from working code
+    detection_prompt="Analyze the image. Is this a formal letter from Aetna about a 'charge master increase' where they state 'we have received' a notification? Answer only YES or NO.",
+    
+    # Detailed extraction instructions - exact from working code
+    extraction_instructions="""Extract ALL relevant data from this Aetna charge master increase notification letter. 
+
+CRITICAL INSTRUCTIONS:
+1. For 'notification_received_date': Look for the phrase 'We have received your email dated [DATE]' in the letter body paragraphs - DO NOT use the letter header date.
+2. For 'charge_master_limit': Capture the COMPLETE limit information including both Commercial and Medicare rates when present. Examples:
+   - If you see "Commercial 4% and Medicare 3%" → extract as "Commercial 4%, Medicare 3%"
+   - If you see "CP 4.5%/ME 3.0%" → extract as "CP 4.5%/ME 3.0%"
+   - If only one rate is shown → extract that single rate
+3. For 'effective_date': Extract the effective date that applies to all facilities in this letter - usually mentioned as "effective [DATE]" or "to become effective [DATE]"
+4. Create one row for each facility mentioned, ensuring no fields are left empty when information is available.""",
+    
+    # CSV column order for output - includes both row and document fields
+    csv_columns=[
+        # Row fields (repeat for each facility)
+        "hospital_name",
+        "charge_master_limit", 
+        "charge_master_increase",
+        # Document fields (same for all rows in a letter)
+        "notification_received_date",
+        "contract_duration",
+        "effective_date",
+        # Metadata fields
+        "document_source",
+        "page_number"
+    ]
+)
+
+
+def get_document_config_by_type(document_type: str) -> DocumentTypeConfig:
+    """
+    Retrieve document configuration by type name.
+    
+    Args:
+        document_type: Name of the document type to retrieve
+        
+    Returns:
+        DocumentTypeConfig object for the specified type
+        
+    Raises:
+        ValueError: If document type is not found
+    """
+    # Map of available document types
+    document_configs = {
+        "HealthcareContract": HEALTHCARE_CONTRACT_CONFIG,
+        # Additional document types can be added here in the future
+    }
+    
+    if document_type not in document_configs:
+        available_types = list(document_configs.keys())
+        raise ValueError(f"Document type '{document_type}' not found. Available types: {available_types}")
+    
+    return document_configs[document_type]
+
+
+def list_available_document_types() -> List[str]:
+    """
+    Get a list of all available document type configurations.
+    
+    Returns:
+        List of document type names
+    """
+    return ["HealthcareContract"]
+
+
+def validate_document_config(config: DocumentTypeConfig) -> bool:
+    """
+    Validate that a document configuration is properly structured.
+    
+    Args:
+        config: Document configuration to validate
+        
+    Returns:
+        True if configuration is valid
+        
+    Raises:
+        ValueError: If configuration is invalid
+    """
+    # Check required fields
+    if not config.document_type:
+        raise ValueError("Document type name is required")
+    
+    if not config.detection_prompt:
+        raise ValueError("Detection prompt is required")
+    
+    if not config.extraction_instructions:
+        raise ValueError("Extraction instructions are required")
+    
+    if not config.csv_columns:
+        raise ValueError("CSV columns must be specified")
+    
+    # Validate that all field names appear in CSV columns
+    all_field_names = set()
+    
+    for field in config.document_fields:
+        all_field_names.add(field.name)
+    
+    for field in config.row_fields:
+        all_field_names.add(field.name)
+    
+    # Check that all fields have corresponding CSV columns
+    missing_columns = all_field_names - set(config.csv_columns)
+    if missing_columns:
+        raise ValueError(f"Missing CSV columns for fields: {missing_columns}")
+    
+    return True
