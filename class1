@@ -1,22 +1,27 @@
-# Core libraries for file handling, AI interaction, and data processing.
 import fitz
 import csv
 import json
 import logging
 import os
 import time
+import threading
+import signal
+import sys
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from google.genai import types
 import google.genai as genai
-from datetime import datetime
-from dataclasses import dataclass
+from datetime import datetime, date
+from dataclasses import dataclass, field
 from dateutil import parser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, Event
+from collections import defaultdict
 
-# Set up logging to track progress and errors, writing to both a file and the console.
+# Configure enhanced logging with thread safety
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(threadName)-10s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('healthcare_classification.log', encoding='utf-8'),
         logging.StreamHandler()
@@ -24,10 +29,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# These dataclasses act as blueprints for our data, ensuring consistency.
 @dataclass
 class DocumentMetadata:
-    """Represents a single PDF, holding all its metadata and final classification details."""
+    """Represents a single PDF document with all metadata and classification details."""
     source_path: str
     pdf_name: str
     state: str
@@ -41,10 +45,29 @@ class DocumentMetadata:
     confidence_score: float = 0.0
     processing_time: float = 0.0
     error_message: str = ""
+    pdf_complexity_level: str = ""
+    pdf_issues: List[str] = field(default_factory=list)
+    
+    # Enhanced file date tracking for optimization
+    file_modification_date: date = None
+    file_date_meets_criteria: bool = False
+    is_newly_modified: bool = False
+    
+    # Thread processing tracking for monitoring
+    thread_id: str = ""
+    retry_count: int = 0
+    processing_started_at: Optional[datetime] = None
+
+    def __post_init__(self):
+        if self.pdf_issues is None:
+            self.pdf_issues = []
+        # Set file modification date for easy access
+        if self.last_modified:
+            self.file_modification_date = self.last_modified.date()
 
 @dataclass
 class ClassificationResult:
-    """A simple structure to pass results between classification methods."""
+    """Structure to pass classification results between methods."""
     is_relevant: bool
     detected_on_page: Optional[int] = None
     effective_date: Optional[datetime] = None
@@ -52,26 +75,54 @@ class ClassificationResult:
     confidence: float = 0.0
     processing_time: float = 0.0
 
+@dataclass
+class PDFComplexityInfo:
+    """Structure to hold PDF complexity analysis results."""
+    has_form_fields: bool = False
+    has_digital_signatures: bool = False
+    has_encryption: bool = False
+    has_embedded_files: bool = False
+    page_count: int = 0
+    complexity_level: str = 'simple'
+    potential_issues: List[str] = field(default_factory=list)
+    analysis_successful: bool = True
+
 class ClassificationConfig:
-    """A central configuration class to make tweaking settings easy without digging through the code."""
+    """Central configuration class for healthcare document classification."""
+    
     def __init__(self):
-        # Folder names the script will look for.
+        # Folder structure configuration
         self.agreements_folder = "AGREEMENTS-NON STANDARD"
         self.hospital_subfolder = "HOSPITAL"
         
-        # Key business logic setting: the minimum year for a document to be considered relevant.
-        self.min_effective_year = 2020
+        # Business logic configuration
+        self.min_effective_year = 2020  # Minimum year for document relevance
         
-        # Settings for AI processing.
-        self.image_dpi = 150  # Higher DPI can improve OCR accuracy but increases processing time.
+        # AI processing settings - PRESERVED FROM WORKING CODE
+        self.image_dpi = 150
         self.first_pages_count = 10
         self.last_pages_count = 10
         
-        # Prompts are carefully worded to guide the AI's response for each task.
+        # PDF error handling settings
+        self.max_repair_attempts = 3
+        self.skip_corrupted_pages = True
+        self.enable_complexity_analysis = True
+        
+        # Threading configuration
+        self.max_threads = 5
+        self.enable_threading = True
+        self.thread_timeout_minutes = 10
+        
+        # State management for incremental processing
+        self.enable_incremental_processing = True
+        self.min_file_modification_date = date(2019, 1, 1)
+        self.state_file_path = "classification_state.json"
+        
+        # AI prompts - EXACT from working code, DO NOT MODIFY
         self.healthcare_contract_prompt = "Analyze the image. Is this a formal letter from Aetna about a 'charge master increase' where they state 'we have received' a notification? Answer only YES or NO."
         self.effective_date_prompt = 'This is an Aetna charge master increase letter. Find the EFFECTIVE DATE mentioned in the letter (phrases like "effective January 1, 2024" or "to become effective 1/1/2025"). Respond with just the date found, or "NOT_FOUND" if no effective date exists.'
         
-        # A static set of US states used to identify state-level folders.
+        # US states for folder identification
         self.us_states = {
             'ALABAMA', 'ALASKA', 'ARIZONA', 'ARKANSAS', 'CALIFORNIA', 'COLORADO', 
             'CONNECTICUT', 'DELAWARE', 'FLORIDA', 'GEORGIA', 'HAWAII', 'IDAHO', 
@@ -85,16 +136,891 @@ class ClassificationConfig:
             'WEST VIRGINIA', 'WISCONSIN', 'WYOMING', 'PUERTO RICO', 'DISTRICT OF COLUMBIA'
         }
 
+class StateManager:
+    """Thread-safe state manager for incremental processing optimization."""
+    
+    def __init__(self, config: ClassificationConfig):
+        self.config = config
+        self.state_file_path = Path(config.state_file_path)
+        self.processed_files = {}
+        self.last_run_date = None
+        self._lock = Lock()
+        self.load_state()
+    
+    def load_state(self):
+        """Load the previous run state from disk."""
+        try:
+            if self.state_file_path.exists():
+                with open(self.state_file_path, 'r', encoding='utf-8') as f:
+                    state_data = json.load(f)
+                    
+                self.last_run_date = parser.parse(state_data.get('last_run_date')).date() if state_data.get('last_run_date') else None
+                self.processed_files = state_data.get('processed_files', {})
+                
+                logger.info(f"Loaded state: Last run = {self.last_run_date}, {len(self.processed_files)} previously processed files")
+            else:
+                logger.info("No previous state found. Starting fresh run.")
+        except Exception as e:
+            logger.warning(f"Could not load previous state: {e}. Starting fresh.")
+            self.processed_files = {}
+            self.last_run_date = None
+    
+    def save_state(self, current_run_date: date):
+        """Save the current run state to disk with thread safety."""
+        with self._lock:
+            try:
+                state_data = {
+                    'last_run_date': current_run_date.isoformat(),
+                    'processed_files': self.processed_files,
+                    'total_files_processed': len(self.processed_files),
+                    'final_save_timestamp': datetime.now().isoformat()
+                }
+                
+                # Atomic write to prevent corruption
+                temp_path = self.state_file_path.with_suffix('.tmp')
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(state_data, f, indent=2, default=str)
+                temp_path.replace(self.state_file_path)
+                
+                logger.info(f"Saved final state: {len(self.processed_files)} processed files as of {current_run_date}")
+                    
+            except Exception as e:
+                logger.error(f"Could not save state: {e}")
+    
+    def should_process_file(self, file_path: str, file_modified_date: date) -> bool:
+        """Thread-safe determination if a file needs processing."""
+        with self._lock:
+            file_info = self.processed_files.get(file_path)
+            
+            if not file_info:
+                return True
+            
+            # Check if file was modified since last processing
+            last_processed_date = parser.parse(file_info['last_modified']).date()
+            return file_modified_date > last_processed_date
+    
+    def update_file_status(self, file_path: str, file_modified_date: date, classification_result: str, thread_id: str):
+        """Thread-safe update of file processing status."""
+        with self._lock:
+            self.processed_files[file_path] = {
+                'last_modified': file_modified_date.isoformat(),
+                'classification_result': classification_result,
+                'processed_on': datetime.now().isoformat(),
+                'thread_id': thread_id
+            }
+
+class ProgressMonitor:
+    """Thread-safe progress monitoring with real-time document tracking."""
+    
+    def __init__(self, total_documents: int, config: ClassificationConfig):
+        self.total_documents = total_documents
+        self.config = config
+        self._lock = Lock()
+        self.start_time = datetime.now()
+        
+        # Thread tracking - shows what each thread is currently processing
+        self.thread_status = {}
+        
+        # Overall statistics
+        self.completed_documents = 0
+        self.successful_documents = 0
+        self.failed_documents = 0
+        self.documents_by_result = defaultdict(int)
+        
+        # Performance tracking
+        self.last_update_time = datetime.now()
+        self.last_completed_count = 0
+        
+        # Recent activity tracking for user visibility
+        self.recent_completions = []  # Store last 10 completed documents
+        
+        # Graceful shutdown handling
+        self.shutdown_event = Event()
+        
+        # Start background monitoring thread
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True, name="ProgressMonitor")
+        self.monitor_thread.start()
+    
+    def update_current_document(self, thread_id: str, document_name: str, status: str = "Processing"):
+        """Update what document a thread is currently working on."""
+        with self._lock:
+            # Truncate long document names for display
+            display_name = document_name
+            if len(display_name) > 50:
+                display_name = "..." + display_name[-47:]
+            
+            self.thread_status[thread_id] = {
+                'document': display_name,
+                'status': status,
+                'start_time': datetime.now()
+            }
+    
+    def update_progress(self, thread_id: str, document_name: str, is_successful: bool, result_type: str, processing_time: float):
+        """Update progress for a completed document with full PDF name."""
+        with self._lock:
+            if is_successful:
+                self.successful_documents += 1
+            else:
+                self.failed_documents += 1
+            
+            self.completed_documents += 1
+            self.documents_by_result[result_type] += 1
+            
+            # Add to recent completions with FULL PDF name
+            self.recent_completions.append({
+                'full_name': document_name,  # Store full PDF name
+                'name': document_name if len(document_name) <= 40 else "..." + document_name[-37:],  # Display name
+                'result': result_type,
+                'time': processing_time,
+                'thread': thread_id
+            })
+            
+            # Keep only last 10 completions for display
+            if len(self.recent_completions) > 10:
+                self.recent_completions.pop(0)
+            
+            # Update thread status to show completion
+            if thread_id in self.thread_status:
+                self.thread_status[thread_id]['status'] = f"COMPLETED: {result_type}"
+    
+    def _monitor_loop(self):
+        """Background monitoring loop for real-time updates."""
+        while not self.shutdown_event.is_set():
+            try:
+                self._print_progress_update()
+                time.sleep(10)  # Update every 10 seconds
+            except Exception as e:
+                logger.error(f"Error in progress monitor: {e}")
+    
+    def _print_progress_update(self):
+        """Print detailed progress update with PDF names and their results."""
+        with self._lock:
+            current_time = datetime.now()
+            elapsed_time = current_time - self.start_time
+            
+            # Calculate overall processing rate
+            current_completed = self.completed_documents
+            time_since_last = (current_time - self.last_update_time).total_seconds()
+            
+            if time_since_last > 0:
+                recent_rate = (current_completed - self.last_completed_count) / (time_since_last / 60)
+            else:
+                recent_rate = 0
+            
+            # Calculate ETA
+            if current_completed > 0 and recent_rate > 0:
+                remaining_docs = self.total_documents - current_completed
+                eta_minutes = remaining_docs / recent_rate
+                eta_hours = eta_minutes / 60
+            else:
+                eta_hours = 0
+            
+            # Calculate success rate
+            success_rate = (self.successful_documents / max(current_completed, 1)) * 100
+            
+            # Clear console for clean update
+            os.system('cls' if os.name == 'nt' else 'clear')
+            
+            print(f"\nHEALTHCARE CLASSIFICATION PROGRESS - {current_time.strftime('%H:%M:%S')}")
+            print(f"Overall: {current_completed:,}/{self.total_documents:,} ({(current_completed/max(self.total_documents, 1))*100:.1f}%) | Success Rate: {success_rate:.1f}%")
+            print(f"Elapsed: {str(elapsed_time).split('.')[0]} | ETA: {eta_hours:.1f} hours | Rate: {recent_rate:.1f} docs/min")
+            print(f"-" * 120)
+            
+            # Show what each thread is currently processing
+            print("CURRENT ACTIVITY:")
+            for thread_id, status in self.thread_status.items():
+                elapsed_on_doc = (current_time - status['start_time']).total_seconds()
+                print(f"  [{thread_id}] {status['document']} → {status['status']} ({elapsed_on_doc:.0f}s)")
+            
+            print(f"-" * 120)
+            
+            # Show recent completions with FULL PDF names and results
+            if self.recent_completions:
+                print("RECENT CLASSIFICATIONS (PDF → RESULT):")
+                for completion in self.recent_completions[-10:]:  # Show last 10
+                    full_name = completion['full_name']  # Full PDF name
+                    result = completion['result']
+                    time_taken = completion['time']
+                    thread = completion['thread']
+                    
+                    # Display results with status indicators
+                    if result == 'relevant':
+                        status_display = f"RELEVANT"
+                    elif result == 'not_healthcare':
+                        status_display = f"NOT_HEALTHCARE"
+                    elif result == 'old_date':
+                        status_display = f"OLD_DATE"
+                    elif result == 'no_date':
+                        status_display = f"NO_DATE"
+                    elif result == 'pdf_corrupted':
+                        status_display = f"CORRUPTED"
+                    else:
+                        status_display = f"{result.upper()}"
+                    
+                    print(f"  {full_name} → {status_display} ({time_taken:.1f}s) [{thread}]")
+            
+            print(f"-" * 120)
+            
+            # Result breakdown with descriptions
+            if self.documents_by_result:
+                print("CLASSIFICATION SUMMARY:")
+                for result_type, count in sorted(self.documents_by_result.items()):
+                    percentage = (count / max(current_completed, 1)) * 100
+                    
+                    # Add descriptions for each result type
+                    descriptions = {
+                        'relevant': 'Healthcare contracts with valid dates (2020+)',
+                        'not_healthcare': 'Not Aetna healthcare contracts',
+                        'old_date': 'Healthcare contracts with old dates (< 2020)',
+                        'no_date': 'Healthcare contracts with no effective date',
+                        'pdf_corrupted': 'PDFs that could not be opened/processed',
+                        'form_field_issues': 'PDFs with form field complications',
+                        'failed': 'Processing errors',
+                        'old_file_date': 'Files modified before 2019',
+                        'skipped_unchanged': 'Files skipped (unchanged since last run)'
+                    }
+                    
+                    desc = descriptions.get(result_type, result_type)
+                    print(f"  {result_type.upper()}: {count} ({percentage:.1f}%) - {desc}")
+            
+            # Update tracking variables
+            self.last_update_time = current_time
+            self.last_completed_count = current_completed
+    
+    def shutdown(self):
+        """Gracefully shutdown the monitor."""
+        self.shutdown_event.set()
+        if hasattr(self, 'monitor_thread'):
+            self.monitor_thread.join(timeout=5)
+
+class EnhancedPDFHandler:
+    """PDF handler with multiple repair strategies for enterprise documents."""
+    
+    @staticmethod
+    def quick_complexity_check(pdf_doc: fitz.Document) -> PDFComplexityInfo:
+        """Analyze PDF complexity to determine processing strategy."""
+        complexity_info = PDFComplexityInfo()
+        
+        try:
+            complexity_info.page_count = len(pdf_doc)
+            
+            # Check for form fields (sample first few pages for performance)
+            pages_to_check = min(5, len(pdf_doc))
+            for page_num in range(pages_to_check):
+                try:
+                    page = pdf_doc.load_page(page_num)
+                    if page.get_widgets():  # Form fields/widgets detected
+                        complexity_info.has_form_fields = True
+                        complexity_info.potential_issues.append('form_fields')
+                        break
+                except Exception:
+                    continue
+            
+            # Check for encryption
+            if pdf_doc.needs_pass:
+                complexity_info.has_encryption = True
+                complexity_info.potential_issues.append('password_protected')
+            
+            # Check for embedded files
+            if pdf_doc.embfile_count() > 0:
+                complexity_info.has_embedded_files = True
+                complexity_info.potential_issues.append('embedded_files')
+            
+            # Check metadata for digital signatures
+            try:
+                metadata = pdf_doc.metadata
+                if metadata and any(sig_indicator in str(metadata).lower() 
+                                  for sig_indicator in ['signature', 'signed', 'certif']):
+                    complexity_info.has_digital_signatures = True
+                    complexity_info.potential_issues.append('digital_signatures')
+            except Exception:
+                pass
+            
+            # Determine complexity level based on issues found
+            issue_count = len(complexity_info.potential_issues)
+            if issue_count == 0:
+                complexity_info.complexity_level = 'simple'
+            elif issue_count <= 2:
+                complexity_info.complexity_level = 'moderate'
+            else:
+                complexity_info.complexity_level = 'complex'
+                
+        except Exception as e:
+            complexity_info.potential_issues.append(f'analysis_error: {str(e)}')
+            complexity_info.complexity_level = 'problematic'
+            complexity_info.analysis_successful = False
+        
+        return complexity_info
+
+    @staticmethod
+    def attempt_pdf_open_with_strategies(pdf_path: str) -> Optional[fitz.Document]:
+        """Multiple strategies for opening problematic enterprise PDFs."""
+        logger.debug(f"Attempting to open PDF: {os.path.basename(pdf_path)}")
+        
+        # Strategy 1: Standard open (fastest approach)
+        try:
+            doc = fitz.open(pdf_path)
+            logger.debug("Standard open successful")
+            return doc
+        except Exception as e:
+            logger.debug(f"Standard open failed: {e}")
+        
+        # Strategy 2: Open with repair flag
+        try:
+            doc = fitz.open(pdf_path, filetype="pdf")
+            logger.debug("Repair mode open successful")
+            return doc
+        except Exception as e:
+            logger.debug(f"Repair mode open failed: {e}")
+        
+        # Strategy 3: Memory-based opening (handles file locking issues)
+        try:
+            with open(pdf_path, 'rb') as f:
+                pdf_data = f.read()
+            doc = fitz.open(stream=pdf_data, filetype="pdf")
+            logger.debug("Memory stream open successful")
+            return doc
+        except Exception as e:
+            logger.debug(f"Memory stream open failed: {e}")
+        
+        # Strategy 4: Visual content preservation via page reconstruction
+        try:
+            source_doc = fitz.open(pdf_path)
+            clean_doc = fitz.open()
+            
+            successful_pages = 0
+            for page_num in range(min(len(source_doc), 20)):  # Limit for safety
+                try:
+                    # Copy the entire page including visual content
+                    clean_doc.insert_pdf(source_doc, from_page=page_num, to_page=page_num)
+                    successful_pages += 1
+                except Exception as page_error:
+                    logger.debug(f"Skipped page {page_num + 1}: {page_error}")
+                    continue
+            
+            source_doc.close()
+            
+            if successful_pages > 0:
+                logger.debug(f"Page reconstruction successful ({successful_pages} pages)")
+                return clean_doc
+            else:
+                clean_doc.close()
+                
+        except Exception as e:
+            logger.debug(f"Page reconstruction failed: {e}")
+        
+        logger.warning(f"All repair strategies failed for: {os.path.basename(pdf_path)}")
+        return None
+
+    @staticmethod
+    def safe_page_access(doc: fitz.Document, page_idx: int) -> Optional[fitz.Page]:
+        """Safely access a page, handling corruption at the page level."""
+        try:
+            page = doc.load_page(page_idx)
+            # Test if page can be rendered by trying to get its rect
+            _ = page.rect
+            return page
+        except Exception as e:
+            logger.debug(f"Page {page_idx + 1} corrupted or inaccessible: {e}")
+            return None
+
+class HealthcareDocumentClassifier:
+    """Core classification logic with exact working implementation preserved."""
+    
+    def __init__(self, client, config: ClassificationConfig):
+        self.client = client
+        self.config = config
+        self.pdf_handler = EnhancedPDFHandler()
+        
+        # State management for incremental processing
+        self.state_manager = StateManager(config)
+        self.progress_monitor = None
+        
+        # Thread-safe statistics tracking
+        self._stats_lock = Lock()
+        self.complexity_stats = defaultdict(int)
+        self.issue_frequency = defaultdict(int)
+        
+        # Initialize live results file for real-time monitoring
+        self.live_results_file = None
+        self.live_results_lock = Lock()
+        self._init_live_results_file()
+        
+        # Graceful shutdown handling
+        self.shutdown_requested = Event()
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _init_live_results_file(self):
+        """Initialize live results file for real-time monitoring."""
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            live_results_path = Path(f"live_classification_results_{timestamp}.txt")
+            self.live_results_file = open(live_results_path, 'w', encoding='utf-8')
+            self.live_results_file.write("PDF_NAME → CLASSIFICATION_RESULT (REASON) [EFFECTIVE_DATE]\n")
+            self.live_results_file.write("=" * 100 + "\n")
+            self.live_results_file.flush()
+            logger.info(f"Live results will be written to: {live_results_path}")
+        except Exception as e:
+            logger.warning(f"Could not create live results file: {e}")
+            self.live_results_file = None
+    
+    def _write_live_result(self, pdf_name: str, result: str, reason: str, effective_date: Optional[datetime]):
+        """Write result to live file immediately for real-time monitoring."""
+        if not self.live_results_file:
+            return
+            
+        try:
+            with self.live_results_lock:
+                date_str = effective_date.strftime('%Y-%m-%d') if effective_date else 'N/A'
+                result_line = f"{pdf_name} → {result.upper()}"
+                
+                if reason:
+                    result_line += f" ({reason})"
+                
+                if effective_date:
+                    result_line += f" [Date: {date_str}]"
+                
+                result_line += "\n"
+                self.live_results_file.write(result_line)
+                self.live_results_file.flush()  # Immediate write to disk
+        except Exception as e:
+            logger.debug(f"Could not write to live results file: {e}")
+    
+    def _signal_handler(self, signum, frame):
+        """Handle graceful shutdown on Ctrl+C or terminate signal."""
+        logger.info("Shutdown signal received. Initiating graceful shutdown...")
+        self.shutdown_requested.set()
+        
+        if self.progress_monitor:
+            self.progress_monitor.shutdown()
+        
+        # Close live results file
+        if self.live_results_file:
+            try:
+                self.live_results_file.close()
+            except:
+                pass
+        
+        # Save current state
+        self.state_manager.save_state(date.today())
+        
+        logger.info("Graceful shutdown completed.")
+        sys.exit(0)
+    
+    def classify_all_documents(self, documents: List[DocumentMetadata]) -> Dict[str, List[DocumentMetadata]]:
+        """Main classification method with parallel processing and exact working logic."""
+        logger.info(f"Starting classification of {len(documents)} documents with {self.config.max_threads} threads...")
+        
+        # Apply intelligent pre-filtering to optimize processing
+        documents_to_process = self._apply_pre_filtering(documents)
+        
+        # Initialize progress monitoring for real-time updates
+        self.progress_monitor = ProgressMonitor(len(documents_to_process), self.config)
+        
+        # Initialize results structure
+        results = {
+            'relevant': [], 'not_healthcare': [], 'old_date': [], 'no_date': [], 
+            'failed': [], 'pdf_corrupted': [], 'form_field_issues': [],
+            'old_file_date': [], 'skipped_unchanged': []
+        }
+        
+        # Thread-safe result collection
+        results_lock = Lock()
+        
+        def process_document_wrapper(doc: DocumentMetadata) -> DocumentMetadata:
+            """Wrapper function for thread processing with real-time progress tracking."""
+            thread_id = threading.current_thread().name
+            
+            try:
+                # Check for shutdown request
+                if self.shutdown_requested.is_set():
+                    return doc
+                
+                doc.processing_started_at = datetime.now()
+                doc.thread_id = thread_id
+                
+                # Show what document we're starting to process
+                self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Starting")
+                logger.info(f"[{thread_id}] Starting: {doc.pdf_name}")
+                
+                # Show PDF opening stage
+                self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Opening PDF")
+                
+                # Execute classification with exact working logic preserved
+                classification_result = self._classify_single_document_exact(doc, thread_id)
+                
+                # Update document with classification results
+                doc.processing_time = classification_result.processing_time
+                doc.confidence_score = classification_result.confidence
+                doc.detected_on_page = classification_result.detected_on_page
+                doc.effective_date = classification_result.effective_date
+                doc.stage_failed = classification_result.stage_failed
+                doc.classification_status = "completed"
+                
+                # Determine result category and log outcome
+                if classification_result.is_relevant:
+                    doc.classification_result = "relevant"
+                    is_successful = True
+                    logger.info(f"[{thread_id}] SUCCESS: {doc.pdf_name} → RELEVANT (Date: {doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else 'N/A'})")
+                else:
+                    # Categorize rejection reasons
+                    if "old_file_date" in doc.stage_failed.lower():
+                        doc.classification_result = 'old_file_date'
+                    elif "form field" in doc.stage_failed.lower():
+                        doc.classification_result = 'form_field_issues'
+                    elif "Stage 2: No effective date" in doc.stage_failed:
+                        doc.classification_result = 'no_date'
+                    elif "Stage 2: Effective date before" in doc.stage_failed:
+                        doc.classification_result = 'old_date'
+                    elif "PDF corruption" in doc.stage_failed or "Unable to open" in doc.stage_failed:
+                        doc.classification_result = 'pdf_corrupted'
+                    else:
+                        doc.classification_result = 'not_healthcare'
+                    is_successful = False
+                    logger.info(f"[{thread_id}] REJECTED: {doc.pdf_name} → {doc.classification_result.upper()} ({doc.stage_failed})")
+                
+                # Update thread-safe statistics
+                with self._stats_lock:
+                    if doc.pdf_complexity_level:
+                        self.complexity_stats[doc.pdf_complexity_level] += 1
+                    for issue in doc.pdf_issues:
+                        self.issue_frequency[issue] += 1
+                
+                # Update state management for incremental processing
+                self.state_manager.update_file_status(
+                    doc.source_path, 
+                    doc.file_modification_date, 
+                    doc.classification_result,
+                    thread_id
+                )
+                
+                # Write results to live monitoring file
+                self._write_live_result(doc.pdf_name, doc.classification_result, doc.stage_failed, doc.effective_date)
+                
+                # Update progress monitoring with completion
+                self.progress_monitor.update_progress(
+                    thread_id, 
+                    doc.pdf_name, 
+                    is_successful, 
+                    doc.classification_result, 
+                    doc.processing_time
+                )
+                
+                # Thread-safe result collection
+                with results_lock:
+                    results[doc.classification_result].append(doc)
+                
+                return doc
+                
+            except Exception as e:
+                logger.error(f"[{thread_id}] FAILED to process {doc.pdf_name}: {e}")
+                doc.classification_result = "failed"
+                doc.error_message = str(e)
+                doc.pdf_complexity_level = "problematic"
+                
+                # Update progress to show failure
+                self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "FAILED")
+                
+                with results_lock:
+                    results['failed'].append(doc)
+                
+                return doc
+        
+        # Execute classification with ThreadPoolExecutor
+        logger.info(f"Processing {len(documents_to_process)} documents with {self.config.max_threads} threads...")
+        
+        completed_count = 0
+        with ThreadPoolExecutor(max_workers=self.config.max_threads, thread_name_prefix="ClassifierWorker") as executor:
+            # Submit all tasks to the thread pool
+            future_to_doc = {executor.submit(process_document_wrapper, doc): doc for doc in documents_to_process}
+            
+            # Process completed tasks as they finish
+            for future in as_completed(future_to_doc):
+                if self.shutdown_requested.is_set():
+                    logger.info("Shutdown requested, cancelling remaining tasks...")
+                    for remaining_future in future_to_doc:
+                        remaining_future.cancel()
+                    break
+                
+                try:
+                    doc = future.result(timeout=self.config.thread_timeout_minutes * 60)
+                    completed_count += 1
+                    
+                    if completed_count % 100 == 0:
+                        logger.info(f"Completed {completed_count}/{len(documents_to_process)} documents")
+                        
+                except Exception as e:
+                    logger.error(f"Task execution failed: {e}")
+        
+        # Add skipped documents to results
+        skipped_docs = [doc for doc in documents if not doc.is_newly_modified and doc not in documents_to_process]
+        results['skipped_unchanged'].extend(skipped_docs)
+        
+        # Generate comprehensive complexity analysis
+        total_docs = len(documents)
+        results['complexity_analysis'] = {
+            'total_analyzed': total_docs,
+            'complexity_distribution': {
+                level: {'count': count, 'percentage': (count/total_docs)*100 if total_docs > 0 else 0}
+                for level, count in self.complexity_stats.items()
+            },
+            'common_issues': dict(sorted(self.issue_frequency.items(), key=lambda x: x[1], reverse=True))
+        }
+        
+        # Shutdown progress monitor
+        if self.progress_monitor:
+            self.progress_monitor.shutdown()
+        
+        # Save final state for future incremental runs
+        self.state_manager.save_state(date.today())
+        
+        logger.info(f"Classification completed. Processed {completed_count} documents.")
+        return results
+    
+    def _apply_pre_filtering(self, documents: List[DocumentMetadata]) -> List[DocumentMetadata]:
+        """Apply intelligent pre-filtering to optimize processing."""
+        documents_to_process = []
+        
+        for doc in documents:
+            # Check file modification date criteria
+            doc.file_date_meets_criteria = doc.file_modification_date >= self.config.min_file_modification_date
+            
+            # Check incremental processing criteria
+            if self.config.enable_incremental_processing:
+                doc.is_newly_modified = self.state_manager.should_process_file(
+                    doc.source_path, 
+                    doc.file_modification_date
+                )
+            else:
+                doc.is_newly_modified = True
+            
+            # Apply filtering logic
+            if not doc.file_date_meets_criteria:
+                doc.classification_result = "old_file_date"
+                doc.stage_failed = f"File modified before {self.config.min_file_modification_date} ({doc.file_modification_date})"
+                continue
+            
+            if not doc.is_newly_modified:
+                doc.classification_result = "skipped_unchanged"
+                doc.stage_failed = f"File unchanged since last run"
+                continue
+            
+            documents_to_process.append(doc)
+        
+        logger.info(f"Pre-filtering results:")
+        logger.info(f"  Total discovered: {len(documents)}")
+        logger.info(f"  To process: {len(documents_to_process)}")
+        
+        return documents_to_process
+    
+    def _classify_single_document_exact(self, doc: DocumentMetadata, thread_id: str) -> ClassificationResult:
+        """Single document classification with exact working logic preserved."""
+        start_time = time.time()
+        pdf_doc = None
+        
+        try:
+            # Update progress: Opening PDF
+            self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Opening PDF")
+            
+            # Step 1: Attempt to open PDF with multiple repair strategies
+            pdf_doc = self.pdf_handler.attempt_pdf_open_with_strategies(doc.source_path)
+            
+            if pdf_doc is None:
+                doc.pdf_complexity_level = "problematic"
+                doc.pdf_issues = ["unable_to_open"]
+                return ClassificationResult(
+                    False, 
+                    stage_failed="PDF corruption: Unable to open PDF after all repair attempts",
+                    processing_time=time.time() - start_time
+                )
+            
+            # Update progress: Analyzing complexity
+            self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Analyzing")
+            
+            # Step 2: Analyze PDF complexity
+            if self.config.enable_complexity_analysis:
+                complexity_info = self.pdf_handler.quick_complexity_check(pdf_doc)
+                doc.pdf_complexity_level = complexity_info.complexity_level
+                doc.pdf_issues = complexity_info.potential_issues.copy()
+            else:
+                doc.pdf_complexity_level = "simple"
+                doc.pdf_issues = []
+            
+            # Check if PDF has any accessible pages
+            if len(pdf_doc) == 0:
+                doc.pdf_complexity_level = "problematic"
+                doc.pdf_issues.append("no_pages")
+                return ClassificationResult(
+                    False, 
+                    stage_failed="PDF corruption: No accessible pages found",
+                    processing_time=time.time() - start_time
+                )
+            
+            # Update progress: Page selection
+            self.progress_monitor.update_current_document(thread_id, doc.pdf_name, "Selecting pages")
+            
+            # Step 3: Page selection with exact working logic
+            pages_to_check = self._get_pages_to_analyze_safely(pdf_doc)
+            
+            if not pages_to_check:
+                doc.pdf_issues.append("no_accessible_pages")
+                return ClassificationResult(
+                    False, 
+                    stage_failed="PDF corruption: No accessible pages for analysis",
+                    processing_time=time.time() - start_time
+                )
+
+            accessible_pages_count = 0
+            total_pages = len(pages_to_check)
+            
+            for page_idx in pages_to_check:
+                # Update progress: Current page being processed
+                self.progress_monitor.update_current_document(
+                    thread_id, doc.pdf_name, f"Page {accessible_pages_count + 1}/{total_pages}"
+                )
+                
+                # Safe page access with error handling
+                page = self.pdf_handler.safe_page_access(pdf_doc, page_idx)
+                if page is None:
+                    logger.debug(f"[{thread_id}] Skipping corrupted page {page_idx + 1} in {doc.pdf_name}")
+                    continue
+                
+                accessible_pages_count += 1
+                
+                # Update progress: Stage 1 check
+                self.progress_monitor.update_current_document(
+                    thread_id, doc.pdf_name, f"Stage 1: Page {page_idx + 1}"
+                )
+                
+                # Stage 1: Healthcare contract detection (exact working logic)
+                if not self._is_healthcare_contract_safe(page):
+                    continue
+
+                # Update progress: Stage 2 check
+                self.progress_monitor.update_current_document(
+                    thread_id, doc.pdf_name, f"Stage 2: Page {page_idx + 1}"
+                )
+                
+                # Stage 2: Effective date extraction (exact working logic)
+                date_result = self._get_effective_date_safe(page)
+                processing_time = time.time() - start_time
+                
+                if date_result and date_result.year >= self.config.min_effective_year:
+                    confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                    return ClassificationResult(True, page_idx + 1, date_result, confidence=confidence, processing_time=processing_time)
+                elif date_result:
+                    confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                    stage_failed_msg = f"Stage 2: Effective date before {self.config.min_effective_year} ({date_result.year})"
+                    if doc.pdf_complexity_level in ['complex', 'moderate']:
+                        stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
+                    return ClassificationResult(False, page_idx + 1, date_result, stage_failed=stage_failed_msg, confidence=confidence, processing_time=processing_time)
+                else: 
+                    confidence = 0.8 if doc.pdf_complexity_level == 'simple' else 0.7
+                    stage_failed_msg = "Stage 2: No effective date found on relevant page"
+                    if doc.pdf_complexity_level in ['complex', 'moderate']:
+                        stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
+                    return ClassificationResult(False, page_idx + 1, None, stage_failed=stage_failed_msg, confidence=confidence, processing_time=processing_time)
+
+            # If we processed some pages but found no healthcare contracts
+            if accessible_pages_count > 0:
+                confidence = 0.9 if doc.pdf_complexity_level == 'simple' else 0.8
+                stage_failed_msg = "Stage 1: Not a healthcare contract"
+                if doc.pdf_complexity_level in ['complex', 'moderate']:
+                    stage_failed_msg += f" (complex PDF: {', '.join(doc.pdf_issues)})"
+                return ClassificationResult(False, stage_failed=stage_failed_msg, confidence=confidence, processing_time=time.time() - start_time)
+            else:
+                doc.pdf_issues.append("no_processable_pages")
+                return ClassificationResult(False, stage_failed="PDF corruption: No pages could be processed", processing_time=time.time() - start_time)
+                
+        except Exception as e:
+            raise RuntimeError(f"Failed to process PDF {doc.pdf_name}") from e
+        finally:
+            if pdf_doc:
+                try:
+                    pdf_doc.close()
+                except:
+                    pass
+
+    def _get_pages_to_analyze_safely(self, pdf_doc: fitz.Document) -> List[int]:
+        """Page selection logic - exact from working code."""
+        total_pages = len(pdf_doc)
+        
+        if total_pages <= (self.config.first_pages_count + self.config.last_pages_count):
+            candidate_pages = list(range(total_pages))
+        else:
+            first = list(range(self.config.first_pages_count))
+            last = list(range(total_pages - self.config.last_pages_count, total_pages))
+            candidate_pages = sorted(list(set(first + last)))
+        
+        # Filter out pages that can't be accessed
+        accessible_pages = []
+        for page_idx in candidate_pages:
+            if self.pdf_handler.safe_page_access(pdf_doc, page_idx) is not None:
+                accessible_pages.append(page_idx)
+        
+        logger.debug(f"Selected {len(accessible_pages)} accessible pages out of {len(candidate_pages)} candidates")
+        return accessible_pages
+
+    def _call_gemini_safe(self, page: fitz.Page, prompt: str) -> Optional[str]:
+        """Gemini API call with error handling - exact from working code."""
+        try:
+            mat = fitz.Matrix(self.config.image_dpi / 72, self.config.image_dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Verify the pixmap is valid
+            if pix.width == 0 or pix.height == 0:
+                logger.debug("Generated pixmap has zero dimensions")
+                return None
+                
+            image_bytes = pix.tobytes("png")
+            
+            if len(image_bytes) == 0:
+                logger.debug("Generated image bytes are empty")
+                return None
+            
+            response = self.client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[types.Part.from_bytes(data=image_bytes, mime_type='image/png'), prompt]
+            )
+            return response.text.strip()
+            
+        except Exception as e:
+            logger.debug(f"Gemini API call failed: {e}")
+            return None
+
+    def _is_healthcare_contract_safe(self, page: fitz.Page) -> bool:
+        """Healthcare contract detection - exact from working code."""
+        try:
+            answer = self._call_gemini_safe(page, self.config.healthcare_contract_prompt)
+            return answer and 'YES' in answer.upper()
+        except Exception as e:
+            logger.debug(f"Healthcare contract check failed: {e}")
+            return False
+
+    def _get_effective_date_safe(self, page: fitz.Page) -> Optional[datetime]:
+        """Effective date extraction - exact from working code."""
+        try:
+            date_text = self._call_gemini_safe(page, self.config.effective_date_prompt)
+            if not date_text or "NOT_FOUND" in date_text:
+                return None
+            return parser.parse(date_text)
+        except (parser.ParserError, TypeError, Exception) as e:
+            logger.debug(f"Could not parse date from AI response '{date_text}': {e}")
+            return None
+
 class EnterpriseFileDiscovery:
-    """Handles the logic of finding all target PDF documents within the specified folder structure."""
+    """Enhanced file discovery with long path support for enterprise environments."""
+    
     def __init__(self, root_path: str, config: ClassificationConfig):
         self.root_path = Path(root_path)
         self.config = config
 
     def discover_all_documents(self) -> List[DocumentMetadata]:
-        """Runs the discovery process by scanning through each state folder."""
+        """Document discovery with long path support for Windows network drives."""
         logger.info(f"Starting document discovery from: {self.root_path}")
         agreements_path = self.root_path / self.config.agreements_folder
+        
         if not agreements_path.exists():
             logger.error(f"'{self.config.agreements_folder}' folder not found at: {agreements_path}")
             return []
@@ -110,9 +1036,10 @@ class EnterpriseFileDiscovery:
         return all_documents
 
     def _process_single_state(self, state_folder: Path) -> List[DocumentMetadata]:
-        """Processes a single state folder to find its hospital subfolders and their PDFs."""
+        """Process state folder with long path support for Windows."""
         logger.info(f"Processing State: {state_folder.name}")
         hospital_base_path = state_folder / self.config.hospital_subfolder
+        
         if not hospital_base_path.exists():
             logger.warning(f"No '{self.config.hospital_subfolder}' folder found in {state_folder.name}.")
             return []
@@ -121,251 +1048,286 @@ class EnterpriseFileDiscovery:
         hospital_subfolders = [d for d in hospital_base_path.iterdir() if d.is_dir()]
         logger.info(f"Found {len(hospital_subfolders)} hospital subfolders in {state_folder.name}.")
 
-        for hospital_folder in hospital_subfolders:
+        # Apply long-path fix to hospital folder paths for Windows network drives
+        for hospital_folder_original in hospital_subfolders:
             try:
-                logger.info(f"  Scanning hospital: {hospital_folder.name}")
-                # We use rglob() to efficiently find all PDFs recursively.
+                # Convert the path to a long-path-aware string for Windows
+                hospital_path_str = str(hospital_folder_original)
+                if hospital_path_str.startswith('\\\\') and not hospital_path_str.startswith('\\\\?\\'):
+                    hospital_path_str = '\\\\?\\UNC\\' + hospital_path_str[2:]
+                
+                # Create a new, corrected Path object to use for processing
+                hospital_folder = Path(hospital_path_str)
+                
+                logger.info(f"  Scanning hospital: {hospital_folder_original.name}")
                 pdf_paths = hospital_folder.rglob("*.pdf")
                 
                 for pdf_path in pdf_paths:
-                    # This is a critical fix for Windows environments. It prepends a special prefix
-                    # to the path string, allowing Python to access files with paths longer than 
-                    # the default 260 character limit.
-                    path_str = str(pdf_path)
-                    if path_str.startswith('\\\\') and not path_str.startswith('\\\\?\\'):
-                        path_str = '\\\\?\\UNC\\' + path_str[2:]
-                    
-                    if os.path.exists(path_str):
-                        stats = os.stat(path_str)
-                        doc = DocumentMetadata(
-                            source_path=path_str,
-                            pdf_name=pdf_path.name,
-                            state=state_folder.name,
-                            file_size=stats.st_size,
-                            last_modified=datetime.fromtimestamp(stats.st_mtime)
-                        )
-                        state_documents.append(doc)
-                    else:
-                        logger.warning(f"    Path discovered but not found, likely a broken shortcut: {pdf_path.name}")
-
+                    try:
+                        path_str = str(pdf_path)
+                        # Ensure long-path prefix for Windows network paths
+                        if path_str.startswith('\\\\') and not path_str.startswith('\\\\?\\'):
+                             path_str = '\\\\?\\UNC\\' + path_str[2:]
+                        
+                        if os.path.exists(path_str):
+                            stats = os.stat(path_str)
+                            doc = DocumentMetadata(
+                                source_path=path_str,
+                                pdf_name=pdf_path.name,
+                                state=state_folder.name,
+                                file_size=stats.st_size,
+                                last_modified=datetime.fromtimestamp(stats.st_mtime)
+                            )
+                            state_documents.append(doc)
+                    except Exception as e:
+                        logger.warning(f"    Could not stat file {pdf_path.name}: {e}")
+                        continue
+                        
             except Exception as e:
-                logger.error(f"  Could not process hospital folder {hospital_folder.name}: {e}")
+                # Use the original folder name in the error for easier identification
+                logger.error(f"  Could not process hospital folder {hospital_folder_original.name}: {e}")
         
         logger.info(f"  Found {len(state_documents)} documents in {state_folder.name}.")
         return state_documents
 
     def _is_state_folder(self, folder_path: Path) -> bool:
-        """A helper to identify state folders based on the configured list of names."""
+        """Enhanced state folder identification based on US state names."""
         return any(state in folder_path.name.upper() for state in self.config.us_states)
 
-class HealthcareDocumentClassifier:
-    """This class encapsulates the two-stage, AI-powered classification logic."""
-    def __init__(self, client, config: ClassificationConfig):
-        self.client = client
-        self.config = config
-
-    def classify_all_documents(self, documents: List[DocumentMetadata]) -> Dict[str, List[DocumentMetadata]]:
-        """
-        Classifies a list of documents sequentially.
-        For each document, it determines relevance and updates its metadata object.
-        """
-        logger.info(f"Starting classification of {len(documents)} documents...")
-        results = {'relevant': [], 'not_healthcare': [], 'old_date': [], 'no_date': [], 'failed': []}
-        
-        for i, doc in enumerate(documents, 1):
-            logger.info(f"--> Processing {i}/{len(documents)}: {doc.pdf_name} (State: {doc.state})")
-            try:
-                classification_result = self._classify_single_document(doc)
-                
-                # Update the original document object with the classification outcome.
-                doc.processing_time = classification_result.processing_time
-                doc.confidence_score = classification_result.confidence
-                doc.detected_on_page = classification_result.detected_on_page
-                doc.effective_date = classification_result.effective_date
-                doc.stage_failed = classification_result.stage_failed
-                doc.classification_status = "completed"
-
-                if classification_result.is_relevant:
-                    doc.classification_result = "relevant"
-                    results['relevant'].append(doc)
-                    logger.info(f"    └── SUCCESS: Document is relevant. Effective Date: {doc.effective_date.strftime('%Y-%m-%d')}")
-                else:
-                    # Categorize the rejection for better reporting.
-                    reason_key = 'not_healthcare' # Default reason
-                    if "Stage 2: No effective date" in doc.stage_failed: reason_key = 'no_date'
-                    elif "Stage 2: Effective date before" in doc.stage_failed: reason_key = 'old_date'
-                    doc.classification_result = reason_key
-                    results[reason_key].append(doc)
-                    logger.info(f"    └── REJECTED: {doc.stage_failed}")
-
-            except Exception as e:
-                logger.error(f"    └── CLASSIFICATION FAILED for {doc.pdf_name}: {e}")
-                doc.classification_result = "failed"
-                doc.error_message = str(e)
-                results['failed'].append(doc)
-        return results
-
-    def _classify_single_document(self, doc: DocumentMetadata) -> ClassificationResult:
-        """
-        Runs the core two-stage AI classification on a single PDF.
-        It's designed to fail fast: if a page isn't a contract, it moves on quickly.
-        """
-        start_time = time.time()
-        try:
-            with fitz.open(doc.source_path) as pdf_doc:
-                pages_to_check = self._get_pages_to_analyze(len(pdf_doc))
-
-                for page_idx in pages_to_check:
-                    page = pdf_doc.load_page(page_idx)
-                    
-                    # Stage 1: Check if the page contains a relevant healthcare contract.
-                    if not self._is_healthcare_contract(page):
-                        continue # If not, this page is irrelevant, so we check the next one.
-
-                    # Stage 2: If it is a contract, check for a valid effective date.
-                    date_result = self._get_effective_date(page)
-                    processing_time = time.time() - start_time
-                    
-                    if date_result and date_result.year >= self.config.min_effective_year:
-                        # Success! The document is relevant and its date is current.
-                        return ClassificationResult(True, page_idx + 1, date_result, confidence=0.9, processing_time=processing_time)
-                    elif date_result:
-                        # Fail: A date was found, but it's older than our minimum year.
-                        return ClassificationResult(False, page_idx + 1, date_result, stage_failed=f"Stage 2: Effective date before {self.config.min_effective_year} ({date_result.year})", confidence=0.9, processing_time=processing_time)
-                    else: 
-                        # Fail: The page looked like a contract, but we couldn't find a date on it.
-                         return ClassificationResult(False, page_idx + 1, None, stage_failed="Stage 2: No effective date found on relevant page", confidence=0.8, processing_time=processing_time)
-
-            # If we've checked all relevant pages and found no contract, the document is rejected.
-            return ClassificationResult(False, stage_failed="Stage 1: Not a healthcare contract", confidence=0.9, processing_time=time.time() - start_time)
-        except Exception as e:
-            # This will be caught by the calling function to mark the document as 'failed'.
-            raise RuntimeError(f"Failed to process PDF {doc.pdf_name}") from e
-
-    def _get_pages_to_analyze(self, total_pages: int) -> List[int]:
-        """Optimizes processing by selecting only a subset of pages from large documents."""
-        # For large docs, we only check the beginning and end, where key info usually is.
-        if total_pages <= (self.config.first_pages_count + self.config.last_pages_count):
-            return list(range(total_pages))
-        else:
-            first = list(range(self.config.first_pages_count))
-            last = list(range(total_pages - self.config.last_pages_count, total_pages))
-            # Using a set handles any overlap for documents that aren't extremely large.
-            return sorted(list(set(first + last)))
-
-    def _call_gemini(self, page: fitz.Page, prompt: str) -> str:
-        """A helper that bundles the logic of converting a page to an image and calling the Gemini API."""
-        mat = fitz.Matrix(self.config.image_dpi / 72, self.config.image_dpi / 72)
-        pix = page.get_pixmap(matrix=mat)
-        image_bytes = pix.tobytes("png")
-        
-        response = self.client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=[types.Part.from_bytes(data=image_bytes, mime_type='image/png'), prompt]
-        )
-        return response.text.strip()
-
-    def _is_healthcare_contract(self, page: fitz.Page) -> bool:
-        """Stage 1: Call the AI to determine if the page content is a relevant contract."""
-        try:
-            answer = self._call_gemini(page, self.config.healthcare_contract_prompt)
-            return 'YES' in answer.upper()
-        except Exception as e:
-            logger.warning(f"AI call failed for contract check: {e}")
-            return False
-
-    def _get_effective_date(self, page: fitz.Page) -> Optional[datetime]:
-        """Stage 2: Call the AI to extract an effective date and parse it into a datetime object."""
-        try:
-            date_text = self._call_gemini(page, self.config.effective_date_prompt)
-            if "NOT_FOUND" in date_text:
-                return None
-            # We use dateutil.parser for its ability to handle various date formats.
-            return parser.parse(date_text)
-        except (parser.ParserError, TypeError, Exception) as e:
-            logger.warning(f"Could not parse date from AI response '{date_text}': {e}")
-            return None
-
-class EnterpriseHealthcareClassificationSystem:
-    """This main class orchestrates the entire workflow: discovery, classification, and reporting."""
-    def __init__(self, client, output_dir: str = "classification_results"):
+class HealthcareClassificationSystem:
+    """Main orchestration class for healthcare document classification."""
+    
+    def __init__(self, client, output_dir: str = "healthcare_classification_results"):
         self.client = client
         self.config = ClassificationConfig()
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self, root_folder_path: str):
-        """Executes the end-to-end process."""
+    def run_classification(self, root_folder_path: str) -> Dict[str, Any]:
+        """Execute the complete healthcare document classification process."""
         start_time = time.time()
-        logger.info("--- STARTING ENTERPRISE CLASSIFICATION ---")
+        
+        logger.info("STARTING HEALTHCARE CLASSIFICATION")
+        logger.info(f"Configuration:")
+        logger.info(f"  Threads: {self.config.max_threads}")
+        logger.info(f"  File date filter: {self.config.min_file_modification_date}")
+        logger.info(f"  Incremental processing: {self.config.enable_incremental_processing}")
 
-        # Step 1: Discover all potential documents.
+        # Step 1: Document discovery across all state folders
         discovery = EnterpriseFileDiscovery(root_folder_path, self.config)
         all_documents = discovery.discover_all_documents()
+        
         if not all_documents:
             logger.error("No documents were found. Exiting.")
-            return
+            return {
+                'success': False,
+                'error': 'No documents found',
+                'output_directory': str(self.output_dir)
+            }
 
-        # Step 2: Classify all discovered documents.
+        # Step 2: Classification with exact working logic preserved
         classifier = HealthcareDocumentClassifier(self.client, self.config)
         results = classifier.classify_all_documents(all_documents)
 
-        # Step 3: Save the results to output files.
-        self._save_reports(all_documents, results)
+        # Step 3: Save comprehensive results and reports
+        output_files = self._save_reports(all_documents, results)
         
         end_time = time.time()
-        logger.info("--- CLASSIFICATION COMPLETE ---")
-        logger.info(f"Total time: {(end_time - start_time):.2f} seconds")
-        self._print_summary(results)
-
-    def _save_reports(self, all_docs: List[DocumentMetadata], results: Dict[str, List[DocumentMetadata]]):
-        """Saves a detailed CSV for auditing and a simple TXT file for downstream use."""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        total_time = end_time - start_time
         
-        # This detailed report is useful for auditing and reviewing every decision the script made.
-        report_path = self.output_dir / f"full_classification_report_{timestamp}.csv"
+        logger.info("CLASSIFICATION COMPLETED")
+        logger.info(f"Total processing time: {total_time/3600:.2f} hours")
+        
+        self._print_summary(results, total_time)
+        
+        # Return comprehensive results for caller
+        return {
+            'success': True,
+            'output_directory': str(self.output_dir),
+            'total_documents_discovered': len(all_documents),
+            'relevant_documents_found': len(results['relevant']),
+            'processing_time_hours': total_time / 3600,
+            'processing_time_seconds': total_time,
+            'output_files': output_files,
+            'classification_breakdown': {
+                'relevant': len(results['relevant']),
+                'not_healthcare': len(results['not_healthcare']),
+                'old_date': len(results['old_date']),
+                'no_date': len(results['no_date']),
+                'form_field_issues': len(results['form_field_issues']),
+                'pdf_corrupted': len(results['pdf_corrupted']),
+                'failed': len(results['failed']),
+                'old_file_date': len(results['old_file_date']),
+                'skipped_unchanged': len(results['skipped_unchanged'])
+            },
+            'complexity_analysis': results.get('complexity_analysis', {})
+        }
+
+    def _save_reports(self, all_docs: List[DocumentMetadata], results: Dict[str, List[DocumentMetadata]]) -> Dict[str, str]:
+        """Save comprehensive reports with detailed analysis."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_files = {}
+        
+        # Comprehensive classification report
+        report_path = self.output_dir / f"classification_report_{timestamp}.csv"
         with open(report_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['source_path', 'pdf_name', 'state', 'classification_result', 'effective_date', 'detected_on_page', 'stage_failed', 'error_message'])
+            writer.writerow([
+                'source_path', 'pdf_name', 'state', 'classification_result', 
+                'effective_date', 'detected_on_page', 'stage_failed', 'error_message', 
+                'complexity_level', 'pdf_issues', 'processing_time', 'confidence_score',
+                'file_modification_date', 'file_date_meets_criteria', 'is_newly_modified',
+                'thread_id', 'retry_count'
+            ])
             for doc in all_docs:
-                writer.writerow([doc.source_path, doc.pdf_name, doc.state, doc.classification_result, doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '', doc.detected_on_page, doc.stage_failed, doc.error_message])
-        logger.info(f"Full CSV report saved to: {report_path}")
-
-        # This simple text file is designed to be easily fed into the next script in a pipeline.
-        relevant_paths = self.output_dir / f"relevant_document_paths_{timestamp}.txt"
+                writer.writerow([
+                    doc.source_path, doc.pdf_name, doc.state, doc.classification_result, 
+                    doc.effective_date.strftime('%Y-%m-%d') if doc.effective_date else '', 
+                    doc.detected_on_page or '', doc.stage_failed, doc.error_message,
+                    doc.pdf_complexity_level, '; '.join(doc.pdf_issues) if doc.pdf_issues else '',
+                    f"{doc.processing_time:.2f}s", f"{doc.confidence_score:.2f}",
+                    doc.file_modification_date.strftime('%Y-%m-%d') if doc.file_modification_date else '',
+                    doc.file_date_meets_criteria, doc.is_newly_modified,
+                    doc.thread_id, doc.retry_count
+                ])
+        output_files['detailed_report'] = str(report_path)
+        
+        # Relevant documents for extraction pipeline
+        relevant_paths = self.output_dir / f"relevant_healthcare_documents_{timestamp}.txt"
         with open(relevant_paths, 'w', encoding='utf-8') as f:
             for doc in results['relevant']:
                 f.write(f"{doc.source_path}\n")
-        logger.info(f"Relevant paths list for extraction saved to: {relevant_paths}")
+        output_files['relevant_documents'] = str(relevant_paths)
+        
+        # Summary statistics for analysis
+        summary_path = self.output_dir / f"processing_summary_{timestamp}.json"
+        summary_data = {
+            'total_documents': len(all_docs),
+            'processing_results': {category: len(docs) for category, docs in results.items() 
+                                 if category != 'complexity_analysis'},
+            'complexity_analysis': results.get('complexity_analysis', {}),
+            'average_processing_time': sum(doc.processing_time for doc in all_docs) / len(all_docs) if all_docs else 0,
+            'success_rate': (len(results['relevant']) / len(all_docs)) * 100 if all_docs else 0
+        }
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2, default=str)
+        output_files['processing_summary'] = str(summary_path)
+        
+        logger.info(f"Reports saved to: {self.output_dir}")
+        return output_files
 
-    def _print_summary(self, results: Dict[str, List[DocumentMetadata]]):
-        """Prints a final, clean summary of the results to the console."""
-        print("\n--- FINAL CLASSIFICATION SUMMARY ---")
-        print(f"  Relevant Documents (2020+): {len(results['relevant'])}")
-        print(f"  Not Healthcare Contracts:   {len(results['not_healthcare'])}")
-        print(f"  Old Dates (< 2020):         {len(results['old_date'])}")
-        print(f"  No Date Found:              {len(results['no_date'])}")
-        print(f"  Failed Processing:          {len(results['failed'])}")
-        print("-" * 34)
+    def _print_summary(self, results: Dict[str, List[DocumentMetadata]], total_time: float):
+        """Print comprehensive summary of classification results."""
+        print(f"\nCLASSIFICATION SUMMARY")
+        print(f"Processing Time: {total_time/3600:.2f} hours ({total_time/60:.1f} minutes)")
+        
+        # Results breakdown
+        print(f"  Relevant Documents (2020+):     {len(results['relevant'])}")
+        print(f"  Not Healthcare Contracts:       {len(results['not_healthcare'])}")
+        print(f"  Old Effective Dates (< 2020):   {len(results['old_date'])}")
+        print(f"  No Date Found:                  {len(results['no_date'])}")
+        print(f"  Form Field Issues:              {len(results['form_field_issues'])}")
+        print(f"  PDF Corrupted/Unreadable:       {len(results['pdf_corrupted'])}")
+        print(f"  Failed Processing:              {len(results['failed'])}")
+        print(f"EFFICIENCY GAINS:")
+        print(f"  Old File Dates (< 2019):        {len(results['old_file_date'])}")
+        print(f"  Skipped (Unchanged):            {len(results['skipped_unchanged'])}")
 
-if __name__ == "__main__":
-    # --- Script Configuration ---
-    GCP_PROJECT_ID = "anbc-hcb-dev"
-    GCP_LOCATION = "us-central1"
+# Client setup and main execution functions
+def create_client():
+    """Create Google AI client for document processing."""
+    return genai.Client(vertexai=True, project="anbc-hcb-dev", location="us-central1")
+
+def run_healthcare_classification(
+    root_folder_path: str,
+    output_dir: str = "healthcare_classification_results",
+    threads: int = 5,
+    min_file_date: str = "2019-01-01",
+    enable_incremental: bool = True
+) -> Dict[str, Any]:
+    """
+    Run healthcare classification with exact working logic and parallel processing.
     
-    # Use a raw string (r"...") for Windows network paths to avoid issues with backslashes.
-    ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"
+    Args:
+        root_folder_path: Path to root folder containing AGREEMENTS-NON STANDARD
+        output_dir: Directory to save classification results
+        threads: Number of parallel processing threads (1-10)
+        min_file_date: Minimum file modification date (YYYY-MM-DD format)
+        enable_incremental: Enable incremental processing to skip unchanged files
+        
+    Returns:
+        Dictionary with comprehensive classification results
+    """
+    client = create_client()
+    classification_system = HealthcareClassificationSystem(
+        client=client, 
+        output_dir=output_dir
+    )
+    
+    # Configure the system based on parameters
+    classification_system.config.max_threads = max(1, min(threads, 10))  # Safety bounds
+    classification_system.config.enable_incremental_processing = enable_incremental
+    
+    if min_file_date:
+        try:
+            classification_system.config.min_file_modification_date = parser.parse(min_file_date).date()
+        except Exception as e:
+            logger.warning(f"Invalid date format '{min_file_date}', using default 2019-01-01: {e}")
+            classification_system.config.min_file_modification_date = date(2019, 1, 1)
+    
+    # Execute the classification process
+    return classification_system.run_classification(root_folder_path)
+
+# Main execution block
+if __name__ == "__main__":
+    # Production configuration for enterprise environment
+    ROOT_FOLDER_PATH = r"\\Network\midp-sfs-007\midamreprc"  # Your network path
     OUTPUT_DIR = "healthcare_classification_results"
-
+    
+    # Configuration settings
+    THREADS = 5                # 5 parallel workers
+    MIN_FILE_DATE = "2019-01-01"  # Only process files modified from this date
+    ENABLE_INCREMENTAL = True     # Enable incremental processing for future runs
+    
     try:
-        # Before running, ensure your local environment is authenticated with Google Cloud.
-        # Typically, this is done by running `gcloud auth application-default login` in your terminal.
-        client = genai.Client(project=GCP_PROJECT_ID, location=GCP_LOCATION)
-
-        # Initialize and run the main classification system.
-        system = EnterpriseHealthcareClassificationSystem(client=client, output_dir=OUTPUT_DIR)
-        system.run(root_folder_path=ROOT_FOLDER_PATH)
-
-    except Exception as e:
-        logger.error(f"A critical error occurred in the main execution block: {e}", exc_info=True)
-        print(f"CRITICAL ERROR: {e}. Check healthcare_classification.log for details.")
+        print("STARTING HEALTHCARE CLASSIFICATION")
+        print(f"EXACT WORKING LOGIC PRESERVED:")
+        print(f"  Stage 1: Healthcare contract detection (exact prompts)")
+        print(f"  Stage 2: Effective date extraction (exact prompts)")
+        print(f"  Page selection logic (first 10, last 10)")
+        print(f"  PDF handling strategies (exact repair methods)")
+        print(f"  Long path support for folder names")
+        print(f"Configuration:")
+        print(f"  Source Path: {ROOT_FOLDER_PATH}")
+        print(f"  Output Directory: {OUTPUT_DIR}")
+        print(f"  Processing Threads: {THREADS}")
+        print(f"  Minimum File Date: {MIN_FILE_DATE}")
+        print(f"  Incremental Processing: {'ENABLED' if ENABLE_INCREMENTAL else 'DISABLED'}")
+        
+        # Run the healthcare document classification
+        results = run_healthcare_classification(
+            root_folder_path=ROOT_FOLDER_PATH,
+            output_dir=OUTPUT_DIR,
+            threads=THREADS,
+            min_file_date=MIN_FILE_DATE,
+            enable_incremental=ENABLE_INCREMENTAL
+        )
+        
+        print("\nCLASSIFICATION COMPLETED SUCCESSFULLY!")
+        print(f"Output Directory: {results.get('output_directory')}")
+        print(f"Processing Time: {results.get('processing_time_hours', 0):.2f} hours")
+        print(f"Documents Discovered: {results.get('total_documents_discovered', 0):,}")
+        print(f"Relevant Documents Found: {results.get('relevant_documents_found', 0):,}")
+        
+        breakdown = results.get('classification_breakdown', {})
+        if breakdown:
+            print(f"\nDETAILED BREAKDOWN:")
+            print(f"  Relevant (2020+):               {breakdown.get('relevant', 0):,}")
+            print(f"  Not Healthcare Contracts:       {breakdown.get('not_healthcare', 0):,}")
+            print(f"  Old Effective Dates (< 2020):   {breakdown.get('old_date', 0):,}")
+            print(f"  No Date Found:                  {breakdown.get('no_date', 0):,}")
+            print(f"  Form Field Issues:              {breakdown.get('form_field_issues', 0):,}")
+            print(f"  PDF Corrupted:                  {breakdown.get('pdf_corrupted', 0):,}")
+            print(f"  Failed:                         {breakdown.get('failed', 0):,}")
+            print(f"  Old File Dates:                 {breakdown.get('old_file_date', 0):,}")
+            print(f"  Sk
