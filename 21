@@ -1,189 +1,221 @@
 """
-Central configuration management for the healthcare document pipeline.
+Pipeline Configuration Settings
 
-This module contains all configuration parameters for the pipeline including
-network paths, processing settings, AI model parameters, and output specifications.
-All pipeline behavior can be controlled by modifying settings in this file.
+Central configuration management for the healthcare document processing pipeline.
+All settings for classification, extraction, and pipeline coordination are managed here.
+
+This configuration supports enterprise-scale processing with:
+- Network drive integration for Windows environments
+- Parallel processing optimization
+- File filtering and incremental processing
+- Output management and logging configuration
 """
 
+import os
 from pathlib import Path
 from datetime import date
+from typing import List, Optional
+from dataclasses import dataclass
 
 
-class PipelineConfiguration:
+@dataclass
+class PipelineConfig:
     """
-    Centralized configuration for the healthcare document processing pipeline.
+    Complete pipeline configuration with enterprise-grade settings.
     
-    This class contains all configuration parameters needed for the complete
-    pipeline operation. Modify these settings to adjust pipeline behavior
-    for different environments and processing requirements.
+    This configuration class manages all aspects of the pipeline including
+    network paths, processing parameters, and output settings.
     """
     
-    def __init__(self):
-        """
-        Initialize pipeline configuration with default settings.
-        
-        Modify these values to match your specific environment and requirements.
-        """
-        
-        # Network folder structure configuration
-        # Update NETWORK_ROOT_PATH to point to your network document repository
-        self.NETWORK_ROOT_PATH = r"\\Network\midp-sfs-007\midamreprc"
-        self.AGREEMENTS_FOLDER = "AGREEMENTS-NON STANDARD"
-        self.HOSPITAL_SUBFOLDER = "HOSPITAL"
-        
-        # Output directory structure
-        # All pipeline outputs will be created under OUTPUT_DIRECTORY
-        self.OUTPUT_DIRECTORY = "pipeline_outputs"
-        self.CLASSIFICATION_OUTPUT_DIR = f"{self.OUTPUT_DIRECTORY}/classification_results"
-        self.EXTRACTION_OUTPUT_DIR = f"{self.OUTPUT_DIRECTORY}/extraction_results"
-        self.CONSOLIDATED_OUTPUT_DIR = f"{self.OUTPUT_DIRECTORY}/consolidated_results"
-        self.LOGS_OUTPUT_DIR = f"{self.OUTPUT_DIRECTORY}/logs"
-        
-        # Processing performance and threading settings
-        # Adjust CLASSIFICATION_THREADS based on system resources (1-20 recommended)
-        self.CLASSIFICATION_THREADS = 5
-        self.ENABLE_INCREMENTAL_PROCESSING = True
-        self.MIN_FILE_MODIFICATION_DATE = date(2019, 1, 1)
-        self.MIN_EFFECTIVE_YEAR = 2020
-        
-        # AI processing configuration for Google Gemini
-        # These settings control image quality and model selection
-        self.IMAGE_DPI = 150
-        self.GEMINI_MODEL = 'gemini-1.5-flash'
-        self.FIRST_PAGES_COUNT = 10
-        self.LAST_PAGES_COUNT = 10
-        
-        # Google Cloud Platform settings
-        # Update these to match your GCP project configuration
-        self.GOOGLE_CLOUD_PROJECT = "anbc-hcb-dev"
-        self.GOOGLE_CLOUD_LOCATION = "us-central1"
-        
-        # Pipeline behavior and error handling settings
-        self.CONTINUE_ON_EXTRACTION_ERRORS = True
-        self.SAVE_INDIVIDUAL_EXTRACTION_CSVS = True
-        self.ENABLE_REAL_TIME_PROGRESS = True
-        self.PROGRESS_UPDATE_INTERVAL_SECONDS = 30
-        
-        # State management for incremental processing
-        self.STATE_FILE_PATH = f"{self.OUTPUT_DIRECTORY}/pipeline_state.json"
-        self.ENABLE_STATE_PERSISTENCE = True
-        
-        # PDF processing and repair settings
-        self.ENABLE_PDF_COMPLEXITY_ANALYSIS = True
-        self.MAX_PDF_REPAIR_ATTEMPTS = 3
-        self.SKIP_CORRUPTED_PAGES = True
-        
-        # US states for folder identification
-        # Used to identify valid state folders in the network structure
-        self.US_STATES = {
-            'ALABAMA', 'ALASKA', 'ARIZONA', 'ARKANSAS', 'CALIFORNIA', 'COLORADO',
-            'CONNECTICUT', 'DELAWARE', 'FLORIDA', 'GEORGIA', 'HAWAII', 'IDAHO',
-            'ILLINOIS', 'INDIANA', 'IOWA', 'KANSAS', 'KENTUCKY', 'LOUISIANA',
-            'MAINE', 'MARYLAND', 'MASSACHUSETTS', 'MICHIGAN', 'MINNESOTA',
-            'MISSISSIPPI', 'MISSOURI', 'MONTANA', 'NEBRASKA', 'NEVADA',
-            'NEW HAMPSHIRE', 'NEW JERSEY', 'NEW MEXICO', 'NEW YORK',
-            'NORTH CAROLINA', 'NORTH DAKOTA', 'OHIO', 'OKLAHOMA', 'OREGON',
-            'PENNSYLVANIA', 'RHODE ISLAND', 'SOUTH CAROLINA', 'SOUTH DAKOTA',
-            'TENNESSEE', 'TEXAS', 'UTAH', 'VERMONT', 'VIRGINIA', 'WASHINGTON',
-            'WEST VIRGINIA', 'WISCONSIN', 'WYOMING', 'PUERTO RICO', 'DISTRICT OF COLUMBIA'
-        }
-        
-        # AI prompts for document classification
-        # These are the exact working prompts - do not modify unless necessary
-        self.HEALTHCARE_CONTRACT_PROMPT = (
-            "Analyze the image. Is this a formal letter from Aetna about a "
-            "'charge master increase' where they state 'we have received' a notification? "
-            "Answer only YES or NO."
-        )
-        
-        self.EFFECTIVE_DATE_PROMPT = (
-            'This is an Aetna charge master increase letter. Find the EFFECTIVE DATE '
-            'mentioned in the letter (phrases like "effective January 1, 2024" or '
-            '"to become effective 1/1/2025"). Respond with just the date found, '
-            'or "NOT_FOUND" if no effective date exists.'
-        )
+    # Network and file system configuration
+    network_root_path: str = r"\\Network\midp-sfs-007\midamreprc"
+    agreements_folder: str = "AGREEMENTS-NON STANDARD"
+    hospital_subfolder: str = "HOSPITAL"
     
-    def create_output_directories(self):
-        """
-        Create all required output directories if they don't exist.
-        
-        This method ensures that all output paths are available before
-        pipeline execution begins. Called automatically during initialization.
-        """
-        directories_to_create = [
-            self.OUTPUT_DIRECTORY,
-            self.CLASSIFICATION_OUTPUT_DIR,
-            self.EXTRACTION_OUTPUT_DIR,
-            self.CONSOLIDATED_OUTPUT_DIR,
-            self.LOGS_OUTPUT_DIR
-        ]
-        
-        for directory_path in directories_to_create:
-            Path(directory_path).mkdir(parents=True, exist_ok=True)
+    # Classification processing settings
+    classification_threads: int = 5
+    classification_timeout_minutes: int = 10
     
-    def validate_configuration(self):
+    # File filtering and optimization
+    min_file_modification_date: date = date(2019, 1, 1)
+    min_effective_year: int = 2020
+    enable_incremental_processing: bool = True
+    
+    # Image processing for AI analysis
+    image_dpi: int = 150
+    first_pages_count: int = 10
+    last_pages_count: int = 10
+    
+    # PDF processing configuration
+    max_pdf_repair_attempts: int = 3
+    skip_corrupted_pages: bool = True
+    enable_complexity_analysis: bool = True
+    
+    # Extraction processing settings
+    extraction_dpi: int = 200
+    enable_parallel_extraction: bool = False  # Sequential extraction as requested
+    
+    # Output and logging configuration
+    output_directory: Path = Path("healthcare_pipeline_results")
+    enable_live_monitoring: bool = True
+    
+    # State management for large-scale processing
+    state_file_path: str = "pipeline_state.json"
+    save_intermediate_results: bool = True
+    
+    # Google AI client configuration
+    google_project_id: str = "anbc-hcb-dev"
+    google_location: str = "us-central1"
+    google_model: str = "gemini-1.5-flash"
+    
+    # US states for folder identification in network structure
+    us_states: List[str] = None
+    
+    def __post_init__(self):
         """
-        Validate that all configuration settings are valid and accessible.
+        Initialize additional configuration after dataclass creation.
+        Sets up derived settings and validates configuration.
+        """
+        # Initialize US states list for folder identification
+        if self.us_states is None:
+            self.us_states = [
+                'ALABAMA', 'ALASKA', 'ARIZONA', 'ARKANSAS', 'CALIFORNIA', 'COLORADO',
+                'CONNECTICUT', 'DELAWARE', 'FLORIDA', 'GEORGIA', 'HAWAII', 'IDAHO',
+                'ILLINOIS', 'INDIANA', 'IOWA', 'KANSAS', 'KENTUCKY', 'LOUISIANA',
+                'MAINE', 'MARYLAND', 'MASSACHUSETTS', 'MICHIGAN', 'MINNESOTA',
+                'MISSISSIPPI', 'MISSOURI', 'MONTANA', 'NEBRASKA', 'NEVADA',
+                'NEW HAMPSHIRE', 'NEW JERSEY', 'NEW MEXICO', 'NEW YORK',
+                'NORTH CAROLINA', 'NORTH DAKOTA', 'OHIO', 'OKLAHOMA', 'OREGON',
+                'PENNSYLVANIA', 'RHODE ISLAND', 'SOUTH CAROLINA', 'SOUTH DAKOTA',
+                'TENNESSEE', 'TEXAS', 'UTAH', 'VERMONT', 'VIRGINIA', 'WASHINGTON',
+                'WEST VIRGINIA', 'WISCONSIN', 'WYOMING', 'PUERTO RICO', 'DISTRICT OF COLUMBIA'
+            ]
         
-        Performs comprehensive validation of network paths, folder structure,
-        and configuration parameters to ensure pipeline can execute successfully.
+        # Ensure output directory is a Path object
+        if isinstance(self.output_directory, str):
+            self.output_directory = Path(self.output_directory)
+        
+        # Create output directory if it doesn't exist
+        self.output_directory.mkdir(parents=True, exist_ok=True)
+        
+        # Validate critical settings
+        self._validate_configuration()
+    
+    def _validate_configuration(self):
+        """
+        Validate configuration settings and log warnings for potential issues.
+        Ensures the pipeline has valid settings for enterprise operation.
+        """
+        # Validate thread count for optimal performance
+        if self.classification_threads < 1 or self.classification_threads > 20:
+            raise ValueError("Classification threads must be between 1 and 20 for optimal performance")
+        
+        # Validate date settings
+        if self.min_effective_year < 2000 or self.min_effective_year > 2030:
+            raise ValueError("Minimum effective year should be between 2000 and 2030")
+        
+        # Validate image processing settings
+        if self.image_dpi < 72 or self.image_dpi > 300:
+            raise ValueError("Image DPI should be between 72 and 300 for optimal AI processing")
+        
+        # Validate network path format for Windows
+        if not self.network_root_path.startswith('\\\\'):
+            raise ValueError("Network root path should be a UNC path starting with '\\\\'")
+    
+    def get_full_agreements_path(self) -> Path:
+        """
+        Get the complete path to the agreements folder on the network.
         
         Returns:
-            bool: True if configuration is valid, False otherwise
+            Path object pointing to the agreements folder
         """
-        try:
-            # Validate network path accessibility
-            network_path = Path(self.NETWORK_ROOT_PATH)
-            if not network_path.exists():
-                return False
-            
-            # Validate agreements folder exists
-            agreements_path = network_path / self.AGREEMENTS_FOLDER
-            if not agreements_path.exists():
-                return False
-            
-            # Validate thread count is reasonable
-            if not (1 <= self.CLASSIFICATION_THREADS <= 20):
-                return False
-            
-            # Validate date settings are sensible
-            if self.MIN_EFFECTIVE_YEAR < 2000 or self.MIN_EFFECTIVE_YEAR > 2030:
-                return False
-            
-            # Validate file modification date is not in the future
-            if self.MIN_FILE_MODIFICATION_DATE > date.today():
-                return False
-            
-            # Validate image DPI is reasonable
-            if not (50 <= self.IMAGE_DPI <= 600):
-                return False
-            
-            # Validate page counts are positive
-            if self.FIRST_PAGES_COUNT < 1 or self.LAST_PAGES_COUNT < 1:
-                return False
-            
-            return True
-            
-        except Exception:
-            return False
+        return Path(self.network_root_path) / self.agreements_folder
     
-    def get_configuration_summary(self):
+    def get_classification_settings(self) -> dict:
         """
-        Generate a summary of current configuration settings.
+        Get settings specific to the classification phase.
         
         Returns:
-            dict: Dictionary containing key configuration parameters
+            Dictionary with classification-specific settings
         """
         return {
-            'network_root_path': self.NETWORK_ROOT_PATH,
-            'output_directory': self.OUTPUT_DIRECTORY,
-            'classification_threads': self.CLASSIFICATION_THREADS,
-            'min_file_date': self.MIN_FILE_MODIFICATION_DATE,
-            'min_effective_year': self.MIN_EFFECTIVE_YEAR,
-            'incremental_processing': self.ENABLE_INCREMENTAL_PROCESSING,
-            'ai_model': self.GEMINI_MODEL,
-            'image_dpi': self.IMAGE_DPI,
-            'google_cloud_project': self.GOOGLE_CLOUD_PROJECT,
-            'continue_on_errors': self.CONTINUE_ON_EXTRACTION_ERRORS
+            'max_threads': self.classification_threads,
+            'timeout_minutes': self.classification_timeout_minutes,
+            'min_file_date': self.min_file_modification_date,
+            'min_effective_year': self.min_effective_year,
+            'enable_incremental': self.enable_incremental_processing,
+            'image_dpi': self.image_dpi,
+            'first_pages': self.first_pages_count,
+            'last_pages': self.last_pages_count
         }
+    
+    def get_extraction_settings(self) -> dict:
+        """
+        Get settings specific to the extraction phase.
+        
+        Returns:
+            Dictionary with extraction-specific settings
+        """
+        return {
+            'image_dpi': self.extraction_dpi,
+            'enable_parallel': self.enable_parallel_extraction,
+            'output_directory': self.output_directory
+        }
+    
+    def get_google_ai_settings(self) -> dict:
+        """
+        Get Google AI client configuration settings.
+        
+        Returns:
+            Dictionary with Google AI settings
+        """
+        return {
+            'project': self.google_project_id,
+            'location': self.google_location,
+            'model': self.google_model
+        }
+
+
+class ClassificationPrompts:
+    """
+    AI prompts for document classification.
+    These prompts are preserved exactly from the working classification logic.
+    """
+    
+    # Healthcare contract detection prompt - exact from working code
+    HEALTHCARE_CONTRACT_DETECTION = (
+        "Analyze the image. Is this a formal letter from Aetna about a 'charge master increase' "
+        "where they state 'we have received' a notification? Answer only YES or NO."
+    )
+    
+    # Effective date extraction prompt - exact from working code
+    EFFECTIVE_DATE_EXTRACTION = (
+        'This is an Aetna charge master increase letter. Find the EFFECTIVE DATE mentioned in the letter '
+        '(phrases like "effective January 1, 2024" or "to become effective 1/1/2025"). '
+        'Respond with just the date found, or "NOT_FOUND" if no effective date exists.'
+    )
+
+
+class ExtractionPrompts:
+    """
+    AI prompts for data extraction.
+    These prompts are preserved exactly from the working extraction logic.
+    """
+    
+    # Letter boundary detection instructions - exact from working code
+    LETTER_BOUNDARY_DETECTION = """
+### CRITICAL: LETTER BOUNDARY DETECTION
+- A NEW letter starts with "Dear..." greeting AND "We have received your letter/email" phrase
+- Extract ALL data that appears BEFORE the words "Enclosure" or "Sincerely" 
+- COMPLETELY IGNORE any tables, data, or content that appears AFTER "Enclosure" or "Sincerely"
+- If you see "Enclosure" or "Sincerely", treat that as the END of the letter - do not extract anything below those words
+- Summary tables, rate sheets, or facility details that appear AFTER letter closing should be completely ignored
+"""
+    
+    # Extraction rules - exact from working code
+    EXTRACTION_RULES = """
+### EXTRACTION RULES:
+1. If this page has "Dear..." and "We have received..." → extract document-level fields from letter portion only
+2. Extract facility/hospital rows ONLY from the letter content (before "Enclosure"/"Sincerely")  
+3. If content appears after "Enclosure"/"Sincerely", pretend it doesn't exist
+"""
